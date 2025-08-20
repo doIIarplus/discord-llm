@@ -1,0 +1,6 @@
+__pycache__/
+api_out/
+latex_images/
+multimodal_input/
+venv/
+output.txt
