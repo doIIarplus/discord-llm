@@ -4,3 +4,4 @@ latex_images/
 multimodal_input/
 venv/
 output.txt
+.env

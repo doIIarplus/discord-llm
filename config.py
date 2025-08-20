@@ -1,6 +1,9 @@
 """Configuration settings for Discord LLM Bot"""
 
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Discord Configuration
 DISCORD_BOT_TOKEN = os.getenv(
