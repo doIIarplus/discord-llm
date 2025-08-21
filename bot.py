@@ -46,7 +46,7 @@ class OllamaBot(discord.Client):
         
         # Initialize RAG system
         self.rag_system = RAGSystem()
-        self.rag_enabled = False  # Flag to enable/disable RAG
+        self.rag_enabled = True  # Flag to enable/disable RAG
         
         # System prompts
         # self.original_system_prompt = (

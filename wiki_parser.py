@@ -83,7 +83,7 @@ class WikiParser:
         return {
             'title': title,
             'content': content,
-            'categories': categories
+            'categories': ", ".join(categories) if categories else None
         }
     
     def _clean_wiki_markup(self, text: str) -> str:

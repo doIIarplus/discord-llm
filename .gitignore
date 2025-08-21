@@ -5,3 +5,4 @@ multimodal_input/
 venv/
 output.txt
 .env
+chroma_db/

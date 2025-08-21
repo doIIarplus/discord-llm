@@ -1,6 +1,7 @@
 """Discord command handlers for Discord LLM Bot"""
 
 import time
+import traceback
 from typing import Optional
 import asyncio
 import os
@@ -154,6 +155,7 @@ class CommandHandlers:
                     f"Total chunks indexed: {stats['total_chunks']}"
                 )
             except Exception as e:
+                traceback.print_exc()
                 await interaction.channel.send(f"❌ Error during indexing: {e}")
         
         @self.bot.tree.command(name="enable_rag")
