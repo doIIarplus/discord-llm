@@ -26,6 +26,7 @@ from latex import split_text_and_latex
 from ollama_client import OllamaClient
 from script_executor import ScriptExecutor
 from utils import encode_images_to_base64, encode_image_to_base64
+from rag_system import RAGSystem
 
 
 class OllamaBot(discord.Client):
@@ -42,6 +43,10 @@ class OllamaBot(discord.Client):
         self.ollama_client = OllamaClient()
         self.image_gen = ImageGenerator()
         self.script_executor = ScriptExecutor()
+        
+        # Initialize RAG system
+        self.rag_system = RAGSystem()
+        self.rag_enabled = False  # Flag to enable/disable RAG
         
         # System prompts
         # self.original_system_prompt = (
@@ -258,6 +263,20 @@ class OllamaBot(discord.Client):
             
         # Regular text query
         prompt = self.format_prompt(messages)
+        
+        # Add RAG context if enabled
+        if self.rag_enabled:
+            # Extract the user's question from messages
+            user_question = ""
+            for msg in messages:
+                if msg.get("role") == "user":
+                    user_question = msg.get("content", "")
+            
+            if user_question:
+                wiki_context = self.rag_system.get_context_for_query(user_question)
+                if wiki_context:
+                    prompt = f"Wiki Context:\n{wiki_context}\n\n{prompt}"
+        
         prompt = f"System: {self.system_prompt}\n" + prompt
         
         if images:

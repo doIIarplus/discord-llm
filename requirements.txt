@@ -1,2 +1,6 @@
 discord.py
 python-dotenv
+chromadb
+lxml
+sentence-transformers
+numpy
