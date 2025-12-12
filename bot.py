@@ -29,6 +29,14 @@ from utils import encode_images_to_base64, encode_image_to_base64
 from rag_system import RAGSystem
 from web_extractor import extract_webpage_context
 
+# Import tool system
+from tools import ToolExecutor
+from tools.executor import DiscordContext
+from tools.base import registry
+# Import tools to register them
+import tools.discord_tools
+import tools.utility_tools
+
 
 class OllamaBot(discord.Client):
     """Main Discord bot class"""
@@ -48,6 +56,10 @@ class OllamaBot(discord.Client):
         # Initialize RAG system
         self.rag_system = RAGSystem()
         self.rag_enabled = False  # Flag to enable/disable RAG
+
+        # Initialize tool system
+        self.tool_executor = ToolExecutor(registry)
+        self.tools_enabled = True  # Flag to enable/disable tool calling
         
         # System prompts
         # self.original_system_prompt = (
@@ -275,7 +287,7 @@ class OllamaBot(discord.Client):
             
         # Regular text query
         prompt = self.format_prompt(messages)
-        
+
         # Add RAG context if enabled
         if self.rag_enabled:
             # Extract the user's question from messages
@@ -283,32 +295,47 @@ class OllamaBot(discord.Client):
             for msg in messages:
                 if msg.get("role") == "user":
                     user_question = msg.get("content", "")
-            
+
             if user_question:
                 wiki_context = self.rag_system.get_context_for_query(user_question)
                 if wiki_context:
                     prompt = f"Wiki Context:\n{wiki_context}\n\n{prompt}"
-        
-        prompt = f"System: {self.system_prompt}\n" + prompt
-        
+
+        # Build system prompt with tools if enabled
+        system_prompt = self.system_prompt
+        if self.tools_enabled:
+            system_prompt += self.tool_executor.get_system_prompt_addition()
+
+        prompt = f"System: {system_prompt}\n" + prompt
+
         # Extract web page content if URLs are present in the last message
         if webpage_context:
             prompt = f"{prompt}\n\nWeb Page Context:\n{webpage_context}"
-        
+
         if images:
             print("Sending image")
-            
+
         try:
             model = self.pick_model(server, channel)
             print(f"Using model: {model}")
             print(f"Prompt: {prompt}")
-            
+
             raw_response = await self.ollama_client.generate(prompt, model, images)
-            
+
             if raw_response == "No response from Ollama.":
                 print("No response from Ollama")
                 return ["No response from Ollama."]
-                
+
+            # Handle tool calls if present and tools are enabled
+            if self.tools_enabled and self.tool_executor.has_tool_calls(raw_response):
+                raw_response = await self._handle_tool_calls(
+                    raw_response,
+                    messages,
+                    server,
+                    channel,
+                    override_messages
+                )
+
             # Add response to context
             if override_messages is None:
                 self.context[server][channel].append({
@@ -316,19 +343,93 @@ class OllamaBot(discord.Client):
                     "content": raw_response,
                     "timestamp": time.time(),
                 })
-                
+
                 # Save context to file
                 with open("output.txt", "w") as file:
                     json.dump(self.context, file, indent=4)
-                    
+
             print(f"Response: {raw_response}")
             return self.process_response(raw_response)
-            
+
         except Exception as e:
             print(f"Error: {e}")
             print(traceback.format_exc())
             return [f"Error communicating with Ollama: {e}"]
-            
+
+    async def _handle_tool_calls(
+        self,
+        response: str,
+        messages: List[dict],
+        server: int,
+        channel: int,
+        override_messages: List[dict] = None,
+        max_iterations: int = 3
+    ) -> str:
+        """
+        Handle tool calls in the LLM response.
+
+        This method executes tools, feeds results back to the LLM,
+        and continues until no more tool calls or max iterations reached.
+        """
+        discord_channel = self.get_channel(channel)
+        discord_guild = self.get_guild(server) if server else None
+
+        # Build Discord context for tools
+        discord_ctx = DiscordContext(
+            channel=discord_channel,
+            guild=discord_guild,
+            bot=self,
+        )
+
+        current_response = response
+        iteration = 0
+
+        while iteration < max_iterations:
+            # Execute all tool calls in the response
+            results, cleaned_response = await self.tool_executor.execute_all(
+                current_response,
+                context=discord_ctx
+            )
+
+            if not results:
+                # No tool calls found, return the cleaned response
+                return cleaned_response if cleaned_response else current_response
+
+            # Format results for the LLM
+            tool_results = self.tool_executor.format_results_for_llm(results)
+            print(f"Tool results:\n{tool_results}")
+
+            # Build continuation prompt with tool results
+            system_prompt = self.system_prompt
+            if self.tools_enabled:
+                system_prompt += self.tool_executor.get_system_prompt_addition()
+
+            continuation_prompt = self.format_prompt(messages)
+            continuation_prompt = f"System: {system_prompt}\n" + continuation_prompt
+
+            # Add the assistant's response with tool calls
+            continuation_prompt += f"\nAssistant: {current_response}\n"
+
+            # Add tool results
+            continuation_prompt += f"\n{tool_results}\n"
+            continuation_prompt += "\nAssistant: Based on the tool results above, "
+
+            # Get next response from LLM
+            model = self.pick_model(server, channel)
+            current_response = await self.ollama_client.generate(continuation_prompt, model)
+
+            if current_response == "No response from Ollama.":
+                return cleaned_response if cleaned_response else "No response from Ollama."
+
+            iteration += 1
+
+            # Check if there are more tool calls
+            if not self.tool_executor.has_tool_calls(current_response):
+                break
+
+        # Return the final response (remove any remaining tool call tags)
+        return self.tool_executor.remove_tool_calls(current_response)
+
     async def close(self):
         """Close the bot"""
         await super().close()

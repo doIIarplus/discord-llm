@@ -11,6 +11,7 @@ import discord
 from discord import app_commands
 
 from image_generation import ImageGenerator
+from tools.base import registry as tool_registry
 
 # Set up logging
 logger = logging.getLogger("CommandHandlers")
@@ -258,5 +259,80 @@ class CommandHandlers:
                 f"Collection: {stats['collection_name']}\n"
                 f"RAG enabled: {self.bot.rag_enabled}"
             )
-            
+
+        # Tool system commands
+        @self.bot.tree.command(name="enable_tools")
+        async def enable_tools(interaction: discord.Interaction):
+            """Enable tool calling for the LLM"""
+            logger.info(f"Enable tools command called by {interaction.user.name}#{interaction.user.discriminator}")
+            self.bot.tools_enabled = True
+            await interaction.response.send_message("✅ Tools enabled. The bot can now use tools to help answer questions.")
+
+        @self.bot.tree.command(name="disable_tools")
+        async def disable_tools(interaction: discord.Interaction):
+            """Disable tool calling for the LLM"""
+            logger.info(f"Disable tools command called by {interaction.user.name}#{interaction.user.discriminator}")
+            self.bot.tools_enabled = False
+            await interaction.response.send_message("❌ Tools disabled. The bot will respond without using tools.")
+
+        @self.bot.tree.command(name="list_tools")
+        async def list_tools(interaction: discord.Interaction):
+            """List all available tools"""
+            logger.info(f"List tools command called by {interaction.user.name}#{interaction.user.discriminator}")
+
+            tools = tool_registry.get_all()
+            if not tools:
+                await interaction.response.send_message("No tools available.")
+                return
+
+            # Group by category
+            by_category = {}
+            for tool in tools:
+                cat = tool.category
+                if cat not in by_category:
+                    by_category[cat] = []
+                by_category[cat].append(tool)
+
+            response = "**Available Tools:**\n\n"
+            for category, cat_tools in sorted(by_category.items()):
+                response += f"**{category.title()}**\n"
+                for tool in cat_tools:
+                    response += f"• `{tool.name}`: {tool.description}\n"
+                response += "\n"
+
+            response += f"\nTools enabled: {'✅' if self.bot.tools_enabled else '❌'}"
+
+            if len(response) > 2000:
+                response = response[:1997] + "..."
+
+            await interaction.response.send_message(response)
+
+        @self.bot.tree.command(name="tool_info")
+        @app_commands.describe(tool_name="Name of the tool to get info about")
+        async def tool_info(interaction: discord.Interaction, tool_name: str):
+            """Get detailed information about a specific tool"""
+            logger.info(f"Tool info command called for {tool_name}")
+
+            tool = tool_registry.get(tool_name)
+            if not tool:
+                await interaction.response.send_message(f"Tool '{tool_name}' not found.")
+                return
+
+            response = f"**Tool: {tool.name}**\n"
+            response += f"Category: {tool.category}\n"
+            response += f"Description: {tool.description}\n\n"
+
+            if tool.parameters:
+                response += "**Parameters:**\n"
+                for param in tool.parameters:
+                    req = "required" if param.required else "optional"
+                    response += f"• `{param.name}` ({param.param_type.value}, {req})\n"
+                    response += f"  {param.description}\n"
+                    if param.enum:
+                        response += f"  Choices: {', '.join(param.enum)}\n"
+            else:
+                response += "No parameters required.\n"
+
+            await interaction.response.send_message(response)
+
         logger.info("All Discord slash commands registered successfully")
