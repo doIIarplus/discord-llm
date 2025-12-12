@@ -1,6 +1,7 @@
 """Wiki XML parser for extracting and chunking content"""
 
 import re
+import nltk
 from typing import List, Dict, Iterator
 from lxml import etree
 import logging
@@ -14,6 +15,28 @@ class WikiParser:
     def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        # Download required NLTK data
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            try:
+                nltk.download('punkt')
+            except Exception:
+                logger.warning("Failed to download punkt tokenizer. Falling back to simple chunking.")
+                self.use_nltk = False
+            else:
+                self.use_nltk = True
+        else:
+            self.use_nltk = True
+            
+        # Try to download punkt_tab as well for newer NLTK versions
+        try:
+            nltk.data.find('tokenizers/punkt_tab')
+        except LookupError:
+            try:
+                nltk.download('punkt_tab')
+            except Exception:
+                pass  # Not critical, we can fall back to punkt
     
     def parse_wiki_xml(self, xml_path: str) -> Iterator[Dict[str, str]]:
         """
@@ -128,7 +151,7 @@ class WikiParser:
     
     def chunk_text(self, text: str, metadata: Dict[str, str] = None) -> List[Dict[str, str]]:
         """
-        Split text into overlapping chunks
+        Split text into semantically meaningful chunks with overlap
         
         Args:
             text: Text to chunk
@@ -140,26 +163,87 @@ class WikiParser:
         if not text:
             return []
         
-        words = text.split()
-        chunks = []
-        
-        for i in range(0, len(words), self.chunk_size - self.chunk_overlap):
-            chunk_words = words[i:i + self.chunk_size]
-            chunk_text = ' '.join(chunk_words)
+        # Use NLTK to split into sentences for better semantic chunking if available
+        if self.use_nltk:
+            try:
+                sentences = nltk.sent_tokenize(text)
+            except Exception:
+                logger.warning("Failed to use NLTK sentence tokenizer. Falling back to simple chunking.")
+                self.use_nltk = False
+                # Fall through to simple chunking
+        else:
+            sentences = None
             
+        # If NLTK failed or is not available, use simple word-based chunking
+        if not self.use_nltk or sentences is None:
+            words = text.split()
+            chunks = []
+            
+            for i in range(0, len(words), self.chunk_size - self.chunk_overlap):
+                chunk_words = words[i:i + self.chunk_size]
+                chunk_text = ' '.join(chunk_words)
+                
+                chunk_data = {
+                    'text': chunk_text,
+                    'chunk_index': len(chunks),
+                    'word_count': len(chunk_words)
+                }
+                
+                if metadata:
+                    chunk_data.update(metadata)
+                
+                chunks.append(chunk_data)
+                
+                # Stop if we've reached the end
+                if i + self.chunk_size >= len(words):
+                    break
+            
+            return chunks
+        
+        # Use sentence-aware chunking when NLTK is available
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        
+        for sentence in sentences:
+            sentence_length = len(sentence.split())
+            
+            # If adding this sentence would exceed chunk size, finalize current chunk
+            if current_length + sentence_length > self.chunk_size and current_chunk:
+                # Create chunk
+                chunk_text = ' '.join(current_chunk)
+                chunk_data = {
+                    'text': chunk_text,
+                    'chunk_index': len(chunks),
+                    'word_count': current_length
+                }
+                
+                if metadata:
+                    chunk_data.update(metadata)
+                
+                chunks.append(chunk_data)
+                
+                # Implement overlap by keeping last few sentences
+                overlap_sentences = max(1, len(current_chunk) // 5)  # Keep ~20% for overlap
+                current_chunk = current_chunk[-overlap_sentences:]
+                current_length = sum(len(s.split()) for s in current_chunk)
+            
+            # Add current sentence to chunk
+            current_chunk.append(sentence)
+            current_length += sentence_length
+        
+        # Add final chunk if it has content
+        if current_chunk:
+            chunk_text = ' '.join(current_chunk)
             chunk_data = {
                 'text': chunk_text,
                 'chunk_index': len(chunks),
-                'word_count': len(chunk_words)
+                'word_count': current_length
             }
             
             if metadata:
                 chunk_data.update(metadata)
             
             chunks.append(chunk_data)
-            
-            # Stop if we've reached the end
-            if i + self.chunk_size >= len(words):
-                break
         
         return chunks

@@ -19,6 +19,9 @@ class Txt2TxtModel(Enum):
     DEEPSEEK_R1_70B = "deepseek-r1:70b"
     GEMMA3_27B_ABLITERATED = "hf.co/mlabonne/gemma-3-27b-it-abliterated-GGUF:Q8_0"
     QWEN_72B = "qwen2.5vl:72b"
+    DEEPSEX = "hf.co/TheBloke/deepsex-34b-GGUF:Q8_0"
+    GPT_OSS = "gpt-oss:120b"
+    GPT_ABLITERATED = "huihui_ai/gpt-oss-abliterated:120b"
 
 
 @dataclass

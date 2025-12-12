@@ -3,6 +3,8 @@
 import os
 import logging
 from typing import List, Dict, Any
+from datetime import datetime
+from functools import lru_cache
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
@@ -10,6 +12,13 @@ from wiki_parser import WikiParser
 
 logger = logging.getLogger(__name__)
 
+# Try to import optional dependencies
+try:
+    from transformers import AutoTokenizer
+    TOKENIZER_AVAILABLE = True
+except ImportError:
+    TOKENIZER_AVAILABLE = False
+    logger.warning("transformers not available. Falling back to word counting for token estimation.")
 
 def _sanitize_metadata(metadatas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -40,13 +49,23 @@ class RAGSystem:
         self,
         db_path: str = "./chroma_db",
         collection_name: str = "maplestory_wiki",
-        model_name: str = "all-MiniLM-L6-v2",
+        model_name: str = "all-mpnet-base-v2",  # Upgraded model
     ):
         self.db_path = db_path
         self.collection_name = collection_name
 
         logger.info(f"Loading embedding model: {model_name}")
         self.embedding_model = SentenceTransformer(model_name)
+        
+        # Initialize tokenizer for better token counting if available
+        if TOKENIZER_AVAILABLE:
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
+            except Exception as e:
+                logger.warning(f"Could not load tokenizer: {e}. Falling back to word counting.")
+                self.tokenizer = None
+        else:
+            self.tokenizer = None
 
         self.client = chromadb.PersistentClient(
             path=db_path,
@@ -56,7 +75,11 @@ class RAGSystem:
         try:
             self.collection = self.client.get_or_create_collection(
                 name=collection_name,
-                metadata={"hnsw:space": "cosine"},
+                metadata={
+                    "hnsw:space": "cosine",
+                    "hnsw:construction_ef": 128,  # higher = more accurate but slower
+                    "hnsw:M": 16,  # connectivity parameter
+                },
             )
             logger.info(f"Using collection: {collection_name}")
         except AttributeError:
@@ -65,11 +88,16 @@ class RAGSystem:
                 logger.info(f"Loaded existing collection: {collection_name}")
             except Exception:
                 self.collection = self.client.create_collection(
-                    name=collection_name, metadata={"hnsw:space": "cosine"}
+                    name=collection_name, 
+                    metadata={
+                        "hnsw:space": "cosine",
+                        "hnsw:construction_ef": 128,
+                        "hnsw:M": 16,
+                    }
                 )
                 logger.info(f"Created new collection: {collection_name}")
 
-        self.parser = WikiParser(chunk_size=500, chunk_overlap=50)
+        self.parser = WikiParser(chunk_size=500, chunk_overlap=100)  # Increased overlap for better context
 
     def index_wiki_dump(self, xml_path: str, batch_size: int = 100):
         logger.info(f"Starting to index wiki dump: {xml_path}")
@@ -93,11 +121,16 @@ class RAGSystem:
                 doc_id = f"{title}_{chunk['chunk_index']}"
                 documents.append(chunk["text"])
 
+                # Enhanced metadata
                 md = {
                     "title": title,
                     "chunk_index": int(chunk.get("chunk_index", 0)),
                     "word_count": int(chunk.get("word_count", 0)),
                     "categories": categories,
+                    "content_length": len(chunk["text"]),  # character count
+                    "timestamp": datetime.now().isoformat(),  # indexing time
+                    "doc_length": len(content.split()),  # total words in original doc
+                    "relative_position": chunk.get("chunk_index", 0) / max(1, len(chunks)-1)  # position in doc
                 }
                 metadatas.append(md)
                 ids.append(doc_id)
@@ -133,6 +166,7 @@ class RAGSystem:
             ids=ids,
         )
 
+    @lru_cache(maxsize=1000)
     def search(self, query: str, n_results: int = 5) -> List[Dict[str, Any]]:
         query_embedding = self.embedding_model.encode([query])
         if hasattr(query_embedding, "tolist"):
@@ -161,6 +195,9 @@ class RAGSystem:
                         "categories": meta.get("categories"),
                         "chunk_index": meta.get("chunk_index"),
                         "score": score,
+                        "word_count": meta.get("word_count"),
+                        "content_length": meta.get("content_length"),
+                        "relative_position": meta.get("relative_position"),
                     }
                 )
 
@@ -174,8 +211,36 @@ class RAGSystem:
         context_parts: List[str] = []
         current_tokens = 0
 
+        # Sort results by score (relevance) and then by document coherence
+        results.sort(key=lambda x: (x.get("score", 0), -abs(x.get("relative_position", 0.5) - 0.5)), reverse=True)
+        
+        # Group results by title to prioritize chunks from the same document
+        grouped_results = {}
         for result in results:
-            result_tokens = len(result["content"]) // 4
+            title = result.get("title", "Unknown")
+            if title not in grouped_results:
+                grouped_results[title] = []
+            grouped_results[title].append(result)
+        
+        # Flatten grouped results, prioritizing documents with more relevant chunks
+        flattened_results = []
+        for title, chunks in grouped_results.items():
+            # Sort chunks by position to maintain reading order
+            chunks.sort(key=lambda x: x.get("relative_position", 0))
+            flattened_results.extend(chunks)
+
+        for result in flattened_results:
+            # Use actual tokenizer for more accurate token counting if available
+            if self.tokenizer:
+                try:
+                    result_tokens = len(self.tokenizer.encode(result["content"]))
+                except Exception:
+                    # Fallback to word counting if tokenizer fails
+                    result_tokens = len(result["content"].split())
+            else:
+                # Fallback to word counting
+                result_tokens = len(result["content"].split())
+                
             if current_tokens + result_tokens > max_tokens:
                 break
 
@@ -193,7 +258,12 @@ class RAGSystem:
         try:
             self.client.delete_collection(name=self.collection_name)
             self.collection = self.client.create_collection(
-                name=self.collection_name, metadata={"hnsw:space": "cosine"}
+                name=self.collection_name, 
+                metadata={
+                    "hnsw:space": "cosine",
+                    "hnsw:construction_ef": 128,
+                    "hnsw:M": 16,
+                }
             )
             logger.info("Collection cleared")
         except Exception as e:
@@ -205,4 +275,63 @@ class RAGSystem:
             "total_chunks": count,
             "collection_name": self.collection_name,
             "db_path": self.db_path,
+        }
+        
+    def evaluate_retrieval(self, queries_with_ground_truth: List[Dict]) -> Dict:
+        """
+        Evaluate the RAG system performance
+        
+        Args:
+            queries_with_ground_truth: List of dicts with 'query' and 'relevant_doc_ids'
+            
+        Returns:
+            Dict with evaluation metrics
+        """
+        total_precision = 0
+        total_recall = 0
+        total_reciprocal_rank = 0
+        query_count = len(queries_with_ground_truth)
+        
+        for item in queries_with_ground_truth:
+            query = item['query']
+            relevant_ids = set(item['relevant_doc_ids'])
+            
+            # Get top 10 results
+            results = self.search(query, n_results=10)
+            retrieved_ids = set([f"{r['title']}_{r['chunk_index']}" for r in results])
+            
+            # Calculate precision and recall
+            if retrieved_ids:
+                precision = len(retrieved_ids.intersection(relevant_ids)) / len(retrieved_ids)
+                recall = len(retrieved_ids.intersection(relevant_ids)) / len(relevant_ids) if relevant_ids else 0
+            else:
+                precision = 0
+                recall = 0
+                
+            # Calculate reciprocal rank
+            reciprocal_rank = 0
+            for i, result in enumerate(results):
+                result_id = f"{result['title']}_{result['chunk_index']}"
+                if result_id in relevant_ids:
+                    reciprocal_rank = 1 / (i + 1)
+                    break
+                    
+            total_precision += precision
+            total_recall += recall
+            total_reciprocal_rank += reciprocal_rank
+            
+        # Calculate averages
+        avg_precision = total_precision / query_count if query_count > 0 else 0
+        avg_recall = total_recall / query_count if query_count > 0 else 0
+        mean_reciprocal_rank = total_reciprocal_rank / query_count if query_count > 0 else 0
+        
+        # Calculate F1 score
+        f1_score = 2 * (avg_precision * avg_recall) / (avg_precision + avg_recall) if (avg_precision + avg_recall) > 0 else 0
+        
+        return {
+            "precision": avg_precision,
+            "recall": avg_recall,
+            "f1_score": f1_score,
+            "mrr": mean_reciprocal_rank,
+            "query_count": query_count
         }

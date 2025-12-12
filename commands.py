@@ -4,12 +4,16 @@ import time
 import traceback
 from typing import Optional
 import asyncio
+import logging
 import os
 
 import discord
 from discord import app_commands
 
 from image_generation import ImageGenerator
+
+# Set up logging
+logger = logging.getLogger("CommandHandlers")
 
 
 class CommandHandlers:
@@ -18,22 +22,28 @@ class CommandHandlers:
     def __init__(self, bot):
         self.bot = bot
         self.image_gen = ImageGenerator()
+        logger.info("CommandHandlers initialized")
         
     def setup_commands(self):
         """Register all slash commands"""
+        logger.info("Setting up Discord slash commands")
         
         @self.bot.tree.command(name="clear", description="Clear context")
         async def clear(interaction: discord.Interaction):
+            logger.info(f"Clear command called by {interaction.user.name}#{interaction.user.discriminator}")
             server = interaction.guild.id
             channel = interaction.channel.id
             
             if server in self.bot.context and channel in self.bot.context[server]:
                 self.bot.context[server][channel] = []
+                logger.debug(f"Cleared context for server {server}, channel {channel}")
             await interaction.response.send_message("Context cleared")
+            logger.info("Context cleared successfully")
             
         @self.bot.tree.command(name="ask", description="Ask something")
         @app_commands.describe(question="Ask something")
         async def ask(interaction: discord.Interaction, question: str):
+            logger.info(f"Ask command called by {interaction.user.name}#{interaction.user.discriminator} with question: {question[:50]}...")
             await interaction.response.defer(thinking=True)
             
             start = time.perf_counter()
@@ -44,29 +54,38 @@ class CommandHandlers:
             )
             end = time.perf_counter()
             elapsed = end - start
+            logger.info(f"Ask command processed in {elapsed:.3f} seconds")
             
             if isinstance(response, tuple):
+                logger.debug("Sending embed and file response")
                 await interaction.followup.send(embed=response[0], file=response[1])
             else:
                 response_text = "\n".join(response) if isinstance(response, list) else response
                 response_text += f"\n\n_Responded in {elapsed:.3f} seconds_"
+                logger.debug(f"Sending text response: {response_text[:100]}...")
                 await interaction.followup.send(response_text)
                 
         @self.bot.tree.command(name='set_system_prompt')
         async def set_system_prompt(interaction: discord.Interaction, prompt: str):
+            logger.info(f"Set system prompt command called by {interaction.user.name}#{interaction.user.discriminator}")
             await interaction.response.defer(thinking=True)
             self.bot.system_prompt = prompt
+            logger.debug("System prompt updated")
             await interaction.followup.send("Prompt updated")
             
         @self.bot.tree.command(name='reset_system_prompt')
         async def reset_system_prompt(interaction: discord.Interaction):
+            logger.info(f"Reset system prompt command called by {interaction.user.name}#{interaction.user.discriminator}")
             await interaction.response.defer(thinking=True)
             self.bot.system_prompt = self.bot.original_system_prompt
+            logger.debug("System prompt reset to default")
             await interaction.followup.send("Prompt reset to default")
             
         @self.bot.tree.command(name='get_system_prompt')
         async def get_system_prompt(interaction: discord.Interaction):
+            logger.info(f"Get system prompt command called by {interaction.user.name}#{interaction.user.discriminator}")
             await interaction.response.defer(thinking=True)
+            logger.debug("Sending current system prompt")
             await interaction.followup.send(self.bot.system_prompt)
             
         @self.bot.tree.command(name="generate_image")
@@ -93,6 +112,8 @@ class CommandHandlers:
             upscale: float = 1.0,
             allow_nsfw: bool = True,
         ):
+            logger.info(f"Generate image command called by {interaction.user.name}#{interaction.user.discriminator}")
+            logger.debug(f"Image generation parameters: prompt='{prompt[:50]}...', seed={seed}, width={width}, height={height}, cfg_scale={cfg_scale}, steps={steps}, upscale={upscale}, allow_nsfw={allow_nsfw}")
             await interaction.response.defer(thinking=True)
             
             try:
@@ -100,6 +121,8 @@ class CommandHandlers:
                     prompt, negative_prompt, seed, width, height, 
                     cfg_scale, steps, upscale, allow_nsfw
                 )
+                logger.info(f"Image generated successfully: {file_path}")
+                logger.debug(f"Image info: steps={image_info.steps}, cfg={image_info.cfg_scale}, size={image_info.width}x{image_info.height}, seed={image_info.seed}")
                 
                 file = discord.File(fp=file_path, filename='generated.png')
                 image_info_text = (
@@ -115,10 +138,13 @@ class CommandHandlers:
                 
                 if is_nsfw:
                     file.spoiler = True
+                    logger.debug("Marking image as NSFW")
                     
                 await interaction.followup.send(embed=embed, file=file)
+                logger.info("Image sent to Discord successfully")
                 
             except Exception as e:
+                logger.error(f"Error during image generation: {e}", exc_info=True)
                 await interaction.followup.send(f"An error occurred: {e}")
         
         @self.bot.tree.command(name="index_wiki")
@@ -127,47 +153,60 @@ class CommandHandlers:
         )
         async def index_wiki(interaction: discord.Interaction, clear_existing: bool = False):
             """Index the MapleStory wiki dump for RAG"""
+            logger.info(f"Index wiki command called by {interaction.user.name}#{interaction.user.discriminator}")
+            logger.debug(f"Clear existing: {clear_existing}")
             await interaction.response.defer(thinking=True)
             
             wiki_path = "maplestorywikinet.xml"
             if not os.path.exists(wiki_path):
+                logger.warning(f"Wiki file not found: {wiki_path}")
                 await interaction.followup.send(f"Wiki file not found: {wiki_path}")
                 return
             
             try:
                 if clear_existing:
+                    logger.info("Clearing existing collection")
                     self.bot.rag_system.clear_collection()
                     await interaction.followup.send("Cleared existing index. Starting indexing...")
                 else:
+                    logger.info("Starting wiki indexing")
                     await interaction.followup.send("Starting wiki indexing. This may take several minutes...")
                 
                 # Run indexing in background
+                logger.debug("Running wiki indexing in background")
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
                     None, 
                     self.bot.rag_system.index_wiki_dump,
                     wiki_path
                 )
+                logger.info("Wiki indexing completed successfully")
                 
                 stats = self.bot.rag_system.get_stats()
+                logger.debug(f"Indexing stats: {stats}")
                 await interaction.channel.send(
                     f"✅ Wiki indexing complete!\n"
                     f"Total chunks indexed: {stats['total_chunks']}"
                 )
             except Exception as e:
+                logger.error(f"Error during wiki indexing: {e}", exc_info=True)
                 traceback.print_exc()
                 await interaction.channel.send(f"❌ Error during indexing: {e}")
         
         @self.bot.tree.command(name="enable_rag")
         async def enable_rag(interaction: discord.Interaction):
             """Enable RAG for wiki content"""
+            logger.info(f"Enable RAG command called by {interaction.user.name}#{interaction.user.discriminator}")
             self.bot.rag_enabled = True
+            logger.debug("RAG enabled")
             await interaction.response.send_message("✅ RAG enabled. Wiki context will be added to queries.")
         
         @self.bot.tree.command(name="disable_rag")
         async def disable_rag(interaction: discord.Interaction):
             """Disable RAG for wiki content"""
+            logger.info(f"Disable RAG command called by {interaction.user.name}#{interaction.user.discriminator}")
             self.bot.rag_enabled = False
+            logger.debug("RAG disabled")
             await interaction.response.send_message("❌ RAG disabled. No wiki context will be added.")
         
         @self.bot.tree.command(name="search_wiki")
@@ -177,12 +216,16 @@ class CommandHandlers:
         )
         async def search_wiki(interaction: discord.Interaction, query: str, n_results: int = 3):
             """Search the indexed wiki content"""
+            logger.info(f"Search wiki command called by {interaction.user.name}#{interaction.user.discriminator} with query: {query[:50]}...")
+            logger.debug(f"Number of results requested: {n_results}")
             await interaction.response.defer(thinking=True)
             
             try:
                 results = self.bot.rag_system.search(query, n_results=n_results)
+                logger.debug(f"Search returned {len(results)} results")
                 
                 if not results:
+                    logger.info("No results found for search query")
                     await interaction.followup.send("No results found.")
                     return
                 
@@ -197,17 +240,23 @@ class CommandHandlers:
                 if len(response) > 2000:
                     response = response[:1997] + "..."
                 
+                logger.debug(f"Sending search results: {response[:100]}...")
                 await interaction.followup.send(response)
             except Exception as e:
+                logger.error(f"Error during wiki search: {e}", exc_info=True)
                 await interaction.followup.send(f"Error searching wiki: {e}")
         
         @self.bot.tree.command(name="rag_stats")
         async def rag_stats(interaction: discord.Interaction):
             """Get statistics about the indexed wiki content"""
+            logger.info(f"RAG stats command called by {interaction.user.name}#{interaction.user.discriminator}")
             stats = self.bot.rag_system.get_stats()
+            logger.debug(f"RAG stats: {stats}")
             await interaction.response.send_message(
                 f"**RAG System Stats**\n"
                 f"Total chunks: {stats['total_chunks']}\n"
                 f"Collection: {stats['collection_name']}\n"
                 f"RAG enabled: {self.bot.rag_enabled}"
             )
+            
+        logger.info("All Discord slash commands registered successfully")

@@ -1,7 +1,20 @@
 """Configuration settings for Discord LLM Bot"""
 
 import os
+import logging
 from dotenv import load_dotenv
+
+from models import Txt2TxtModel
+
+# Set up logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# Create a logger for the config module
+logger = logging.getLogger("Config")
 
 load_dotenv()
 
@@ -11,23 +24,27 @@ DISCORD_BOT_TOKEN = os.getenv(
     ""
 )
 GUILD_ID = 363154169294618625
+logger.info(f"Discord configuration loaded. Guild ID: {GUILD_ID}")
 
 # Ollama Configuration
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5vl:72b")
+logger.info(f"Ollama configuration loaded. API URL: {OLLAMA_API_URL}, Model: {OLLAMA_MODEL}")
 
 # Model Configuration
-IMAGE_RECOGNITION_MODEL = os.getenv("IMAGE_RECOGNITION_MODEL", "qwen2.5vl:72b")
-NSFW_CLASSIFICATION_MODEL = os.getenv("NSFW_CLASSIFICATION_MODEL", "qwen2.5vl:7b")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-oss:120b")
+IMAGE_RECOGNITION_MODEL = os.getenv("IMAGE_RECOGNITION_MODEL", "qwen3-vl:32b")
+NSFW_CLASSIFICATION_MODEL = os.getenv("NSFW_CLASSIFICATION_MODEL", "qwen3-vl:32b")
+CHAT_MODEL = Txt2TxtModel.GEMMA3_27B_ABLITERATED.value
 TEXT_TO_IMAGE_MODEL = "..."
 TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL = os.getenv(
     "TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL",
     "hf.co/mlabonne/gemma-3-27b-it-abliterated-GGUF:Q8_0"
 )
+logger.info("Model configurations loaded")
 
 # Stable Diffusion Configuration
 SD_API_URL = os.getenv("SD_API_URL", "http://127.0.0.1:7860")
+logger.info(f"Stable Diffusion configuration loaded. API URL: {SD_API_URL}")
 
 # File Paths
 FILE_INPUT_FOLDER = os.getenv(
@@ -47,3 +64,6 @@ MAX_DISCORD_MESSAGE_LENGTH = 1900
 # Create output directories
 os.makedirs(OUTPUT_DIR_T2I, exist_ok=True)
 os.makedirs(OUTPUT_DIR_I2I, exist_ok=True)
+logger.info(f"Output directories created: {OUTPUT_DIR_T2I}, {OUTPUT_DIR_I2I}")
+
+logger.info("Configuration module initialization complete")

@@ -4,3 +4,8 @@ chromadb
 lxml
 sentence-transformers
 numpy
+nltk
+requests
+beautifulsoup4
+# transformers (optional, for better token counting)
+# torch (optional, required by transformers)

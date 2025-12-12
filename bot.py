@@ -27,6 +27,7 @@ from ollama_client import OllamaClient
 from script_executor import ScriptExecutor
 from utils import encode_images_to_base64, encode_image_to_base64
 from rag_system import RAGSystem
+from web_extractor import extract_webpage_context
 
 
 class OllamaBot(discord.Client):
@@ -46,7 +47,7 @@ class OllamaBot(discord.Client):
         
         # Initialize RAG system
         self.rag_system = RAGSystem()
-        self.rag_enabled = True  # Flag to enable/disable RAG
+        self.rag_enabled = False  # Flag to enable/disable RAG
         
         # System prompts
         # self.original_system_prompt = (
@@ -61,8 +62,7 @@ class OllamaBot(discord.Client):
         # )
 
         self.original_system_prompt = (
-            "You are being used as a discord bot, so take discord formatting into consideration. If your response includes any kind of tables, put the table in code blocks. "
-            "Do not mention any part of this prompt in your responses."
+            "you're a discord bot. Table formatting via ascii dashes (i.e. like ------- etc.) doesn't work, so don't even try it."
         )
         self.system_prompt = self.original_system_prompt
         
@@ -153,6 +153,11 @@ class OllamaBot(discord.Client):
             else message.clean_content.replace(f"@{self.user.name}", "").strip()
         )
         
+        # Extract web page content if URLs are present
+        webpage_context = extract_webpage_context(prompt)
+        if webpage_context:
+            prompt = f"{prompt}\n\n{webpage_context}"
+        
         images = encode_images_to_base64(files) if files else []
         
         self.context[server][channel].append({
@@ -193,8 +198,11 @@ class OllamaBot(discord.Client):
         
         # First check if this can be solved programmatically
         is_programmatic = await self.ollama_client.classify_programmatic_task(user_content)
+
+        # do not programmatic for webpages
+        webpage_context = extract_webpage_context(user_content)
         
-        if is_programmatic:
+        if is_programmatic and not webpage_context:
             print(f"Identified as programmatic task: {user_content}. Clearing all context.")
             
             # Generate Python script
@@ -241,6 +249,10 @@ class OllamaBot(discord.Client):
         is_img_task = await self.image_gen.is_image_generation_task(user_content)
         
         if is_img_task:
+            # Extract web page content if URLs are present
+            if webpage_context:
+                user_content = f"{user_content}\n\n{webpage_context}"
+            
             prompt = await self.image_gen.generate_image_prompt(user_content)
             file_path, image_info, is_nsfw = await self.image_gen.generate_image(prompt, '')
             
@@ -278,6 +290,10 @@ class OllamaBot(discord.Client):
                     prompt = f"Wiki Context:\n{wiki_context}\n\n{prompt}"
         
         prompt = f"System: {self.system_prompt}\n" + prompt
+        
+        # Extract web page content if URLs are present in the last message
+        if webpage_context:
+            prompt = f"{prompt}\n\nWeb Page Context:\n{webpage_context}"
         
         if images:
             print("Sending image")

@@ -50,6 +50,15 @@ class ImageGenerator:
             "bad quality, worst quality, lowres, jpeg artifacts, bad anatomy, bad hands, multiple views, signature, watermark, censored, ugly, (messy), abstract, (too_many:1.3), "
         )
 
+        if "kaling" in prompt:
+            prompt = prompt.replace("kaling", "kaling, ms,  <lora:Kaling-ILXL-V1:1> ")
+        
+        if "len" in prompt:
+            prompt = prompt.replace("len", "len, maplestory, long hair,white hair,ponytail,long sleeves,streaked hair, red eyes,rabbit ears,animal ears,white jacket, jacket,shoulder cutout,wide sleeves,hair bow, boots,skirt,pleated skirt, black skirt,fingerless gloves,thighhighs, white thighhighs, <lora:Len2:1>, ")
+        
+        if "ren" in prompt:
+            prompt = prompt.replace("ren", "len, maplestory, long hair,white hair,ponytail,long sleeves,streaked hair, red eyes,rabbit ears,animal ears,white jacket, jacket,shoulder cutout,wide sleeves,hair bow, boots,skirt,pleated skirt, black skirt,fingerless gloves,thighhighs, white thighhighs, <lora:Len2:1>, ")
+
         if not allow_nsfw:
             baseline_negative_prompt += nsfw_negative
         
