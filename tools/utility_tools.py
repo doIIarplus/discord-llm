@@ -5,6 +5,7 @@ import re
 import math
 from datetime import datetime
 from typing import Any, Dict
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .base import Tool, ToolParameter, ParameterType, ToolResult, registry
 
@@ -102,15 +103,34 @@ class CurrentTimeTool(Tool):
             default="full",
             enum=["full", "date", "time", "unix"]
         ),
+        ToolParameter(
+            name="timezone",
+            description="The timezone to get the time for (e.g., 'UTC', 'America/New_York', 'Australia/Sydney')",
+            param_type=ParameterType.STRING,
+            required=False,
+            default=None
+        ),
     ]
 
     async def execute(self, **kwargs) -> ToolResult:
         fmt = kwargs.get("format", "full")
-        now = datetime.now()
+        timezone_str = kwargs.get("timezone")
 
         try:
+            if timezone_str:
+                try:
+                    tz = ZoneInfo(timezone_str)
+                    now = datetime.now(tz)
+                except ZoneInfoNotFoundError:
+                    # Try some common aliases or fuzzy matching if needed, 
+                    # but for now, just return specific error
+                    return ToolResult(success=False, output=None, error=f"Timezone '{timezone_str}' not found. Please use IANA timezone format (e.g., 'America/New_York').")
+            else:
+                now = datetime.now()
+                timezone_str = "local"
+
             if fmt == "full":
-                result = now.strftime("%Y-%m-%d %H:%M:%S")
+                result = now.strftime("%Y-%m-%d %H:%M:%S %Z")
             elif fmt == "date":
                 result = now.strftime("%Y-%m-%d")
             elif fmt == "time":
@@ -125,7 +145,7 @@ class CurrentTimeTool(Tool):
                 output={
                     "current_time": result,
                     "format": fmt,
-                    "timezone": "local"
+                    "timezone": timezone_str
                 }
             )
 

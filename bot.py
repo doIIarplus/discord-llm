@@ -28,6 +28,7 @@ from script_executor import ScriptExecutor
 from utils import encode_images_to_base64, encode_image_to_base64
 from rag_system import RAGSystem
 from web_extractor import extract_webpage_context
+from file_parser import FileParser
 
 # Import tool system
 from tools import ToolExecutor
@@ -104,23 +105,30 @@ class OllamaBot(discord.Client):
         server = message.guild.id
         
         # Handle attachments
-        files = []
+        image_files = []
+        document_files = []
+        
         for attachment in message.attachments:
             file_path = os.path.join(FILE_INPUT_FOLDER, attachment.filename)
             await attachment.save(file_path)
-            files.append(file_path)
+            
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']:
+                image_files.append(file_path)
+            else:
+                document_files.append(file_path)
             
         # Check if bot should respond
         if self.user in message.mentions:
             should_respond = True
-            await self.build_context(message, server, True, files)
+            await self.build_context(message, server, True, image_files, document_files)
             
         # Check if replying to bot
         if message.reference:
             ref_msg = await message.channel.fetch_message(message.reference.message_id)
             if ref_msg.author.id == self.user.id:
                 should_respond = True
-                await self.build_context(message, server, True, files)
+                await self.build_context(message, server, True, image_files, document_files)
                 
         if should_respond:
             async with message.channel.typing():
@@ -145,11 +153,14 @@ class OllamaBot(discord.Client):
         message: discord.Message,
         server: int,
         strip_mention: bool = False,
-        files: List[str] = None
+        image_files: List[str] = None,
+        document_files: List[str] = None
     ):
         """Build conversation context"""
-        if files is None:
-            files = []
+        if image_files is None:
+            image_files = []
+        if document_files is None:
+            document_files = []
             
         channel = message.channel.id
         
@@ -165,12 +176,24 @@ class OllamaBot(discord.Client):
             else message.clean_content.replace(f"@{self.user.name}", "").strip()
         )
         
+        # Process documents
+        if document_files:
+            doc_context = ""
+            for doc_path in document_files:
+                content = FileParser.parse_file(doc_path)
+                if content:
+                    filename = os.path.basename(doc_path)
+                    doc_context += f"\n\n--- Content of {filename} ---\n{content}\n--------------------------\n"
+            
+            if doc_context:
+                prompt += f"\n\n[Attached Documents Context]{doc_context}"
+        
         # Extract web page content if URLs are present
         webpage_context = extract_webpage_context(prompt)
         if webpage_context:
             prompt = f"{prompt}\n\n{webpage_context}"
         
-        images = encode_images_to_base64(files) if files else []
+        images = encode_images_to_base64(image_files) if image_files else []
         
         self.context[server][channel].append({
             "role": "user",

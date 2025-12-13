@@ -7,5 +7,6 @@ numpy
 nltk
 requests
 beautifulsoup4
+pypdf
 # transformers (optional, for better token counting)
 # torch (optional, required by transformers)

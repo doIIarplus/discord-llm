@@ -503,3 +503,535 @@ class GetUserPresenceTool(Tool):
         except Exception as e:
             logger.error(f"Error getting online members: {e}", exc_info=True)
             return ToolResult(success=False, output=None, error=str(e))
+
+
+@registry.register
+class DeleteMessageTool(Tool):
+    """Tool to delete a specific message"""
+
+    name = "delete_message"
+    description = "Delete a specific message by its ID."
+    category = "discord"
+    requires_discord_context = True
+    parameters = [
+        ToolParameter(
+            name="message_id",
+            description="The ID of the message to delete",
+            param_type=ParameterType.STRING,
+            required=True
+        ),
+        ToolParameter(
+            name="channel_id",
+            description="The channel ID containing the message. Defaults to current channel.",
+            param_type=ParameterType.STRING,
+            required=False
+        ),
+        ToolParameter(
+            name="reason",
+            description="Reason for deletion",
+            param_type=ParameterType.STRING,
+            required=False
+        ),
+    ]
+
+    async def execute(self, **kwargs) -> ToolResult:
+        ctx = kwargs.get("_discord_context")
+        if not ctx:
+            return ToolResult(success=False, output=None, error="Discord context required")
+
+        message_id = kwargs.get("message_id")
+        channel_id = kwargs.get("channel_id")
+        reason = kwargs.get("reason")
+
+        try:
+            channel = ctx.channel
+            if channel_id:
+                channel = ctx.bot.get_channel(int(channel_id))
+                if not channel:
+                    return ToolResult(success=False, output=None, error=f"Channel {channel_id} not found")
+
+            message = await channel.fetch_message(int(message_id))
+            await message.delete(reason=reason)
+
+            return ToolResult(
+                success=True,
+                output=f"Successfully deleted message {message_id}"
+            )
+
+        except discord.NotFound:
+            return ToolResult(success=False, output=None, error="Message not found")
+        except discord.Forbidden:
+            return ToolResult(success=False, output=None, error="No permission to delete this message")
+        except Exception as e:
+            logger.error(f"Error deleting message: {e}", exc_info=True)
+            return ToolResult(success=False, output=None, error=str(e))
+
+
+@registry.register
+class PurgeMessagesTool(Tool):
+    """Tool to bulk delete messages"""
+
+    name = "purge_messages"
+    description = "Bulk delete messages from a channel. This deletes the most recent messages."
+    category = "discord"
+    requires_discord_context = True
+    parameters = [
+        ToolParameter(
+            name="limit",
+            description="Number of messages to delete (max 100)",
+            param_type=ParameterType.INTEGER,
+            required=True
+        ),
+        ToolParameter(
+            name="channel_id",
+            description="Channel ID. Defaults to current channel.",
+            param_type=ParameterType.STRING,
+            required=False
+        ),
+    ]
+
+    async def execute(self, **kwargs) -> ToolResult:
+        ctx = kwargs.get("_discord_context")
+        if not ctx:
+            return ToolResult(success=False, output=None, error="Discord context required")
+
+        limit = min(kwargs.get("limit", 10), 100)
+        channel_id = kwargs.get("channel_id")
+
+        try:
+            channel = ctx.channel
+            if channel_id:
+                channel = ctx.bot.get_channel(int(channel_id))
+                if not channel:
+                    return ToolResult(success=False, output=None, error=f"Channel {channel_id} not found")
+
+            if not isinstance(channel, discord.TextChannel):
+                 return ToolResult(success=False, output=None, error="Can only purge text channels")
+
+            deleted = await channel.purge(limit=limit)
+
+            return ToolResult(
+                success=True,
+                output=f"Successfully deleted {len(deleted)} messages"
+            )
+
+        except discord.Forbidden:
+            return ToolResult(success=False, output=None, error="No permission to purge messages")
+        except Exception as e:
+            logger.error(f"Error purging messages: {e}", exc_info=True)
+            return ToolResult(success=False, output=None, error=str(e))
+
+
+@registry.register
+class ListRolesTool(Tool):
+    """Tool to list all roles in the server"""
+
+    name = "list_roles"
+    description = "List all available roles in the server."
+    category = "discord"
+    requires_discord_context = True
+    parameters = []
+
+    async def execute(self, **kwargs) -> ToolResult:
+        ctx = kwargs.get("_discord_context")
+        if not ctx or not ctx.guild:
+            return ToolResult(success=False, output=None, error="Discord context required")
+
+        try:
+            roles = []
+            for role in ctx.guild.roles:
+                if role.name == "@everyone":
+                    continue
+                roles.append({
+                    "id": str(role.id),
+                    "name": role.name,
+                    "members": len(role.members),
+                    "color": str(role.color),
+                    "hoisted": role.hoist,
+                    "mentionable": role.mentionable
+                })
+
+            # Sort by position (high to low)
+            roles.reverse()
+
+            return ToolResult(
+                success=True,
+                output={
+                    "total_roles": len(roles),
+                    "roles": roles
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Error listing roles: {e}", exc_info=True)
+            return ToolResult(success=False, output=None, error=str(e))
+
+
+@registry.register
+class AddRoleTool(Tool):
+    """Tool to add a role to a user"""
+
+    name = "add_role"
+    description = "Assign a role to a user."
+    category = "discord"
+    requires_discord_context = True
+    parameters = [
+        ToolParameter(
+            name="user_id",
+            description="ID of the user to assign role to",
+            param_type=ParameterType.STRING,
+            required=True
+        ),
+        ToolParameter(
+            name="role_name",
+            description="Name of the role to assign (or ID)",
+            param_type=ParameterType.STRING,
+            required=True
+        ),
+    ]
+
+    async def execute(self, **kwargs) -> ToolResult:
+        ctx = kwargs.get("_discord_context")
+        if not ctx or not ctx.guild:
+            return ToolResult(success=False, output=None, error="Discord context required")
+
+        user_id = kwargs.get("user_id")
+        role_name = kwargs.get("role_name")
+
+        try:
+            member = ctx.guild.get_member(int(user_id))
+            if not member:
+                return ToolResult(success=False, output=None, error="User not found")
+
+            # Find role
+            role = discord.utils.get(ctx.guild.roles, name=role_name)
+            if not role:
+                 # Try by ID
+                try:
+                    role = ctx.guild.get_role(int(role_name))
+                except ValueError:
+                    pass
+            
+            if not role:
+                 return ToolResult(success=False, output=None, error=f"Role '{role_name}' not found")
+
+            await member.add_roles(role)
+
+            return ToolResult(
+                success=True,
+                output=f"Successfully added role '{role.name}' to {member.display_name}"
+            )
+
+        except discord.Forbidden:
+            return ToolResult(success=False, output=None, error="No permission to manage roles")
+        except Exception as e:
+            logger.error(f"Error adding role: {e}", exc_info=True)
+            return ToolResult(success=False, output=None, error=str(e))
+
+
+@registry.register
+class RemoveRoleTool(Tool):
+    """Tool to remove a role from a user"""
+
+    name = "remove_role"
+    description = "Remove a role from a user."
+    category = "discord"
+    requires_discord_context = True
+    parameters = [
+        ToolParameter(
+            name="user_id",
+            description="ID of the user to remove role from",
+            param_type=ParameterType.STRING,
+            required=True
+        ),
+        ToolParameter(
+            name="role_name",
+            description="Name of the role to remove (or ID)",
+            param_type=ParameterType.STRING,
+            required=True
+        ),
+    ]
+
+    async def execute(self, **kwargs) -> ToolResult:
+        ctx = kwargs.get("_discord_context")
+        if not ctx or not ctx.guild:
+            return ToolResult(success=False, output=None, error="Discord context required")
+
+        user_id = kwargs.get("user_id")
+        role_name = kwargs.get("role_name")
+
+        try:
+            member = ctx.guild.get_member(int(user_id))
+            if not member:
+                return ToolResult(success=False, output=None, error="User not found")
+
+            # Find role
+            role = discord.utils.get(ctx.guild.roles, name=role_name)
+            if not role:
+                 # Try by ID
+                try:
+                    role = ctx.guild.get_role(int(role_name))
+                except ValueError:
+                    pass
+            
+            if not role:
+                 return ToolResult(success=False, output=None, error=f"Role '{role_name}' not found")
+
+            await member.remove_roles(role)
+
+            return ToolResult(
+                success=True,
+                output=f"Successfully removed role '{role.name}' from {member.display_name}"
+            )
+
+        except discord.Forbidden:
+            return ToolResult(success=False, output=None, error="No permission to manage roles")
+        except Exception as e:
+            logger.error(f"Error removing role: {e}", exc_info=True)
+            return ToolResult(success=False, output=None, error=str(e))
+
+
+@registry.register
+class CreateChannelTool(Tool):
+    """Tool to create a new channel"""
+
+    name = "create_channel"
+    description = "Create a new text or voice channel."
+    category = "discord"
+    requires_discord_context = True
+    parameters = [
+        ToolParameter(
+            name="name",
+            description="Name of the new channel",
+            param_type=ParameterType.STRING,
+            required=True
+        ),
+        ToolParameter(
+            name="type",
+            description="Type of channel: 'text' or 'voice'. Defaults to text.",
+            param_type=ParameterType.STRING,
+            required=False,
+            default="text",
+            enum=["text", "voice"]
+        ),
+        ToolParameter(
+            name="category_name",
+            description="Name of the category to place the channel in",
+            param_type=ParameterType.STRING,
+            required=False
+        ),
+    ]
+
+    async def execute(self, **kwargs) -> ToolResult:
+        ctx = kwargs.get("_discord_context")
+        if not ctx or not ctx.guild:
+            return ToolResult(success=False, output=None, error="Discord context required")
+
+        name = kwargs.get("name")
+        channel_type = kwargs.get("type", "text")
+        category_name = kwargs.get("category_name")
+
+        try:
+            category = None
+            if category_name:
+                category = discord.utils.get(ctx.guild.categories, name=category_name)
+                if not category:
+                    return ToolResult(success=False, output=None, error=f"Category '{category_name}' not found")
+
+            channel = None
+            if channel_type == "voice":
+                channel = await ctx.guild.create_voice_channel(name, category=category)
+            else:
+                channel = await ctx.guild.create_text_channel(name, category=category)
+
+            return ToolResult(
+                success=True,
+                output={
+                    "id": str(channel.id),
+                    "name": channel.name,
+                    "type": str(channel.type),
+                    "category": channel.category.name if channel.category else None
+                }
+            )
+
+        except discord.Forbidden:
+            return ToolResult(success=False, output=None, error="No permission to create channels")
+        except Exception as e:
+            logger.error(f"Error creating channel: {e}", exc_info=True)
+            return ToolResult(success=False, output=None, error=str(e))
+
+
+@registry.register
+class SetChannelTopicTool(Tool):
+    """Tool to set channel topic"""
+
+    name = "set_channel_topic"
+    description = "Set the topic/description of a channel."
+    category = "discord"
+    requires_discord_context = True
+    parameters = [
+        ToolParameter(
+            name="topic",
+            description="The new topic for the channel",
+            param_type=ParameterType.STRING,
+            required=True
+        ),
+        ToolParameter(
+            name="channel_id",
+            description="Channel ID. Defaults to current channel.",
+            param_type=ParameterType.STRING,
+            required=False
+        ),
+    ]
+
+    async def execute(self, **kwargs) -> ToolResult:
+        ctx = kwargs.get("_discord_context")
+        if not ctx:
+            return ToolResult(success=False, output=None, error="Discord context required")
+
+        topic = kwargs.get("topic")
+        channel_id = kwargs.get("channel_id")
+
+        try:
+            channel = ctx.channel
+            if channel_id:
+                channel = ctx.bot.get_channel(int(channel_id))
+                if not channel:
+                    return ToolResult(success=False, output=None, error=f"Channel {channel_id} not found")
+
+            if not isinstance(channel, discord.TextChannel):
+                 return ToolResult(success=False, output=None, error="Can only set topic for text channels")
+
+            await channel.edit(topic=topic)
+
+            return ToolResult(
+                success=True,
+                output=f"Successfully set topic for #{channel.name}"
+            )
+
+        except discord.Forbidden:
+            return ToolResult(success=False, output=None, error="No permission to edit channel")
+        except Exception as e:
+            logger.error(f"Error setting channel topic: {e}", exc_info=True)
+            return ToolResult(success=False, output=None, error=str(e))
+
+
+@registry.register
+class PinMessageTool(Tool):
+    """Tool to pin a message"""
+
+    name = "pin_message"
+    description = "Pin a message to the channel."
+    category = "discord"
+    requires_discord_context = True
+    parameters = [
+        ToolParameter(
+            name="message_id",
+            description="ID of the message to pin",
+            param_type=ParameterType.STRING,
+            required=True
+        ),
+        ToolParameter(
+            name="channel_id",
+            description="Channel ID. Defaults to current channel.",
+            param_type=ParameterType.STRING,
+            required=False
+        ),
+    ]
+
+    async def execute(self, **kwargs) -> ToolResult:
+        ctx = kwargs.get("_discord_context")
+        if not ctx:
+            return ToolResult(success=False, output=None, error="Discord context required")
+
+        message_id = kwargs.get("message_id")
+        channel_id = kwargs.get("channel_id")
+
+        try:
+            channel = ctx.channel
+            if channel_id:
+                channel = ctx.bot.get_channel(int(channel_id))
+                if not channel:
+                    return ToolResult(success=False, output=None, error=f"Channel {channel_id} not found")
+
+            message = await channel.fetch_message(int(message_id))
+            await message.pin()
+
+            return ToolResult(
+                success=True,
+                output=f"Successfully pinned message {message_id}"
+            )
+
+        except discord.NotFound:
+            return ToolResult(success=False, output=None, error="Message not found")
+        except discord.Forbidden:
+            return ToolResult(success=False, output=None, error="No permission to pin messages")
+        except Exception as e:
+            logger.error(f"Error pinning message: {e}", exc_info=True)
+            return ToolResult(success=False, output=None, error=str(e))
+
+
+@registry.register
+class CreateInviteTool(Tool):
+    """Tool to create an invite link"""
+
+    name = "create_invite"
+    description = "Create an invite link for the current or specified channel."
+    category = "discord"
+    requires_discord_context = True
+    parameters = [
+        ToolParameter(
+            name="channel_id",
+            description="Channel ID. Defaults to current channel.",
+            param_type=ParameterType.STRING,
+            required=False
+        ),
+        ToolParameter(
+            name="max_age",
+            description="Duration in seconds until invite expires. 0 for never.",
+            param_type=ParameterType.INTEGER,
+            required=False,
+            default=86400
+        ),
+        ToolParameter(
+            name="max_uses",
+            description="Max number of uses. 0 for unlimited.",
+            param_type=ParameterType.INTEGER,
+            required=False,
+            default=0
+        ),
+    ]
+
+    async def execute(self, **kwargs) -> ToolResult:
+        ctx = kwargs.get("_discord_context")
+        if not ctx:
+            return ToolResult(success=False, output=None, error="Discord context required")
+
+        channel_id = kwargs.get("channel_id")
+        max_age = kwargs.get("max_age", 86400)
+        max_uses = kwargs.get("max_uses", 0)
+
+        try:
+            channel = ctx.channel
+            if channel_id:
+                channel = ctx.bot.get_channel(int(channel_id))
+                if not channel:
+                    return ToolResult(success=False, output=None, error=f"Channel {channel_id} not found")
+
+            invite = await channel.create_invite(max_age=max_age, max_uses=max_uses)
+
+            return ToolResult(
+                success=True,
+                output={
+                    "url": invite.url,
+                    "code": invite.code,
+                    "channel": channel.name,
+                    "expires_at": invite.expires_at.isoformat() if invite.expires_at else None
+                }
+            )
+
+        except discord.Forbidden:
+            return ToolResult(success=False, output=None, error="No permission to create invites")
+        except Exception as e:
+            logger.error(f"Error creating invite: {e}", exc_info=True)
+            return ToolResult(success=False, output=None, error=str(e))
