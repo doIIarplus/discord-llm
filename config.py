@@ -10,7 +10,7 @@ from models import Txt2TxtModel
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 
 # Create a logger for the config module
@@ -19,17 +19,16 @@ logger = logging.getLogger("Config")
 load_dotenv()
 
 # Discord Configuration
-DISCORD_BOT_TOKEN = os.getenv(
-    "DISCORD_BOT_TOKEN",
-    ""
-)
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = 363154169294618625
 logger.info(f"Discord configuration loaded. Guild ID: {GUILD_ID}")
 
 # Ollama Configuration
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5vl:72b")
-logger.info(f"Ollama configuration loaded. API URL: {OLLAMA_API_URL}, Model: {OLLAMA_MODEL}")
+logger.info(
+    f"Ollama configuration loaded. API URL: {OLLAMA_API_URL}, Model: {OLLAMA_MODEL}"
+)
 
 # Model Configuration
 IMAGE_RECOGNITION_MODEL = os.getenv("IMAGE_RECOGNITION_MODEL", "qwen3-vl:32b")
@@ -38,7 +37,7 @@ CHAT_MODEL = Txt2TxtModel.GEMMA3_27B_ABLITERATED.value
 TEXT_TO_IMAGE_MODEL = "..."
 TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL = os.getenv(
     "TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL",
-    "hf.co/mlabonne/gemma-3-27b-it-abliterated-GGUF:Q8_0"
+    "hf.co/mlabonne/gemma-3-27b-it-abliterated-GGUF:Q8_0",
 )
 logger.info("Model configurations loaded")
 
@@ -48,8 +47,7 @@ logger.info(f"Stable Diffusion configuration loaded. API URL: {SD_API_URL}")
 
 # File Paths
 FILE_INPUT_FOLDER = os.getenv(
-    "FILE_INPUT_FOLDER",
-    "/home/dollarplus/projects/discord_llm_bot/multimodal_input/"
+    "FILE_INPUT_FOLDER", "/home/dollarplus/projects/discord_llm_bot/multimodal_input/"
 )
 OUTPUT_DIR = "api_out"
 OUTPUT_DIR_T2I = os.path.join(OUTPUT_DIR, "txt2img")

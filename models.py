@@ -22,6 +22,7 @@ class Txt2TxtModel(Enum):
     DEEPSEX = "hf.co/TheBloke/deepsex-34b-GGUF:Q8_0"
     GPT_OSS = "gpt-oss:120b"
     GPT_ABLITERATED = "huihui_ai/gpt-oss-abliterated:120b"
+    GPT_OSS_20b = "gpt-oss:20b"
 
 
 @dataclass

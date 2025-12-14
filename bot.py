@@ -29,6 +29,7 @@ from utils import encode_images_to_base64, encode_image_to_base64
 from rag_system import RAGSystem
 from web_extractor import extract_webpage_context
 from file_parser import FileParser
+from mention_extractor import extract_mention_context
 
 # Import tool system
 from tools import ToolExecutor
@@ -334,6 +335,12 @@ class OllamaBot(discord.Client):
         # Extract web page content if URLs are present in the last message
         if webpage_context:
             prompt = f"{prompt}\n\nWeb Page Context:\n{webpage_context}"
+
+        # Extract Discord mentions (users, channels, roles) from the last message
+        guild = self.get_guild(server)
+        mention_context = extract_mention_context(user_content, guild)
+        if mention_context:
+            prompt = f"{prompt}\n\n{mention_context}"
 
         if images:
             print("Sending image")

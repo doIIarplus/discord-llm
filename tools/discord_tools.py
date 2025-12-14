@@ -16,7 +16,7 @@ class GetChannelMessagesTool(Tool):
     """Tool to read recent messages from the current or specified channel"""
 
     name = "get_channel_messages"
-    description = "Retrieve recent messages from a Discord channel. Useful for getting context about recent conversations."
+    description = "Retrieve recent messages from a Discord channel. Useful for getting context about recent conversations. Can filter by a specific user."
     category = "discord"
     requires_discord_context = True
     parameters = [
@@ -39,6 +39,12 @@ class GetChannelMessagesTool(Tool):
             param_type=ParameterType.STRING,
             required=False
         ),
+        ToolParameter(
+            name="author_id",
+            description="Only include messages from this user ID. Use this to filter messages by a specific user.",
+            param_type=ParameterType.STRING,
+            required=False
+        ),
     ]
 
     async def execute(self, **kwargs) -> ToolResult:
@@ -49,6 +55,7 @@ class GetChannelMessagesTool(Tool):
         limit = min(kwargs.get("limit", 10), 50)
         channel_id = kwargs.get("channel_id")
         before_id = kwargs.get("before_message_id")
+        author_id = kwargs.get("author_id")
 
         try:
             # Get channel
@@ -65,7 +72,15 @@ class GetChannelMessagesTool(Tool):
                 before = discord.Object(id=int(before_id))
 
             messages = []
-            async for msg in channel.history(limit=limit, before=before):
+            # If filtering by author, we need to fetch more messages to find enough from that user
+            fetch_limit = limit * 5 if author_id else limit
+            fetch_limit = min(fetch_limit, 100)  # Cap at 100 to avoid excessive fetching
+
+            async for msg in channel.history(limit=fetch_limit, before=before):
+                # Filter by author if specified
+                if author_id and str(msg.author.id) != author_id:
+                    continue
+
                 messages.append({
                     "id": str(msg.id),
                     "author": msg.author.display_name,
@@ -75,6 +90,10 @@ class GetChannelMessagesTool(Tool):
                     "has_attachments": len(msg.attachments) > 0,
                     "has_embeds": len(msg.embeds) > 0,
                 })
+
+                # Stop once we have enough messages
+                if len(messages) >= limit:
+                    break
 
             return ToolResult(
                 success=True,
@@ -366,7 +385,7 @@ class SearchMessagesTool(Tool):
     """Tool to search for messages containing specific text"""
 
     name = "search_messages"
-    description = "Search for messages in the current channel containing specific text."
+    description = "Search for messages in a channel containing specific text. Can filter by user."
     category = "discord"
     requires_discord_context = True
     parameters = [
@@ -389,23 +408,38 @@ class SearchMessagesTool(Tool):
             param_type=ParameterType.STRING,
             required=False
         ),
+        ToolParameter(
+            name="channel_id",
+            description="Channel ID to search in. If not provided, uses current channel.",
+            param_type=ParameterType.STRING,
+            required=False
+        ),
     ]
 
     async def execute(self, **kwargs) -> ToolResult:
         ctx = kwargs.get("_discord_context")
-        if not ctx or not ctx.channel:
+        if not ctx or not ctx.bot:
             return ToolResult(success=False, output=None, error="Discord context required")
 
         query = kwargs.get("query", "").lower()
         limit = min(kwargs.get("limit", 50), 100)
         author_id = kwargs.get("author_id")
+        channel_id = kwargs.get("channel_id")
 
         if not query:
             return ToolResult(success=False, output=None, error="Query is required")
 
         try:
+            # Get channel
+            if channel_id:
+                channel = ctx.bot.get_channel(int(channel_id))
+                if not channel:
+                    return ToolResult(success=False, output=None, error=f"Channel {channel_id} not found")
+            else:
+                channel = ctx.channel
+
             matches = []
-            async for msg in ctx.channel.history(limit=limit):
+            async for msg in channel.history(limit=limit):
                 # Filter by author if specified
                 if author_id and str(msg.author.id) != author_id:
                     continue
@@ -415,6 +449,7 @@ class SearchMessagesTool(Tool):
                     matches.append({
                         "id": str(msg.id),
                         "author": msg.author.display_name,
+                        "author_id": str(msg.author.id),
                         "content": msg.content[:300],
                         "timestamp": msg.created_at.isoformat(),
                     })
@@ -422,12 +457,15 @@ class SearchMessagesTool(Tool):
             return ToolResult(
                 success=True,
                 output={
+                    "channel": channel.name,
                     "query": query,
                     "matches_found": len(matches),
                     "messages": matches[:20]  # Limit results
                 }
             )
 
+        except discord.Forbidden:
+            return ToolResult(success=False, output=None, error="No permission to read this channel")
         except Exception as e:
             logger.error(f"Error searching messages: {e}", exc_info=True)
             return ToolResult(success=False, output=None, error=str(e))
