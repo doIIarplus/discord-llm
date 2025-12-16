@@ -23,6 +23,7 @@ class Txt2TxtModel(Enum):
     GPT_OSS = "gpt-oss:120b"
     GPT_ABLITERATED = "huihui_ai/gpt-oss-abliterated:120b"
     GPT_OSS_20b = "gpt-oss:20b"
+    QWEN3_VL = "qwen3-vl:32b"
 
 
 @dataclass

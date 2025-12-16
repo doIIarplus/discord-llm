@@ -357,7 +357,8 @@ class OllamaBot(discord.Client):
         images = messages[-1].get("images", [])
         
         # First check if this can be solved programmatically
-        is_programmatic = await self.ollama_client.classify_programmatic_task(user_content)
+        # is_programmatic = await self.ollama_client.classify_programmatic_task(user_content)
+        is_programmatic = False
 
         # do not programmatic for webpages
         webpage_context = extract_webpage_context(user_content)
