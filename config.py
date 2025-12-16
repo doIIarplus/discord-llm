@@ -64,4 +64,27 @@ os.makedirs(OUTPUT_DIR_T2I, exist_ok=True)
 os.makedirs(OUTPUT_DIR_I2I, exist_ok=True)
 logger.info(f"Output directories created: {OUTPUT_DIR_T2I}, {OUTPUT_DIR_I2I}")
 
+# Bot personality for autonomous response decisions
+BOT_PERSONALITY = os.getenv("BOT_PERSONALITY", """
+- Helpful and knowledgeable about technology, programming, and AI
+- Enjoys discussing interesting technical problems
+- Will offer assistance when someone seems stuck
+- Friendly but not overly chatty
+""".strip())
+
+# Number of recent messages to consider for autonomous response context
+AUTONOMOUS_CONTEXT_MESSAGES = int(os.getenv("AUTONOMOUS_CONTEXT_MESSAGES", "10"))
+
+# Channels where autonomous responses are enabled (empty list = all channels)
+# Format: comma-separated channel IDs, e.g., "123456789,987654321"
+_autonomous_channels_str = os.getenv(
+    "AUTONOMOUS_RESPONSE_CHANNELS",
+    "1381051356894334999,1171545202486431745"
+)
+AUTONOMOUS_RESPONSE_CHANNELS = (
+    [int(ch.strip()) for ch in _autonomous_channels_str.split(",") if ch.strip()]
+    if _autonomous_channels_str
+    else []
+)
+
 logger.info("Configuration module initialization complete")

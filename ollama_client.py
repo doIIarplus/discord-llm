@@ -117,7 +117,59 @@ class OllamaClient:
         response = await self.generate(full_prompt, model=CHAT_MODEL)
         
         return "yes" in response.lower()
-        
+
+    async def classify_should_respond(
+        self,
+        conversation_context: str,
+        bot_personality: str,
+        bot_name: str
+    ) -> bool:
+        """
+        Classify whether the bot should respond to a conversation based on personality.
+
+        Args:
+            conversation_context: Recent messages formatted as a conversation
+            bot_personality: Description of the bot's personality and interests
+            bot_name: The bot's display name for reference
+
+        Returns:
+            True if the bot should respond, False otherwise
+        """
+        system_prompt = f"""You are a classifier that determines whether a Discord bot named "{bot_name}" should join a conversation.
+
+The bot has the following personality:
+{bot_personality}
+
+Based on the conversation context below, decide if "{bot_name}" would naturally want to respond. Consider:
+1. Is the topic interesting to the bot's personality?
+2. Would the bot have something valuable to add?
+3. Is someone indirectly asking for help the bot could provide?
+4. Would it feel natural for the bot to join this conversation?
+5. Avoid jumping into private/personal conversations unless directly relevant
+6. Don't respond to every message - be selective and natural
+
+Respond with ONLY "Yes" or "No".
+- "Yes" = The bot should respond because it's relevant to its interests/expertise
+- "No" = The bot should stay quiet and let the conversation continue
+
+Examples of when to respond (Yes):
+- Technical discussions the bot is knowledgeable about
+- Someone asking a question the bot can answer (even without mentioning the bot)
+- Topics aligned with the bot's personality/interests
+- Conversations where the bot's input would be genuinely helpful
+
+Examples of when NOT to respond (No):
+- Personal conversations between users
+- Topics outside the bot's expertise
+- When users are clearly talking to each other, not seeking bot input
+- Casual greetings or small talk not directed at the bot
+- Conversations that just concluded (no need to add more)"""
+
+        full_prompt = f"System: {system_prompt}\n\nRecent conversation:\n{conversation_context}\n\nShould {bot_name} respond? "
+        response = await self.generate(full_prompt, model=CHAT_MODEL)
+
+        return "yes" in response.lower()
+
     async def generate_python_script(self, prompt: str) -> str:
         """Generate Python code to solve a programmatic request"""
         system_prompt = (

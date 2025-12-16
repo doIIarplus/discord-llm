@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 import time
 import traceback
@@ -13,6 +14,9 @@ from discord import app_commands
 
 from commands import CommandHandlers
 from config import (
+    AUTONOMOUS_CONTEXT_MESSAGES,
+    AUTONOMOUS_RESPONSE_CHANNELS,
+    BOT_PERSONALITY,
     CONTEXT_LIMIT,
     DISCORD_BOT_TOKEN,
     FILE_INPUT_FOLDER,
@@ -30,6 +34,7 @@ from rag_system import RAGSystem
 from web_extractor import extract_webpage_context
 from file_parser import FileParser
 from mention_extractor import extract_mention_context
+from response_splitter import split_response_by_markers, calculate_typing_delay
 
 # Import tool system
 from tools import ToolExecutor
@@ -76,7 +81,19 @@ class OllamaBot(discord.Client):
         # )
 
         self.original_system_prompt = (
-            "you're a discord bot. Table formatting via ascii dashes (i.e. like ------- etc.) doesn't work, so don't even try it."
+            "You're a discord bot. Table formatting via ascii dashes (i.e. like ------- etc.) doesn't work, so don't even try it.\n\n"
+            "MULTI-MESSAGE RESPONSES:\n"
+            "When your response would naturally be multiple messages (like a greeting followed by information, "
+            "or multiple distinct points), you can split them using the marker: ---MSG---\n"
+            "Example:\n"
+            "Hey! Let me help you with that.\n"
+            "---MSG---\n"
+            "Here's what I found about your question...\n\n"
+            "Only use this for natural conversational breaks. Don't overuse it - most responses should be single messages. "
+            "Use it when:\n"
+            "- You want to greet then provide information\n"
+            "- You have multiple distinct topics to address\n"
+            "- A dramatic pause or separate thought would feel natural"
         )
         self.system_prompt = self.original_system_prompt
         
@@ -99,55 +116,54 @@ class OllamaBot(discord.Client):
         
     async def on_message(self, message: discord.Message):
         """Handle incoming messages"""
+        # Ignore bot messages (including self)
         if message.author.bot:
             return
-            
-        should_respond = False
+
         server = message.guild.id
-        
+        channel = message.channel.id
+
         # Handle attachments
         image_files = []
         document_files = []
-        
+
         for attachment in message.attachments:
             file_path = os.path.join(FILE_INPUT_FOLDER, attachment.filename)
             await attachment.save(file_path)
-            
+
             ext = os.path.splitext(file_path)[1].lower()
             if ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']:
                 image_files.append(file_path)
             else:
                 document_files.append(file_path)
-            
-        # Check if bot should respond
-        if self.user in message.mentions:
-            should_respond = True
-            await self.build_context(message, server, True, image_files, document_files)
-            
-        # Check if replying to bot
+
+        # Determine response mode
+        is_direct_mention = self.user in message.mentions
+        is_reply_to_bot = False
+
         if message.reference:
-            ref_msg = await message.channel.fetch_message(message.reference.message_id)
-            if ref_msg.author.id == self.user.id:
-                should_respond = True
-                await self.build_context(message, server, True, image_files, document_files)
-                
+            try:
+                ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                is_reply_to_bot = ref_msg.author.id == self.user.id
+            except discord.NotFound:
+                pass
+
+        # Always respond to direct mentions and replies
+        if is_direct_mention or is_reply_to_bot:
+            await self.build_context(message, server, True, image_files, document_files)
+            await self._send_response(message, server, channel)
+            return
+
+        # For other messages, use personality-based classification
+        # Only in allowed channels (empty list = all channels allowed)
+        if AUTONOMOUS_RESPONSE_CHANNELS and channel not in AUTONOMOUS_RESPONSE_CHANNELS:
+            return  # Skip autonomous responses in non-allowed channels
+
+        should_respond = await self._should_respond_autonomously(message, server, channel)
+
         if should_respond:
-            async with message.channel.typing():
-                start = time.perf_counter()
-                response_texts = await self.query_ollama(server, message.channel.id)
-                end = time.perf_counter()
-                elapsed = end - start
-                
-                if isinstance(response_texts, tuple):
-                    await message.channel.send(embed=response_texts[0], file=response_texts[1])
-                else:
-                    for response_text in response_texts:
-                        if isinstance(response_text, str) and response_text.strip():
-                            print(f"Sending response: {response_text}")
-                            await message.channel.send(response_text)
-                        elif isinstance(response_text, dict) and "image" in response_text:
-                            file = discord.File(response_text["image"])
-                            await message.channel.send(file=file)
+            await self.build_context(message, server, False, image_files, document_files)
+            await self._send_response(message, server, channel)
                             
     async def build_context(
         self,
@@ -207,7 +223,115 @@ class OllamaBot(discord.Client):
         # Maintain context limit
         if len(self.context[server][channel]) > CONTEXT_LIMIT:
             self.context[server][channel].pop(0)
-            
+
+    async def _should_respond_autonomously(
+        self,
+        message: discord.Message,
+        server: int,
+        channel: int
+    ) -> bool:
+        """
+        Use LLM to decide if bot should respond based on personality.
+
+        Gathers recent conversation context and asks the LLM if responding
+        would be natural given the bot's personality.
+        """
+        # Gather recent messages for context
+        conversation_context = await self._get_recent_conversation(
+            message.channel,
+            limit=AUTONOMOUS_CONTEXT_MESSAGES
+        )
+
+        # Ask the LLM if we should respond
+        should_respond = await self.ollama_client.classify_should_respond(
+            conversation_context=conversation_context,
+            bot_personality=BOT_PERSONALITY,
+            bot_name=self.user.display_name
+        )
+
+        return should_respond
+
+    async def _get_recent_conversation(
+        self,
+        channel: discord.TextChannel,
+        limit: int = 10
+    ) -> str:
+        """
+        Fetch recent messages from channel and format as conversation context.
+
+        Args:
+            channel: The Discord channel to fetch from
+            limit: Number of recent messages to fetch
+
+        Returns:
+            Formatted conversation string
+        """
+        messages = []
+        async for msg in channel.history(limit=limit):
+            # Mark bot's own messages
+            author_name = msg.author.display_name
+            if msg.author.id == self.user.id:
+                author_name = f"{author_name} (this bot)"
+
+            timestamp = msg.created_at.strftime("%H:%M")
+            content = msg.content[:500]  # Truncate very long messages
+            messages.append(f"[{timestamp}] {author_name}: {content}")
+
+        # Reverse to chronological order (history returns newest first)
+        messages.reverse()
+
+        return "\n".join(messages)
+
+    async def _send_response(
+        self,
+        message: discord.Message,
+        server: int,
+        channel: int
+    ):
+        """
+        Generate and send response with natural typing delays for multiple messages.
+        """
+        async with message.channel.typing():
+            start = time.perf_counter()
+            response_data = await self.query_ollama(server, channel)
+            end = time.perf_counter()
+            elapsed = end - start
+            print(f"Query took {elapsed:.2f}s")
+
+        # Handle image generation responses (tuple with embed + file)
+        if isinstance(response_data, tuple):
+            await message.channel.send(embed=response_data[0], file=response_data[1])
+            return
+
+        # Process text responses
+        for response_item in response_data:
+            if isinstance(response_item, str) and response_item.strip():
+                # Split by markers if present
+                message_parts = split_response_by_markers(response_item)
+
+                for i, part in enumerate(message_parts):
+                    # Show typing indicator
+                    async with message.channel.typing():
+                        # Calculate delay based on message length
+                        delay = calculate_typing_delay(part)
+                        # Add small random variation (10-30%)
+                        delay *= random.uniform(0.9, 1.3)
+
+                        # Wait (simulating typing)
+                        await asyncio.sleep(delay)
+
+                    # Send the message
+                    print(f"Sending response part {i+1}/{len(message_parts)}: {part[:50]}...")
+                    await message.channel.send(part)
+
+                    # Small pause between messages if there are more
+                    if i < len(message_parts) - 1:
+                        await asyncio.sleep(random.uniform(0.3, 0.8))
+
+            elif isinstance(response_item, dict) and "image" in response_item:
+                file = discord.File(response_item["image"])
+                await message.channel.send(file=file)
+
     def format_prompt(self, messages: List[dict]) -> str:
         """Format messages into a prompt"""
         prompt = ""
