@@ -33,8 +33,9 @@ def test_complete_functionality():
         return False
     
     # Test context extraction
-    context = extract_webpage_context(test_text)
+    context, sources = extract_webpage_context(test_text)
     print(f"Context length: {len(context)}")
+    print(f"Sources: {sources}")
     
     if len(context) == 0:
         print("Failed to extract context!")

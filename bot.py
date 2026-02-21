@@ -1,10 +1,9 @@
 """Discord LLM Bot - Main module"""
 
 import asyncio
-import json
+import re
 import os
 import random
-import re
 import time
 import traceback
 from typing import Dict, List
@@ -14,9 +13,6 @@ from discord import app_commands
 
 from commands import CommandHandlers
 from config import (
-    AUTONOMOUS_CONTEXT_MESSAGES,
-    AUTONOMOUS_RESPONSE_CHANNELS,
-    BOT_PERSONALITY,
     CONTEXT_LIMIT,
     DISCORD_BOT_TOKEN,
     FILE_INPUT_FOLDER,
@@ -26,69 +22,59 @@ from config import (
     MAX_DISCORD_MESSAGE_LENGTH
 )
 from image_generation import ImageGenerator
-from latex import split_text_and_latex
 from ollama_client import OllamaClient
-from script_executor import ScriptExecutor
-from utils import encode_images_to_base64, encode_image_to_base64
+from utils import encode_images_to_base64
 from rag_system import RAGSystem
-from web_extractor import extract_webpage_context
+from web_extractor import extract_webpage_context, web_search, format_search_results, js_renderer
 from file_parser import FileParser
 from mention_extractor import extract_mention_context
-from response_splitter import split_response_by_markers, calculate_typing_delay
+from response_splitter import split_response_by_markers, split_long_message, calculate_typing_delay
 
-# Import tool system
-from tools import ToolExecutor
-from tools.executor import DiscordContext
-from tools.base import registry
-# Import tools to register them
-import tools.discord_tools
-import tools.utility_tools
+# Keywords that suggest an image generation request
+_IMAGE_GEN_KEYWORDS = re.compile(
+    r'\b(generate|create|draw|make|paint|render|sketch)\b.{0,30}\b(image|picture|photo|illustration|art|drawing|painting)\b',
+    re.IGNORECASE
+)
+
+# Keywords that suggest the user needs up-to-date / web-searchable info
+_SEARCH_KEYWORDS = re.compile(
+    r'\b(latest|recent|current|today|yesterday|tonight|this week|this month|this year'
+    r'|news|update|score|weather|price|stock|election|released|announced'
+    r'|who won|who is winning|what happened|how much does|how much is'
+    r'|in 202[4-9]|right now)\b',
+    re.IGNORECASE
+)
 
 
 class OllamaBot(discord.Client):
     """Main Discord bot class"""
-    
+
     def __init__(self):
         super().__init__(intents=discord.Intents.all())
         self.tree = app_commands.CommandTree(self)
-        
+
         # Per-server per-channel context
         self.context: Dict[str, Dict[str, List[dict]]] = {}
-        
+
         # Initialize clients
         self.ollama_client = OllamaClient()
         self.image_gen = ImageGenerator()
-        self.script_executor = ScriptExecutor()
-        
+        self._last_search_sources: List[dict] = []
+
         # Initialize RAG system
         self.rag_system = RAGSystem()
-        self.rag_enabled = False  # Flag to enable/disable RAG
+        self.rag_enabled = False
 
-        # Initialize tool system
-        self.tool_executor = ToolExecutor(registry)
-        self.tools_enabled = True  # Flag to enable/disable tool calling
-        
         # System prompts
-        # self.original_system_prompt = (
-        #     "If your response includes actual mathematical expressions or formulas, present them using LaTeX syntax, "
-        #     "wrapped in double dollar signs like this: $$...$$. Only use LaTeX for mathematical content—do not use "
-        #     "LaTeX for plain text, variables in discussion, or non-math concepts. Ensure all LaTeX expressions are "
-        #     "valid, syntactically correct, and renderable. For example, the quadratic formula should be written "
-        #     "as: $$x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$$ \n "
-        #     "Avoid using LaTeX unless a clear mathematical equation is being communicated. DO NOT USE MATHEMATICAL EQUATIONS OR LATEX IN NON MATH RELATED TOPICS."
-        #     "Do not reference this instruction in your response. You are being used as a discord bot, so take discord formatting into consideration. If your response includes any kind of tables, put the table in code blocks. "
-        #     "Do not mention any part of this prompt in your responses."
-        # )
-
         self.original_system_prompt = (
-            "You're a discord bot. Table formatting via ascii dashes (i.e. like ------- etc.) doesn't work, so don't even try it.\n\n"
+            "Your responses should be akin to that of a typical millenial texter: short, to the point, and mostly without punctuation. Do not offer any kind of assistance without being prompted. use slang *sparingly*. \n\n"
             "MULTI-MESSAGE RESPONSES:\n"
             "When your response would naturally be multiple messages (like a greeting followed by information, "
             "or multiple distinct points), you can split them using the marker: ---MSG---\n"
             "Example:\n"
-            "Hey! Let me help you with that.\n"
+            "hey i can help you with that.\n"
             "---MSG---\n"
-            "Here's what I found about your question...\n\n"
+            "i found out this about what you asked\n\n"
             "Only use this for natural conversational breaks. Don't overuse it - most responses should be single messages. "
             "Use it when:\n"
             "- You want to greet then provide information\n"
@@ -96,24 +82,27 @@ class OllamaBot(discord.Client):
             "- A dramatic pause or separate thought would feel natural"
         )
         self.system_prompt = self.original_system_prompt
-        
+
         # Setup command handlers
         self.command_handlers = CommandHandlers(self)
-        
+
     async def setup_hook(self):
         """Setup hook for Discord bot"""
         self.command_handlers.setup_commands()
-        await self.tree.sync()
-        
+        # NOTE: tree.sync() is intentionally omitted here.
+        # Run it manually (e.g. via a one-off script) after changing commands,
+        # as Discord rate-limits this call.
+        await js_renderer.start()
+
     def pick_model(self, server: int, channel: int) -> str:
         """Pick the appropriate model based on context"""
-        if (server in self.context and 
-            channel in self.context[server] and 
-            self.context[server][channel] and 
+        if (server in self.context and
+            channel in self.context[server] and
+            self.context[server][channel] and
             self.context[server][channel][-1].get("images")):
             return IMAGE_RECOGNITION_MODEL
         return CHAT_MODEL
-        
+
     async def on_message(self, message: discord.Message):
         """Handle incoming messages"""
         # Ignore bot messages (including self)
@@ -128,7 +117,8 @@ class OllamaBot(discord.Client):
         document_files = []
 
         for attachment in message.attachments:
-            file_path = os.path.join(FILE_INPUT_FOLDER, attachment.filename)
+            safe_filename = os.path.basename(attachment.filename)
+            file_path = os.path.join(FILE_INPUT_FOLDER, safe_filename)
             await attachment.save(file_path)
 
             ext = os.path.splitext(file_path)[1].lower()
@@ -142,29 +132,21 @@ class OllamaBot(discord.Client):
         is_reply_to_bot = False
 
         if message.reference:
-            try:
-                ref_msg = await message.channel.fetch_message(message.reference.message_id)
-                is_reply_to_bot = ref_msg.author.id == self.user.id
-            except discord.NotFound:
-                pass
+            # Use cached resolved message when available
+            ref_msg = message.reference.resolved
+            if ref_msg is None:
+                try:
+                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                except discord.NotFound:
+                    ref_msg = None
+            if ref_msg and ref_msg.author.id == self.user.id:
+                is_reply_to_bot = True
 
-        # Always respond to direct mentions and replies
+        # Only respond to direct mentions and replies
         if is_direct_mention or is_reply_to_bot:
-            await self.build_context(message, server, True, image_files, document_files)
-            await self._send_response(message, server, channel)
-            return
+            fetched_sources = await self.build_context(message, server, False, image_files, document_files)
+            await self._send_response(message, server, channel, fetched_sources)
 
-        # For other messages, use personality-based classification
-        # Only in allowed channels (empty list = all channels allowed)
-        if AUTONOMOUS_RESPONSE_CHANNELS and channel not in AUTONOMOUS_RESPONSE_CHANNELS:
-            return  # Skip autonomous responses in non-allowed channels
-
-        should_respond = await self._should_respond_autonomously(message, server, channel)
-
-        if should_respond:
-            await self.build_context(message, server, False, image_files, document_files)
-            await self._send_response(message, server, channel)
-                            
     async def build_context(
         self,
         message: discord.Message,
@@ -178,22 +160,22 @@ class OllamaBot(discord.Client):
             image_files = []
         if document_files is None:
             document_files = []
-            
+
         channel = message.channel.id
-        
+
         if server not in self.context:
             self.context[server] = {}
-            
+
         if channel not in self.context[server]:
             self.context[server][channel] = []
-            
+
         prompt = (
             message.content
             if not strip_mention
             else message.clean_content.replace(f"@{self.user.name}", "").strip()
         )
-        
-        # Process documents
+
+        # Process documents and clean up files after parsing
         if document_files:
             doc_context = ""
             for doc_path in document_files:
@@ -201,17 +183,29 @@ class OllamaBot(discord.Client):
                 if content:
                     filename = os.path.basename(doc_path)
                     doc_context += f"\n\n--- Content of {filename} ---\n{content}\n--------------------------\n"
-            
+                try:
+                    os.remove(doc_path)
+                except OSError:
+                    pass
+
             if doc_context:
                 prompt += f"\n\n[Attached Documents Context]{doc_context}"
-        
+
         # Extract web page content if URLs are present
-        webpage_context = extract_webpage_context(prompt)
+        webpage_context, fetched_sources = await extract_webpage_context(prompt)
         if webpage_context:
             prompt = f"{prompt}\n\n{webpage_context}"
-        
-        images = encode_images_to_base64(image_files) if image_files else []
-        
+
+        # Encode images and clean up files
+        images = []
+        if image_files:
+            images = encode_images_to_base64(image_files)
+            for img_path in image_files:
+                try:
+                    os.remove(img_path)
+                except OSError:
+                    pass
+
         self.context[server][channel].append({
             "role": "user",
             "name": message.author.display_name,
@@ -219,74 +213,19 @@ class OllamaBot(discord.Client):
             "timestamp": time.time(),
             "images": images,
         })
-        
+
         # Maintain context limit
         if len(self.context[server][channel]) > CONTEXT_LIMIT:
             self.context[server][channel].pop(0)
 
-    async def _should_respond_autonomously(
-        self,
-        message: discord.Message,
-        server: int,
-        channel: int
-    ) -> bool:
-        """
-        Use LLM to decide if bot should respond based on personality.
-
-        Gathers recent conversation context and asks the LLM if responding
-        would be natural given the bot's personality.
-        """
-        # Gather recent messages for context
-        conversation_context = await self._get_recent_conversation(
-            message.channel,
-            limit=AUTONOMOUS_CONTEXT_MESSAGES
-        )
-
-        # Ask the LLM if we should respond
-        should_respond = await self.ollama_client.classify_should_respond(
-            conversation_context=conversation_context,
-            bot_personality=BOT_PERSONALITY,
-            bot_name=self.user.display_name
-        )
-
-        return should_respond
-
-    async def _get_recent_conversation(
-        self,
-        channel: discord.TextChannel,
-        limit: int = 10
-    ) -> str:
-        """
-        Fetch recent messages from channel and format as conversation context.
-
-        Args:
-            channel: The Discord channel to fetch from
-            limit: Number of recent messages to fetch
-
-        Returns:
-            Formatted conversation string
-        """
-        messages = []
-        async for msg in channel.history(limit=limit):
-            # Mark bot's own messages
-            author_name = msg.author.display_name
-            if msg.author.id == self.user.id:
-                author_name = f"{author_name} (this bot)"
-
-            timestamp = msg.created_at.strftime("%H:%M")
-            content = msg.content[:500]  # Truncate very long messages
-            messages.append(f"[{timestamp}] {author_name}: {content}")
-
-        # Reverse to chronological order (history returns newest first)
-        messages.reverse()
-
-        return "\n".join(messages)
+        return fetched_sources
 
     async def _send_response(
         self,
         message: discord.Message,
         server: int,
-        channel: int
+        channel: int,
+        sources: List[dict] = None,
     ):
         """
         Generate and send response with natural typing delays for multiple messages.
@@ -298,37 +237,60 @@ class OllamaBot(discord.Client):
             elapsed = end - start
             print(f"Query took {elapsed:.2f}s")
 
+        # Merge URL-fetched sources with search sources
+        all_sources = list(sources or [])
+        search_sources = getattr(self, '_last_search_sources', [])
+        if search_sources:
+            all_sources.extend(search_sources)
+            self._last_search_sources = []
+
         # Handle image generation responses (tuple with embed + file)
         if isinstance(response_data, tuple):
             await message.channel.send(embed=response_data[0], file=response_data[1])
             return
 
-        # Process text responses
+        # Collect all text parts to figure out where to append sources
+        all_parts = []
         for response_item in response_data:
             if isinstance(response_item, str) and response_item.strip():
-                # Split by markers if present
-                message_parts = split_response_by_markers(response_item)
+                all_parts.extend(split_response_by_markers(response_item))
 
-                for i, part in enumerate(message_parts):
-                    # Show typing indicator
-                    async with message.channel.typing():
-                        # Calculate delay based on message length
-                        delay = calculate_typing_delay(part)
-                        # Add small random variation (10-30%)
-                        delay *= random.uniform(0.9, 1.3)
+        # Append source footnote with clickable links (deduplicated by domain)
+        if all_sources and all_parts:
+            seen_domains = set()
+            source_links = []
+            for s in all_sources:
+                try:
+                    domain = s['url'].split('/')[2].removeprefix('www.')
+                except (IndexError, AttributeError):
+                    continue
+                if domain not in seen_domains:
+                    seen_domains.add(domain)
+                    source_links.append(f"[{domain}](<{s['url']}>)")
+            if source_links:
+                footnote = f"\n-# Sources: {' | '.join(source_links)}"
+                last = all_parts[-1] + footnote
+                if len(last) <= MAX_DISCORD_MESSAGE_LENGTH:
+                    all_parts[-1] = last
+                else:
+                    all_parts.append(f"-# Sources: {' | '.join(source_links)}")
 
-                        # Wait (simulating typing)
-                        await asyncio.sleep(delay)
+        # Send text parts with typing delays
+        for i, part in enumerate(all_parts):
+            async with message.channel.typing():
+                delay = calculate_typing_delay(part)
+                delay *= random.uniform(0.9, 1.3)
+                await asyncio.sleep(delay)
 
-                    # Send the message
-                    print(f"Sending response part {i+1}/{len(message_parts)}: {part[:50]}...")
-                    await message.channel.send(part)
+            print(f"Sending response part {i+1}/{len(all_parts)}: {part[:50]}...")
+            await message.channel.send(part)
 
-                    # Small pause between messages if there are more
-                    if i < len(message_parts) - 1:
-                        await asyncio.sleep(random.uniform(0.3, 0.8))
+            if i < len(all_parts) - 1:
+                await asyncio.sleep(random.uniform(0.3, 0.8))
 
-            elif isinstance(response_item, dict) and "image" in response_item:
+        # Handle any image items
+        for response_item in response_data:
+            if isinstance(response_item, dict) and "image" in response_item:
                 file = discord.File(response_item["image"])
                 await message.channel.send(file=file)
 
@@ -341,101 +303,134 @@ class OllamaBot(discord.Client):
             prompt += f"{role} {name}: {msg['content']}\n"
         prompt += "Assistant: "
         return prompt
-        
+
     def process_response(self, text: str, limit: int = MAX_DISCORD_MESSAGE_LENGTH) -> List:
-        """Process response text, handling LaTeX and length limits"""
+        """Process response text, handling length limits"""
         # Remove thinking tags
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-        processed_response = split_text_and_latex(text)
-        print(f"Processed response: {processed_response}")
-        return processed_response
-        
+        # Wrap bare URLs in <> to suppress Discord auto-embeds
+        text = re.sub(r'(?<![<])(https?://\S+)', r'<\1>', text)
+        # Split long text to fit Discord's message length limit
+        parts = split_long_message(text.strip(), limit)
+        return parts
+
     async def query_ollama(self, server: int, channel: int, override_messages: List[dict] = None):
         """Query Ollama for a response"""
         messages = override_messages or self.context[server][channel]
         user_content = messages[-1]['content']
         images = messages[-1].get("images", [])
-        
-        # First check if this can be solved programmatically
-        # is_programmatic = await self.ollama_client.classify_programmatic_task(user_content)
-        is_programmatic = False
 
-        # do not programmatic for webpages
-        webpage_context = extract_webpage_context(user_content)
-        
-        if is_programmatic and not webpage_context:
-            print(f"Identified as programmatic task: {user_content}. Clearing all context.")
-            
-            # Generate Python script
-            script = await self.ollama_client.generate_python_script(user_content)
-            print(f"Generated script:\n{script}")
-            
-            # Execute the script
-            success, output, image_path = self.script_executor.execute_script(script)
-            
-            if success:
-                # Prepare the context for the LLM with the script output
-                script_context = (
-                    f"The user asked: {user_content}\n"
-                    f"I executed the following Python script:\n```python\n{script}\n```\n"
-                    f"The script output was:\n{output}\n"
+        # Check if this is an image generation task (fast heuristic first)
+        # Also check if this could be a follow-up to a recent image generation
+        has_recent_image_gen = any(
+            msg.get("role") == "assistant" and "[Generated an image" in msg.get("content", "")
+            for msg in messages[-4:]
+        )
+        if _IMAGE_GEN_KEYWORDS.search(user_content) or has_recent_image_gen:
+            # For follow-ups, give the classifier context about the recent image
+            classify_input = user_content
+            if has_recent_image_gen and not _IMAGE_GEN_KEYWORDS.search(user_content):
+                for msg in reversed(messages[-4:]):
+                    if msg.get("role") == "assistant" and "[Generated an image" in msg.get("content", ""):
+                        classify_input = f"[Previous: {msg['content']}]\nUser: {user_content}"
+                        break
+            is_img_task = await self.image_gen.is_image_generation_task(classify_input)
+
+            if is_img_task:
+                # Determine if this is a modification of a previous image or a fresh request
+                is_modification = has_recent_image_gen and not _IMAGE_GEN_KEYWORDS.search(user_content)
+                prev_seed = -1
+                prev_prompt = None
+
+                if is_modification:
+                    # Extract previous prompt and seed from context
+                    for msg in reversed(messages[-4:]):
+                        content = msg.get("content", "")
+                        if msg.get("role") == "assistant" and "[Generated an image" in content:
+                            prompt_match = re.search(r'\[Generated an image with the following prompt: (.+?)\]', content, re.DOTALL)
+                            seed_match = re.search(r'seed: (\d+)', content)
+                            if prompt_match:
+                                prev_prompt = prompt_match.group(1)
+                            if seed_match:
+                                prev_seed = int(seed_match.group(1))
+                            break
+
+                if is_modification and prev_prompt:
+                    # Modification: minimally edit the previous prompt, reuse seed
+                    print(f"  [image modification: reusing seed {prev_seed}, modifying prompt]")
+                    prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
+                    print(f"  [modified prompt: {prompt}]")
+                else:
+                    # New generation: fresh prompt, random seed
+                    prev_seed = -1
+                    # Extract web page content if URLs are present
+                    webpage_context, _ = await extract_webpage_context(user_content)
+                    if webpage_context:
+                        user_content = f"{user_content}\n\n{webpage_context}"
+                    prompt = (await self.image_gen.generate_image_prompt(user_content)).strip()
+
+                file_path, image_info, is_nsfw = await self.image_gen.generate_image(prompt, '', seed=prev_seed)
+
+                # Store image generation context for follow-up continuity
+                if override_messages is None:
+                    self.context[server][channel].append({
+                        "role": "assistant",
+                        "content": (
+                            f"[Generated an image with the following prompt: {prompt}] "
+                            f"(seed: {image_info.seed}, "
+                            f"size: {image_info.width}x{image_info.height})"
+                        ),
+                        "timestamp": time.time(),
+                    })
+
+                file = discord.File(fp=file_path, filename='generated.png')
+                image_info_text = (
+                    f"steps: {image_info.steps}, "
+                    f"cfg: {image_info.cfg_scale}, "
+                    f"size: {image_info.width}x{image_info.height}, "
+                    f"seed: {image_info.seed}"
                 )
-                
-                if image_path:
-                    script_context += f"The script also generated an image (attached).\n"
-                    # Read the image for the LLM to analyze
-                    image_base64 = encode_image_to_base64(image_path)
-                    images = [image_base64]
-                
-                script_context += "Based on this output, provide a clear and concise answer to the user's question. Do not mention that this output was generated via a script. Do not mention any file names or such. Just provide an answer to the question."
-                
-                # Get LLM response based on the script output
-                prompt = f"System: {self.system_prompt}\n{script_context}\nAssistant: "
-                response = await self.ollama_client.generate(prompt, model=CHAT_MODEL, images=images)
-                
-                # Process the response
-                result = self.process_response(response)
-                
-                # If there's an image, add it to the response
-                if image_path:
-                    result.append({"image": image_path})
-                    
-                return result
-            else:
-                # Script failed, fall back to regular response
-                print(f"Script execution failed: {output}")
-                # Continue with regular flow below
-        
-        # Check if this is an image generation task
-        is_img_task = await self.image_gen.is_image_generation_task(user_content)
-        
-        if is_img_task:
-            # Extract web page content if URLs are present
-            if webpage_context:
-                user_content = f"{user_content}\n\n{webpage_context}"
-            
-            prompt = await self.image_gen.generate_image_prompt(user_content)
-            file_path, image_info, is_nsfw = await self.image_gen.generate_image(prompt, '')
-            
-            file = discord.File(fp=file_path, filename='generated.png')
-            image_info_text = (
-                f"steps: {image_info.steps}, "
-                f"cfg: {image_info.cfg_scale}, "
-                f"size: {image_info.width}x{image_info.height}, "
-                f"seed: {image_info.seed}"
-            )
-            
-            embed = discord.Embed()
-            embed.set_image(url='attachment://generated.png')
-            embed.set_footer(text=image_info_text)
-            
-            if is_nsfw:
-                file.spoiler = True
-                
-            return (embed, file)
-            
+
+                embed = discord.Embed()
+                embed.set_image(url='attachment://generated.png')
+                embed.set_footer(text=image_info_text)
+
+                if is_nsfw:
+                    file.spoiler = True
+
+                return (embed, file)
+
+        # Check if the user's message needs a web search (heuristic + LLM)
+        search_summary = ""
+        search_sources = []
+        # Strip Discord mentions for cleaner LLM input
+        clean_query = re.sub(r'<@!?\d+>', '', user_content).strip()
+        if _SEARCH_KEYWORDS.search(clean_query):
+            print("  [search heuristic matched, checking with LLM...]")
+            needs_search = await self.ollama_client.classify_search_task(clean_query)
+            if needs_search:
+                search_query = await self.ollama_client.extract_search_query(clean_query)
+                print(f"  [searching: {search_query}]")
+                search_results = await web_search(search_query, max_results=5)
+                if search_results:
+                    raw_context = format_search_results(search_results)
+                    print(f"  [summarizing {len(raw_context)} chars of search results...]")
+                    search_summary = await self.ollama_client.summarize_search_results(clean_query, raw_context)
+                    print(f"  [summary: {len(search_summary)} chars]")
+                    print(f"  [summary content: {search_summary}]")
+                    search_sources = [
+                        {"url": r["url"], "title": r["title"] or r["url"]}
+                        for r in search_results[:3]
+                    ]
+
+        self._last_search_sources = search_sources
+
         # Regular text query
         prompt = self.format_prompt(messages)
+
+        # Add search summary if available
+        if search_summary:
+            prompt = f"Search Results Summary:\n{search_summary}\n\n{prompt}"
 
         # Add RAG context if enabled
         if self.rag_enabled:
@@ -450,16 +445,8 @@ class OllamaBot(discord.Client):
                 if wiki_context:
                     prompt = f"Wiki Context:\n{wiki_context}\n\n{prompt}"
 
-        # Build system prompt with tools if enabled
         system_prompt = self.system_prompt
-        if self.tools_enabled:
-            system_prompt += self.tool_executor.get_system_prompt_addition()
-
         prompt = f"System: {system_prompt}\n" + prompt
-
-        # Extract web page content if URLs are present in the last message
-        if webpage_context:
-            prompt = f"{prompt}\n\nWeb Page Context:\n{webpage_context}"
 
         # Extract Discord mentions (users, channels, roles) from the last message
         guild = self.get_guild(server)
@@ -481,16 +468,6 @@ class OllamaBot(discord.Client):
                 print("No response from Ollama")
                 return ["No response from Ollama."]
 
-            # Handle tool calls if present and tools are enabled
-            if self.tools_enabled and self.tool_executor.has_tool_calls(raw_response):
-                raw_response = await self._handle_tool_calls(
-                    raw_response,
-                    messages,
-                    server,
-                    channel,
-                    override_messages
-                )
-
             # Add response to context
             if override_messages is None:
                 self.context[server][channel].append({
@@ -498,10 +475,6 @@ class OllamaBot(discord.Client):
                     "content": raw_response,
                     "timestamp": time.time(),
                 })
-
-                # Save context to file
-                with open("output.txt", "w") as file:
-                    json.dump(self.context, file, indent=4)
 
             print(f"Response: {raw_response}")
             return self.process_response(raw_response)
@@ -511,82 +484,9 @@ class OllamaBot(discord.Client):
             print(traceback.format_exc())
             return [f"Error communicating with Ollama: {e}"]
 
-    async def _handle_tool_calls(
-        self,
-        response: str,
-        messages: List[dict],
-        server: int,
-        channel: int,
-        override_messages: List[dict] = None,
-        max_iterations: int = 3
-    ) -> str:
-        """
-        Handle tool calls in the LLM response.
-
-        This method executes tools, feeds results back to the LLM,
-        and continues until no more tool calls or max iterations reached.
-        """
-        discord_channel = self.get_channel(channel)
-        discord_guild = self.get_guild(server) if server else None
-
-        # Build Discord context for tools
-        discord_ctx = DiscordContext(
-            channel=discord_channel,
-            guild=discord_guild,
-            bot=self,
-        )
-
-        current_response = response
-        iteration = 0
-
-        while iteration < max_iterations:
-            # Execute all tool calls in the response
-            results, cleaned_response = await self.tool_executor.execute_all(
-                current_response,
-                context=discord_ctx
-            )
-
-            if not results:
-                # No tool calls found, return the cleaned response
-                return cleaned_response if cleaned_response else current_response
-
-            # Format results for the LLM
-            tool_results = self.tool_executor.format_results_for_llm(results)
-            print(f"Tool results:\n{tool_results}")
-
-            # Build continuation prompt with tool results
-            system_prompt = self.system_prompt
-            if self.tools_enabled:
-                system_prompt += self.tool_executor.get_system_prompt_addition()
-
-            continuation_prompt = self.format_prompt(messages)
-            continuation_prompt = f"System: {system_prompt}\n" + continuation_prompt
-
-            # Add the assistant's response with tool calls
-            continuation_prompt += f"\nAssistant: {current_response}\n"
-
-            # Add tool results
-            continuation_prompt += f"\n{tool_results}\n"
-            continuation_prompt += "\nAssistant: Based on the tool results above, "
-
-            # Get next response from LLM
-            model = self.pick_model(server, channel)
-            current_response = await self.ollama_client.generate(continuation_prompt, model)
-
-            if current_response == "No response from Ollama.":
-                return cleaned_response if cleaned_response else "No response from Ollama."
-
-            iteration += 1
-
-            # Check if there are more tool calls
-            if not self.tool_executor.has_tool_calls(current_response):
-                break
-
-        # Return the final response (remove any remaining tool call tags)
-        return self.tool_executor.remove_tool_calls(current_response)
-
     async def close(self):
         """Close the bot"""
+        await js_renderer.stop()
         await super().close()
 
 

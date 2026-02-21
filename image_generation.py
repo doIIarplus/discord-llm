@@ -20,10 +20,10 @@ class ImageGenerator:
         prompt: str,
         negative_prompt: Optional[str] = None,
         seed: int = -1,
-        width: int = 832,
-        height: int = 1216,
-        cfg_scale: float = 3.0,
-        steps: int = 30,
+        width: int = 864,
+        height: int = 1280,
+        cfg_scale: float = 1.0,
+        steps: int = 9,
         upscale: float = 1.0,
         allow_nsfw: bool = True,
     ) -> Tuple[str, ImageInfo, bool]:
@@ -34,7 +34,7 @@ class ImageGenerator:
         height = min(2000, height)
         steps = min(60, max(2, steps))
         upscale = min(2, max(1, upscale))
-        cfg_scale = min(7, max(1.5, cfg_scale))
+        cfg_scale = min(7, max(1, cfg_scale))
         
         # Build prompts
         baseline_positive_prompt = (
@@ -50,14 +50,14 @@ class ImageGenerator:
             "bad quality, worst quality, lowres, jpeg artifacts, bad anatomy, bad hands, multiple views, signature, watermark, censored, ugly, (messy), abstract, (too_many:1.3), "
         )
 
-        if "kaling" in prompt:
-            prompt = prompt.replace("kaling", "kaling, ms,  <lora:Kaling-ILXL-V1:1> ")
+        # if "kaling" in prompt:
+        #     prompt = prompt.replace("kaling", "kaling, ms,  <lora:Kaling-ILXL-V1:1> ")
         
-        if "len" in prompt:
-            prompt = prompt.replace("len", "len, maplestory, long hair,white hair,ponytail,long sleeves,streaked hair, red eyes,rabbit ears,animal ears,white jacket, jacket,shoulder cutout,wide sleeves,hair bow, boots,skirt,pleated skirt, black skirt,fingerless gloves,thighhighs, white thighhighs, <lora:Len2:1>, ")
+        # if "len" in prompt:
+        #     prompt = prompt.replace("len", "len, maplestory, long hair,white hair,ponytail,long sleeves,streaked hair, red eyes,rabbit ears,animal ears,white jacket, jacket,shoulder cutout,wide sleeves,hair bow, boots,skirt,pleated skirt, black skirt,fingerless gloves,thighhighs, white thighhighs, <lora:Len2:1>, ")
         
-        if "ren" in prompt:
-            prompt = prompt.replace("ren", "len, maplestory, long hair,white hair,ponytail,long sleeves,streaked hair, red eyes,rabbit ears,animal ears,white jacket, jacket,shoulder cutout,wide sleeves,hair bow, boots,skirt,pleated skirt, black skirt,fingerless gloves,thighhighs, white thighhighs, <lora:Len2:1>, ")
+        # if "ren" in prompt:
+        #     prompt = prompt.replace("ren", "len, maplestory, long hair,white hair,ponytail,long sleeves,streaked hair, red eyes,rabbit ears,animal ears,white jacket, jacket,shoulder cutout,wide sleeves,hair bow, boots,skirt,pleated skirt, black skirt,fingerless gloves,thighhighs, white thighhighs, <lora:Len2:1>, ")
 
         if not allow_nsfw:
             baseline_negative_prompt += nsfw_negative
@@ -84,11 +84,9 @@ class ImageGenerator:
             "height": height,
             "cfg_scale": cfg_scale,
             "sampler_name": sampler,
+            "scheduler": "Simple",
             "n_iter": 1,
             "batch_size": 1,
-            "override_settings": {
-                "CLIP_stop_at_last_layers": 1,
-            },
         }
         
         # Handle upscaling
@@ -100,16 +98,16 @@ class ImageGenerator:
             payload["hr_second_pass_steps"] = steps
             payload["denoising_strength"] = 0.5
             
-        # Add face detailer
-        payload["alwayson_scripts"] = {
-            "ADetailer": {
-                "args": [
-                    {
-                        "ad_model": "face_yolov8n.pt"
-                    }
-                ]
-            }
-        }
+        # # Add face detailer
+        # payload["alwayson_scripts"] = {
+        #     "ADetailer": {
+        #         "args": [
+        #             {
+        #                 "ad_model": "face_yolov8n.pt"
+        #             }
+        #         ]
+        #     }
+        # }
         
         # Generate image
         file_path, image_info = self.sd_client.call_txt2img_api(**payload)

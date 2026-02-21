@@ -4,7 +4,6 @@ import os
 import logging
 from typing import List, Dict, Any
 from datetime import datetime
-from functools import lru_cache
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
@@ -166,7 +165,6 @@ class RAGSystem:
             ids=ids,
         )
 
-    @lru_cache(maxsize=1000)
     def search(self, query: str, n_results: int = 5) -> List[Dict[str, Any]]:
         query_embedding = self.embedding_model.encode([query])
         if hasattr(query_embedding, "tolist"):

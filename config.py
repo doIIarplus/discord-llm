@@ -20,7 +20,7 @@ load_dotenv()
 
 # Discord Configuration
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
-GUILD_ID = 363154169294618625
+GUILD_ID = int(os.getenv("GUILD_ID", "363154169294618625"))
 logger.info(f"Discord configuration loaded. Guild ID: {GUILD_ID}")
 
 # Ollama Configuration
@@ -33,7 +33,9 @@ logger.info(
 # Model Configuration
 IMAGE_RECOGNITION_MODEL = os.getenv("IMAGE_RECOGNITION_MODEL", "qwen3-vl:32b")
 NSFW_CLASSIFICATION_MODEL = os.getenv("NSFW_CLASSIFICATION_MODEL", "qwen3-vl:32b")
-CHAT_MODEL = Txt2TxtModel.QWEN3_VL.value
+CHAT_MODEL = Txt2TxtModel.GEMMA3_27B.value
+SEARCH_UTILITY_MODEL = Txt2TxtModel.GEMMA3_27B.value
+SEARCH_SUMMARIZATION_MODEL = Txt2TxtModel.QWEN3_VL.value
 TEXT_TO_IMAGE_MODEL = "..."
 TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL = os.getenv(
     "TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL",
@@ -64,27 +66,7 @@ os.makedirs(OUTPUT_DIR_T2I, exist_ok=True)
 os.makedirs(OUTPUT_DIR_I2I, exist_ok=True)
 logger.info(f"Output directories created: {OUTPUT_DIR_T2I}, {OUTPUT_DIR_I2I}")
 
-# Bot personality for autonomous response decisions
-BOT_PERSONALITY = os.getenv("BOT_PERSONALITY", """
-- Helpful and knowledgeable about technology, programming, and AI
-- Enjoys discussing interesting technical problems
-- Will offer assistance when someone seems stuck
-- Friendly but not overly chatty
-""".strip())
-
-# Number of recent messages to consider for autonomous response context
-AUTONOMOUS_CONTEXT_MESSAGES = int(os.getenv("AUTONOMOUS_CONTEXT_MESSAGES", "10"))
-
-# Channels where autonomous responses are enabled (empty list = all channels)
-# Format: comma-separated channel IDs, e.g., "123456789,987654321"
-_autonomous_channels_str = os.getenv(
-    "AUTONOMOUS_RESPONSE_CHANNELS",
-    "1381051356894334999,1171545202486431745"
-)
-AUTONOMOUS_RESPONSE_CHANNELS = (
-    [int(ch.strip()) for ch in _autonomous_channels_str.split(",") if ch.strip()]
-    if _autonomous_channels_str
-    else []
-)
+# Tavily Web Search
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
 logger.info("Configuration module initialization complete")

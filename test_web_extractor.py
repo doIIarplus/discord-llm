@@ -37,8 +37,9 @@ def test_webpage_fetching():
 def test_webpage_context_extraction():
     """Test extracting webpage context"""
     test_text = "Check out this website: https://httpbin.org/html"
-    context = extract_webpage_context(test_text)
+    context, sources = extract_webpage_context(test_text)
     print(f"Context: {context}")
+    print(f"Sources: {sources}")
     assert len(context) > 0
     print("Webpage context extraction test passed!")
 

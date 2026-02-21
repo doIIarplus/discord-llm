@@ -1,12 +1,14 @@
 discord.py
 python-dotenv
+aiohttp
 chromadb
 lxml
 sentence-transformers
 numpy
 nltk
-requests
 beautifulsoup4
 pypdf
+trafilatura
+tavily-python
 # transformers (optional, for better token counting)
 # torch (optional, required by transformers)
