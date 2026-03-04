@@ -460,6 +460,22 @@ class CommandHandlers:
             logger.info(f"Get model command called by {interaction.user.name}#{interaction.user.discriminator}")
             await interaction.response.send_message(f"Current model: **{self.bot.active_model}**")
 
+        @self.bot.tree.command(name="ping", description="Ping Google and show the latency")
+        async def ping(interaction: discord.Interaction):
+            """Ping Google and return the round-trip latency."""
+            logger.info(f"Ping command called by {interaction.user.name}#{interaction.user.discriminator}")
+            await interaction.response.defer(thinking=True)
+            try:
+                start = time.perf_counter()
+                async with aiohttp.ClientSession() as session:
+                    async with session.get("https://www.google.com", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        await resp.read()
+                latency_ms = (time.perf_counter() - start) * 1000
+                await interaction.followup.send(f"Pong! Google responded in **{latency_ms:.1f}ms**")
+            except Exception as e:
+                logger.error(f"Ping failed: {e}", exc_info=True)
+                await interaction.followup.send(f"Ping failed: {e}")
+
         @self.bot.tree.command(name="sync_commands")
         async def sync_commands(interaction: discord.Interaction):
             """Manually sync slash commands to Discord (rate-limited, use sparingly)"""
