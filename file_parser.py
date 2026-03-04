@@ -2,6 +2,7 @@ import os
 import logging
 from typing import Optional
 import pypdf
+from sandbox import safe_path
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ class FileParser:
         Determines the file type and extracts text content.
         Returns the extracted text or None if the file type is unsupported or extraction fails.
         """
+        file_path = safe_path(file_path)
         if not os.path.exists(file_path):
             logger.error(f"File not found: {file_path}")
             return None

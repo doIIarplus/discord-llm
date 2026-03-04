@@ -5,6 +5,8 @@ import datetime
 import time
 from typing import List
 
+from sandbox import safe_path
+
 
 def timestamp() -> str:
     """Generate a timestamp string for file naming"""
@@ -13,6 +15,7 @@ def timestamp() -> str:
 
 def encode_file_to_base64(path: str) -> str:
     """Encode a file to base64 string"""
+    path = safe_path(path)
     with open(path, "rb") as file:
         return base64.b64encode(file.read()).decode("utf-8")
 

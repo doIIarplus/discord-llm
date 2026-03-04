@@ -47,11 +47,12 @@ logger.info("Model configurations loaded")
 SD_API_URL = os.getenv("SD_API_URL", "http://127.0.0.1:7860")
 logger.info(f"Stable Diffusion configuration loaded. API URL: {SD_API_URL}")
 
-# File Paths
-FILE_INPUT_FOLDER = os.getenv(
-    "FILE_INPUT_FOLDER", "/home/dollarplus/projects/discord_llm_bot/multimodal_input/"
-)
-OUTPUT_DIR = "api_out"
+# Project root (used to anchor all file paths)
+PROJECT_DIR = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+
+# File Paths — always relative to project root
+FILE_INPUT_FOLDER = os.path.join(PROJECT_DIR, "multimodal_input")
+OUTPUT_DIR = os.path.join(PROJECT_DIR, "api_out")
 OUTPUT_DIR_T2I = os.path.join(OUTPUT_DIR, "txt2img")
 OUTPUT_DIR_I2I = os.path.join(OUTPUT_DIR, "img2img")
 

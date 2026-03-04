@@ -9,6 +9,7 @@ from typing import Tuple
 from config import SD_API_URL, OUTPUT_DIR_T2I, OUTPUT_DIR_I2I
 from models import ImageInfo
 from utils import timestamp
+from sandbox import safe_path
 
 
 class StableDiffusionClient:

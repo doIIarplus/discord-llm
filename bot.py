@@ -33,6 +33,7 @@ from web_extractor import extract_webpage_context, web_search, format_search_res
 from file_parser import FileParser
 from mention_extractor import extract_mention_context
 from response_splitter import split_response_by_markers, split_response_by_paragraphs, split_long_message, calculate_typing_delay
+from sandbox import safe_path, SandboxViolation
 
 # Exit code that tells the wrapper script (run_bot.sh) to restart the bot
 RESTART_EXIT_CODE = 42
@@ -193,7 +194,7 @@ class OllamaBot(discord.Client):
 
         for attachment in message.attachments:
             safe_filename = os.path.basename(attachment.filename)
-            file_path = os.path.join(FILE_INPUT_FOLDER, safe_filename)
+            file_path = safe_path(os.path.join(FILE_INPUT_FOLDER, safe_filename))
             await attachment.save(file_path)
 
             ext = os.path.splitext(file_path)[1].lower()
