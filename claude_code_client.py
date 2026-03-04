@@ -133,7 +133,7 @@ class ClaudeCodeClient:
             "--model", model_alias,
             "--no-session-persistence",
             "--dangerously-skip-permissions",
-            "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep",
+            "--allowedTools", "Read,Write,Edit,Glob,Grep",
         ]
 
         full_prompt = (
