@@ -32,6 +32,7 @@ class StableDiffusionClient:
         
     def decode_and_save_base64(self, base64_str: str, save_path: str):
         """Decode base64 string and save to file"""
+        save_path = safe_path(save_path)
         with open(save_path, "wb") as file:
             file.write(base64.b64decode(base64_str))
             

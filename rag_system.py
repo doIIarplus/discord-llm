@@ -8,6 +8,7 @@ import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 from wiki_parser import WikiParser
+from sandbox import safe_path
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,7 @@ class RAGSystem:
         self.parser = WikiParser(chunk_size=500, chunk_overlap=100)  # Increased overlap for better context
 
     def index_wiki_dump(self, xml_path: str, batch_size: int = 100):
+        xml_path = safe_path(xml_path)
         logger.info(f"Starting to index wiki dump: {xml_path}")
 
         documents: List[str] = []

@@ -1,0 +1,51 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "autoApprove": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "allowWrite": [],
+      "denyRead": [
+        "//etc",
+        "//home/dollarplus/.ssh",
+        "//home/dollarplus/.gnupg",
+        "//home/dollarplus/.aws",
+        "//home/dollarplus/.config",
+        "//home/dollarplus/.local",
+        "//mnt"
+      ],
+      "denyWrite": [
+        "//etc",
+        "//home/dollarplus/.ssh",
+        "//home/dollarplus/.gnupg",
+        "//home/dollarplus/.aws",
+        "//home/dollarplus/.bashrc",
+        "//home/dollarplus/.zshrc",
+        "//home/dollarplus/.profile",
+        "//mnt",
+        "//.env"
+      ]
+    },
+    "network": {
+      "allowedDomains": []
+    }
+  },
+  "permissions": {
+    "deny": [
+      "Read(//etc/**)",
+      "Read(//home/dollarplus/.ssh/**)",
+      "Read(//home/dollarplus/.gnupg/**)",
+      "Read(//home/dollarplus/.aws/**)",
+      "Read(//mnt/**)",
+      "Edit(//etc/**)",
+      "Edit(//home/dollarplus/.ssh/**)",
+      "Edit(//mnt/**)",
+      "Write(//etc/**)",
+      "Write(//home/dollarplus/.ssh/**)",
+      "Write(//mnt/**)",
+      "Read(**/.env)",
+      "Edit(**/.env)",
+      "Write(**/.env)"
+    ]
+  }
+}
