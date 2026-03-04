@@ -497,6 +497,24 @@ class CommandHandlers:
                 logger.error(f"Error listing documents: {e}", exc_info=True)
                 await interaction.followup.send(f"Error: {e}")
 
+        @self.bot.tree.command(name="purge", description="Delete all messages in this channel")
+        @app_commands.default_permissions(manage_messages=True)
+        async def purge(interaction: discord.Interaction):
+            """Delete all messages in the current channel."""
+            logger.info(f"Purge command called by {interaction.user.name}#{interaction.user.discriminator} in #{interaction.channel.name}")
+            if not interaction.channel.permissions_for(interaction.user).manage_messages:
+                await interaction.response.send_message("You need the Manage Messages permission to use this.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            deleted_total = 0
+            while True:
+                deleted = await interaction.channel.purge(limit=100)
+                deleted_total += len(deleted)
+                if len(deleted) < 100:
+                    break
+            logger.info(f"Purged {deleted_total} messages in #{interaction.channel.name}")
+            await interaction.followup.send(f"Deleted {deleted_total} messages.", ephemeral=True)
+
         @self.bot.tree.command(name="sync_commands")
         async def sync_commands(interaction: discord.Interaction):
             """Manually sync slash commands to Discord (rate-limited, use sparingly)"""
