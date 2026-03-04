@@ -92,6 +92,33 @@ def split_long_message(text: str, limit: int = MAX_DISCORD_MESSAGE_LENGTH) -> Li
     return messages
 
 
+def split_response_by_paragraphs(text: str) -> List[str]:
+    """
+    Split response text by ---MSG--- markers first, then by paragraph breaks.
+
+    Used for backends like Claude Code that may use either convention.
+    """
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+
+    # Try ---MSG--- markers first
+    if MESSAGE_SPLIT_MARKER in text:
+        return split_response_by_markers(text)
+
+    # Fall back to paragraph breaks (double newlines)
+    parts = re.split(r'\n\n+', text)
+
+    messages = []
+    for part in parts:
+        cleaned = part.strip()
+        if cleaned:
+            if len(cleaned) > MAX_DISCORD_MESSAGE_LENGTH:
+                messages.extend(split_long_message(cleaned))
+            else:
+                messages.append(cleaned)
+
+    return messages if messages else [text.strip()]
+
+
 def calculate_typing_delay(message: str, wpm: int = 80) -> float:
     """
     Calculate a realistic typing delay based on message length.

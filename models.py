@@ -24,6 +24,17 @@ class Txt2TxtModel(Enum):
     GPT_ABLITERATED = "huihui_ai/gpt-oss-abliterated:120b"
     GPT_OSS_20b = "gpt-oss:20b"
     QWEN3_VL = "qwen3-vl:32b"
+    # Claude Code (CLI, uses Max/Pro subscription)
+    CLAUDE_CODE = "claude-code"
+    CLAUDE_CODE_OPUS = "claude-code-opus"
+
+
+CLAUDE_CODE_MODELS = {Txt2TxtModel.CLAUDE_CODE.value, Txt2TxtModel.CLAUDE_CODE_OPUS.value}
+
+
+def is_claude_code_model(model_value: str) -> bool:
+    """Check if a model value is a Claude Code CLI backend."""
+    return model_value in CLAUDE_CODE_MODELS
 
 
 @dataclass

@@ -25,15 +25,24 @@ class OllamaClient:
         self,
         prompt: str,
         model: str = CHAT_MODEL,
-        images: Optional[List[str]] = None
+        images: Optional[List[str]] = None,
+        keep_alive: Optional[int] = None,
     ) -> str:
-        """Generate a response from Ollama"""
+        """Generate a response from Ollama.
+
+        Args:
+            keep_alive: Ollama keep_alive value. -1 = stay loaded forever,
+                        None = use Ollama's default timeout.
+        """
         try:
             payload = {
                 "model": model,
                 "prompt": prompt,
                 "stream": False,
             }
+
+            if keep_alive is not None:
+                payload["keep_alive"] = keep_alive
 
             if images:
                 payload["images"] = images

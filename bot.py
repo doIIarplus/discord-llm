@@ -1,9 +1,11 @@
 """Discord LLM Bot - Main module"""
 
 import asyncio
+import json
 import re
 import os
 import random
+import sys
 import time
 import traceback
 from typing import Dict, List
@@ -23,12 +25,17 @@ from config import (
 )
 from image_generation import ImageGenerator
 from ollama_client import OllamaClient
+from claude_code_client import ClaudeCodeClient, RateLimitError
+from models import is_claude_code_model
 from utils import encode_images_to_base64
 from rag_system import RAGSystem
 from web_extractor import extract_webpage_context, web_search, format_search_results, js_renderer
 from file_parser import FileParser
 from mention_extractor import extract_mention_context
-from response_splitter import split_response_by_markers, split_long_message, calculate_typing_delay
+from response_splitter import split_response_by_markers, split_response_by_paragraphs, split_long_message, calculate_typing_delay
+
+# Exit code that tells the wrapper script (run_bot.sh) to restart the bot
+RESTART_EXIT_CODE = 42
 
 # Keywords that suggest an image generation request
 _IMAGE_GEN_KEYWORDS = re.compile(
@@ -38,10 +45,18 @@ _IMAGE_GEN_KEYWORDS = re.compile(
 
 # Keywords that suggest the user needs up-to-date / web-searchable info
 _SEARCH_KEYWORDS = re.compile(
-    r'\b(latest|recent|current|today|yesterday|tonight|this week|this month|this year'
+    r'\b(latest|recent|current|when|happening|happened|recently|today|yesterday|tonight|this week|this month|this year'
     r'|news|update|score|weather|price|stock|election|released|announced'
     r'|who won|who is winning|what happened|how much does|how much is'
     r'|in 202[4-9]|right now)\b',
+    re.IGNORECASE
+)
+
+# Keywords that suggest the user wants the bot to modify its own code
+_CODE_CHANGE_KEYWORDS = re.compile(
+    r'\b(add|create|make|implement|build|write)\b.{0,30}\b(command|slash command|feature|function)\b'
+    r'|\b(change|modify|update|fix|edit)\b.{0,20}\b(the bot|your code|yourself|your behavior|the code)\b'
+    r'|\bmodify yourself\b',
     re.IGNORECASE
 )
 
@@ -58,8 +73,17 @@ class OllamaBot(discord.Client):
 
         # Initialize clients
         self.ollama_client = OllamaClient()
+        self.claude_code_client = ClaudeCodeClient()
         self.image_gen = ImageGenerator()
         self._last_search_sources: List[dict] = []
+
+        # Active model (switchable via /set_model, persisted to disk)
+        self._state_file = os.path.join(os.path.dirname(__file__), "bot_state.json")
+        self._state = self._load_state()
+        self.active_model = self._state.get("active_model", CHAT_MODEL)
+
+        # Pending code change: {channel_id, user_id, instruction}
+        self._pending_code_change = None
 
         # Initialize RAG system
         self.rag_system = RAGSystem()
@@ -86,27 +110,78 @@ class OllamaBot(discord.Client):
         # Setup command handlers
         self.command_handlers = CommandHandlers(self)
 
+    def _load_state(self) -> dict:
+        """Load persisted bot state."""
+        try:
+            with open(self._state_file) as f:
+                data = json.load(f)
+            print(f"Loaded saved state: {data}")
+            return data
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_state(self):
+        """Persist bot state to disk."""
+        self._state["active_model"] = self.active_model
+        try:
+            with open(self._state_file, "w") as f:
+                json.dump(self._state, f)
+        except OSError as e:
+            print(f"Warning: could not save state: {e}")
+
+    def save_active_model(self):
+        """Persist current model selection to disk."""
+        self._save_state()
+
     async def setup_hook(self):
         """Setup hook for Discord bot"""
         self.command_handlers.setup_commands()
-        # NOTE: tree.sync() is intentionally omitted here.
-        # Run it manually (e.g. via a one-off script) after changing commands,
-        # as Discord rate-limits this call.
+        # Sync to specific guild for instant command visibility
+        guild = discord.Object(id=GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
         await js_renderer.start()
 
+    async def on_ready(self):
+        """Called when the bot is fully connected. Send post-restart notification if pending."""
+        print(f"Logged in as {self.user}")
+        notify = self._state.pop("restart_notify", None)
+        if notify:
+            self._save_state()  # Clear the notification from disk
+            channel = self.get_channel(notify["channel_id"])
+            if channel:
+                try:
+                    await channel.send(notify.get("message", "ok i'm back, changes have been applied"))
+                except Exception as e:
+                    print(f"Failed to send restart notification: {e}")
+
     def pick_model(self, server: int, channel: int) -> str:
-        """Pick the appropriate model based on context"""
+        """Pick the appropriate model based on context and active backend"""
+        # Claude Code doesn't support images via CLI
+        if is_claude_code_model(self.active_model):
+            has_images = (server in self.context and
+                channel in self.context[server] and
+                self.context[server][channel] and
+                self.context[server][channel][-1].get("images"))
+            if has_images:
+                return IMAGE_RECOGNITION_MODEL
+            return self.active_model
+        # Local models: switch to vision model when images are present
         if (server in self.context and
             channel in self.context[server] and
             self.context[server][channel] and
             self.context[server][channel][-1].get("images")):
             return IMAGE_RECOGNITION_MODEL
-        return CHAT_MODEL
+        return self.active_model
 
     async def on_message(self, message: discord.Message):
         """Handle incoming messages"""
         # Ignore bot messages (including self)
         if message.author.bot:
+            return
+
+        # Ignore DMs (no guild)
+        if message.guild is None:
             return
 
         server = message.guild.id
@@ -143,9 +218,47 @@ class OllamaBot(discord.Client):
                 is_reply_to_bot = True
 
         # Only respond to direct mentions and replies
-        if is_direct_mention or is_reply_to_bot:
+        if not (is_direct_mention or is_reply_to_bot):
+            return
+
+        try:
+            user_text = re.sub(r'<@!?\d+>', '', message.content).strip()
+
+            # Check if user is confirming a pending code change
+            pending = self._pending_code_change
+            if pending and pending["channel_id"] == channel and pending["user_id"] == message.author.id:
+                self._pending_code_change = None
+                if re.match(r'^(y(es|eah|ep|a)?|sure|go ahead|do it|ok|yup|please|absolutely)\b', user_text, re.IGNORECASE):
+                    await self._execute_code_change(message, pending["instruction"])
+                    return
+                else:
+                    await message.channel.send("ok nvm, cancelled")
+                    return
+
+            # Check if user is asking for a code change (heuristic)
+            if _CODE_CHANGE_KEYWORDS.search(user_text):
+                self._pending_code_change = {
+                    "channel_id": channel,
+                    "user_id": message.author.id,
+                    "instruction": user_text,
+                }
+                await message.channel.send(
+                    f"sounds like you want me to modify my code. i'd do this:\n"
+                    f"> {user_text}\n"
+                    f"want me to go ahead?"
+                )
+                return
+
             fetched_sources = await self.build_context(message, server, False, image_files, document_files)
             await self._send_response(message, server, channel, fetched_sources)
+
+        except Exception as e:
+            print(f"Error in on_message: {e}")
+            print(traceback.format_exc())
+            try:
+                await message.channel.send(f"something broke: {e}")
+            except Exception:
+                pass
 
     async def build_context(
         self,
@@ -250,10 +363,12 @@ class OllamaBot(discord.Client):
             return
 
         # Collect all text parts to figure out where to append sources
+        # Claude Code uses paragraph breaks; local models use ---MSG--- markers
+        splitter = split_response_by_paragraphs if is_claude_code_model(self.active_model) else split_response_by_markers
         all_parts = []
         for response_item in response_data:
             if isinstance(response_item, str) and response_item.strip():
-                all_parts.extend(split_response_by_markers(response_item))
+                all_parts.extend(splitter(response_item))
 
         # Append source footnote with clickable links (deduplicated by domain)
         if all_sources and all_parts:
@@ -293,6 +408,70 @@ class OllamaBot(discord.Client):
             if isinstance(response_item, dict) and "image" in response_item:
                 file = discord.File(response_item["image"])
                 await message.channel.send(file=file)
+
+    async def _execute_code_change(self, message: discord.Message, instruction: str):
+        """Run Claude Code to modify bot source, show diff, offer apply/revert."""
+        channel = message.channel
+
+        # Git snapshot for safety
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        proc = await asyncio.create_subprocess_exec(
+            "git", "add", "-A", cwd=project_dir,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        proc = await asyncio.create_subprocess_exec(
+            "git", "commit", "-m",
+            f"[auto] pre-modification snapshot {time.strftime('%Y%m%d_%H%M%S')}",
+            "--allow-empty", cwd=project_dir,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+        status_msg = await channel.send("on it, gimme a sec...")
+
+        try:
+            async with channel.typing():
+                response, exit_code = await self.claude_code_client.run_code_edit(instruction)
+        except RateLimitError:
+            reset = self.claude_code_client.rate_limit_resets_at or "unknown"
+            await status_msg.edit(content=f"claude code is rate limited, resets at {reset}")
+            return
+        except Exception as e:
+            await status_msg.edit(content=f"something went wrong: {e}")
+            return
+
+        if exit_code != 0:
+            await status_msg.edit(content=f"code edit failed (exit {exit_code}):\n```\n{response[:1500]}\n```")
+            return
+
+        # Show diff
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff", cwd=project_dir,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        diff = stdout.decode("utf-8", errors="replace")
+
+        await status_msg.edit(content="done, here's what i changed:")
+
+        if diff:
+            diff_display = diff[:1800]
+            if len(diff) > 1800:
+                diff_display += "\n... (truncated)"
+            await channel.send(f"```diff\n{diff_display}\n```")
+        else:
+            await channel.send(f"no files changed.\n\nclaude said: {response[:1500]}")
+            return
+
+        # Summary
+        summary = response[:1500] if len(response) > 1500 else response
+        await channel.send(summary)
+
+        # Apply/Revert buttons
+        from commands import RestartConfirmView
+        view = RestartConfirmView(self, message.author.id)
+        await channel.send("apply changes and restart?", view=view)
 
     def format_prompt(self, messages: List[dict]) -> str:
         """Format messages into a prompt"""
@@ -400,28 +579,41 @@ class OllamaBot(discord.Client):
 
                 return (embed, file)
 
+        # Determine which backend we're using
+        model = self.pick_model(server, channel)
+        using_claude_code = is_claude_code_model(model)
+
+        # Auto-fallback: if Claude Code is rate limited, fall back to local model
+        if using_claude_code and self.claude_code_client.is_rate_limited:
+            reset = self.claude_code_client.rate_limit_resets_at
+            print(f"  [Claude Code rate limited, resets at {reset}, falling back to local model]")
+            model = CHAT_MODEL
+            using_claude_code = False
+
         # Check if the user's message needs a web search (heuristic + LLM)
+        # Skip manual search pipeline when using Claude Code — it handles search itself
         search_summary = ""
         search_sources = []
-        # Strip Discord mentions for cleaner LLM input
-        clean_query = re.sub(r'<@!?\d+>', '', user_content).strip()
-        if _SEARCH_KEYWORDS.search(clean_query):
-            print("  [search heuristic matched, checking with LLM...]")
-            needs_search = await self.ollama_client.classify_search_task(clean_query)
-            if needs_search:
-                search_query = await self.ollama_client.extract_search_query(clean_query)
-                print(f"  [searching: {search_query}]")
-                search_results = await web_search(search_query, max_results=5)
-                if search_results:
-                    raw_context = format_search_results(search_results)
-                    print(f"  [summarizing {len(raw_context)} chars of search results...]")
-                    search_summary = await self.ollama_client.summarize_search_results(clean_query, raw_context)
-                    print(f"  [summary: {len(search_summary)} chars]")
-                    print(f"  [summary content: {search_summary}]")
-                    search_sources = [
-                        {"url": r["url"], "title": r["title"] or r["url"]}
-                        for r in search_results[:3]
-                    ]
+        if not using_claude_code:
+            # Strip Discord mentions for cleaner LLM input
+            clean_query = re.sub(r'<@!?\d+>', '', user_content).strip()
+            if _SEARCH_KEYWORDS.search(clean_query):
+                print("  [search heuristic matched, checking with LLM...]")
+                needs_search = await self.ollama_client.classify_search_task(clean_query)
+                if needs_search:
+                    search_query = await self.ollama_client.extract_search_query(clean_query)
+                    print(f"  [searching: {search_query}]")
+                    search_results = await web_search(search_query, max_results=5)
+                    if search_results:
+                        raw_context = format_search_results(search_results)
+                        print(f"  [summarizing {len(raw_context)} chars of search results...]")
+                        search_summary = await self.ollama_client.summarize_search_results(clean_query, raw_context)
+                        print(f"  [summary: {len(search_summary)} chars]")
+                        print(f"  [summary content: {search_summary}]")
+                        search_sources = [
+                            {"url": r["url"], "title": r["title"] or r["url"]}
+                            for r in search_results[:3]
+                        ]
 
         self._last_search_sources = search_sources
 
@@ -458,15 +650,39 @@ class OllamaBot(discord.Client):
             print("Sending image")
 
         try:
-            model = self.pick_model(server, channel)
             print(f"Using model: {model}")
             print(f"Prompt: {prompt}")
 
-            raw_response = await self.ollama_client.generate(prompt, model, images)
+            if using_claude_code:
+                try:
+                    raw_response, _ = await self.claude_code_client.generate_with_search(
+                        prompt, model, images
+                    )
+                    if raw_response == "No response from Claude Code.":
+                        print("No response from Claude Code")
+                        return ["No response from Claude Code."]
+                except RateLimitError as rl_err:
+                    reset = self.claude_code_client.rate_limit_resets_at or "unknown"
+                    print(f"  [Claude Code rate limited, resets at {reset}, falling back to local model]")
+                    model = CHAT_MODEL
+                    raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1)
 
-            if raw_response == "No response from Ollama.":
-                print("No response from Ollama")
-                return ["No response from Ollama."]
+                    if raw_response == "No response from Ollama.":
+                        return ["No response from Ollama."]
+                except Exception as cc_err:
+                    print(f"  [Claude Code error: {cc_err}, falling back to local model]")
+                    model = CHAT_MODEL
+                    raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1)
+
+                    if raw_response == "No response from Ollama.":
+                        return ["No response from Ollama."]
+
+            else:
+                raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1)
+
+                if raw_response == "No response from Ollama.":
+                    print("No response from Ollama")
+                    return ["No response from Ollama."]
 
             # Add response to context
             if override_messages is None:
@@ -482,7 +698,18 @@ class OllamaBot(discord.Client):
         except Exception as e:
             print(f"Error: {e}")
             print(traceback.format_exc())
-            return [f"Error communicating with Ollama: {e}"]
+            backend = "Claude Code" if using_claude_code else "Ollama"
+            return [f"Error communicating with {backend}: {e}"]
+
+    async def request_restart(self, channel=None, reason=""):
+        """Gracefully shut down the bot, signaling the wrapper to restart."""
+        self._restart_requested = True
+        if channel:
+            try:
+                await channel.send(f"Restarting... {reason}".strip())
+            except Exception:
+                pass
+        await self.close()
 
     async def close(self):
         """Close the bot"""
@@ -494,6 +721,9 @@ def main():
     """Main entry point"""
     bot = OllamaBot()
     bot.run(DISCORD_BOT_TOKEN)
+    # After bot.run() returns, check if a restart was requested
+    if getattr(bot, '_restart_requested', False):
+        sys.exit(RESTART_EXIT_CODE)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ Commands:
     /clear                Clear conversation context
     /context              Show current context
     /search <query>       Web search via Tavily
+    /model [name]         Show/switch active model (e.g. /model claude_code)
     /prompt               Show current system prompt
     /set_prompt <text>    Set system prompt
     /reset_prompt         Reset to default system prompt
@@ -27,14 +28,18 @@ import sys
 import time
 from typing import List
 
+import aiohttp
+
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import CONTEXT_LIMIT, CHAT_MODEL, IMAGE_RECOGNITION_MODEL, MAX_DISCORD_MESSAGE_LENGTH
 from ollama_client import OllamaClient
+from claude_code_client import ClaudeCodeClient, RateLimitError
+from models import is_claude_code_model, Txt2TxtModel
 from web_extractor import extract_webpage_context, web_search, format_search_results, js_renderer
 from file_parser import FileParser
-from response_splitter import split_response_by_markers, split_long_message
+from response_splitter import split_response_by_markers, split_response_by_paragraphs, split_long_message
 
 # Image gen heuristic from bot.py
 _IMAGE_GEN_KEYWORDS = re.compile(
@@ -78,6 +83,8 @@ class TestCLI:
 
     def __init__(self):
         self.ollama_client = OllamaClient()
+        self.claude_code_client = ClaudeCodeClient()
+        self.active_model = CHAT_MODEL
         self.context: List[dict] = []
         self.system_prompt = (
             "Your responses should be akin to that of a typical millenial texter: short, to the point, and mostly without punctuation. Do not offer any kind of assistance without being prompted. use slang *sparingly*. \n\n"
@@ -98,6 +105,44 @@ class TestCLI:
         self.current_user = "TestUser"
         self.pending_attachments: List[str] = []
         self.use_ddg = False
+
+    async def _fetch_ollama_models(self) -> list:
+        """Query Ollama API for available local models."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("http://localhost:11434/api/tags", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status != 200:
+                        return []
+                    data = await resp.json()
+        except Exception:
+            return []
+
+        models = []
+        for m in data.get("models", []):
+            name = m["name"]
+            size_bytes = m.get("size", 0)
+            param_size = m.get("details", {}).get("parameter_size", "?")
+
+            display = name
+            for prefix in ("hf.co/", "huihui_ai/"):
+                if display.startswith(prefix):
+                    display = display[len(prefix):]
+
+            size_gb = size_bytes / (1024 ** 3)
+            if size_gb >= 1:
+                size_str = f"{size_gb:.0f}GB"
+            else:
+                size_str = f"{size_gb * 1024:.0f}MB"
+
+            models.append({
+                "value": name,
+                "display_name": display,
+                "size_str": size_str,
+                "param_size": param_size,
+            })
+
+        models.sort(key=lambda x: x["display_name"].lower())
+        return models
 
     async def build_context(self, text: str, username: str):
         """Build context from user input, same logic as bot.py."""
@@ -213,10 +258,22 @@ class TestCLI:
                 })
                 return [f"[Image would be generated | seed: {seed_display} | prompt: {simulated_prompt}]"]
 
+        # Determine which backend we're using
+        model = self.active_model
+        using_claude_code = is_claude_code_model(model)
+
+        # Auto-fallback: if Claude Code is rate limited, fall back to local model
+        if using_claude_code and self.claude_code_client.is_rate_limited:
+            reset = self.claude_code_client.rate_limit_resets_at
+            print(c(f"  [Claude Code rate limited, resets at {reset}, falling back to local]", "red"))
+            model = CHAT_MODEL
+            using_claude_code = False
+
         # Check if the user's message needs a web search (heuristic + LLM)
+        # Skip manual search pipeline when using Claude Code — it handles search itself
         search_summary = ""
         self._search_sources = []
-        if _SEARCH_KEYWORDS.search(user_content):
+        if not using_claude_code and _SEARCH_KEYWORDS.search(user_content):
             print(c("  [search heuristic matched, checking with LLM...]", "cyan"))
             needs_search = await self.ollama_client.classify_search_task(user_content)
             if needs_search:
@@ -246,15 +303,32 @@ class TestCLI:
 
         prompt = f"System: {self.system_prompt}\n" + prompt
 
-        model = CHAT_MODEL
         print(c(f"  [model: {model}]", "dim"))
 
         start = time.perf_counter()
-        raw_response = await self.ollama_client.generate(prompt, model)
+        if using_claude_code:
+            try:
+                raw_response, _ = await self.claude_code_client.generate_with_search(prompt, model)
+                if raw_response == "No response from Claude Code.":
+                    return ["No response from Claude Code."]
+            except RateLimitError as rl_err:
+                reset = self.claude_code_client.rate_limit_resets_at or "unknown"
+                print(c(f"  [Claude Code rate limited, resets at {reset}, falling back to local]", "red"))
+                model = CHAT_MODEL
+                raw_response = await self.ollama_client.generate(prompt, model, keep_alive=-1)
+                if raw_response == "No response from Ollama.":
+                    return ["No response from Ollama."]
+            except Exception as cc_err:
+                print(c(f"  [Claude Code error: {cc_err}, falling back to local]", "red"))
+                model = CHAT_MODEL
+                raw_response = await self.ollama_client.generate(prompt, model, keep_alive=-1)
+                if raw_response == "No response from Ollama.":
+                    return ["No response from Ollama."]
+        else:
+            raw_response = await self.ollama_client.generate(prompt, model, keep_alive=-1)
+            if raw_response == "No response from Ollama.":
+                return ["No response from Ollama."]
         elapsed = time.perf_counter() - start
-
-        if raw_response == "No response from Ollama.":
-            return ["No response from Ollama."]
 
         # Add to context
         self.context.append({
@@ -264,10 +338,11 @@ class TestCLI:
         })
 
         parts = self.process_response(raw_response)
-        # Split by ---MSG--- markers too
+        # Claude Code uses paragraph breaks; local models use ---MSG--- markers
+        splitter = split_response_by_paragraphs if using_claude_code else split_response_by_markers
         final_parts = []
         for part in parts:
-            final_parts.extend(split_response_by_markers(part))
+            final_parts.extend(splitter(part))
 
         print(c(f"  [{elapsed:.2f}s]", "dim"))
         return final_parts
@@ -351,6 +426,86 @@ class TestCLI:
             color = "cyan" if role == "user" else "green"
             print(c(f"  [{i}] {tag}: {content}", color))
 
+    async def handle_modify(self, instruction: str):
+        """Handle /modify command — use Claude Code to edit bot source."""
+        from claude_code_client import RateLimitError
+
+        print(c(f"  Modifying bot: {instruction}", "yellow"))
+
+        # Git snapshot
+        proc = await asyncio.create_subprocess_exec(
+            "git", "add", "-A",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        proc = await asyncio.create_subprocess_exec(
+            "git", "commit", "-m",
+            f"[auto] pre-modification snapshot {time.strftime('%Y%m%d_%H%M%S')}",
+            "--allow-empty",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+        try:
+            response, exit_code = await self.claude_code_client.run_code_edit(instruction)
+        except RateLimitError as e:
+            print(c(f"  Rate limited: {e}", "red"))
+            return
+        except Exception as e:
+            print(c(f"  Error: {e}", "red"))
+            return
+
+        if exit_code != 0:
+            print(c(f"  Code edit failed (exit {exit_code}):", "red"))
+            print(f"  {response[:1500]}")
+            return
+
+        # Show diff
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        diff = stdout.decode("utf-8", errors="replace")
+
+        if diff:
+            print(c("  Changes:", "yellow"))
+            for line in diff.splitlines()[:60]:
+                if line.startswith("+") and not line.startswith("+++"):
+                    print(c(f"  {line}", "green"))
+                elif line.startswith("-") and not line.startswith("---"):
+                    print(c(f"  {line}", "red"))
+                else:
+                    print(c(f"  {line}", "dim"))
+            if len(diff.splitlines()) > 60:
+                print(c("  ... (truncated)", "dim"))
+        else:
+            print(c("  No files changed.", "dim"))
+
+        print(c(f"\n  Summary: {response[:500]}", "green"))
+
+        # Ask to apply or revert
+        answer = input(c("\n  Apply changes? [y/N] ", "yellow")).strip().lower()
+        if answer == "y":
+            proc = await asyncio.create_subprocess_exec(
+                "git", "add", "-A",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            proc = await asyncio.create_subprocess_exec(
+                "git", "commit", "-m", "[bot-self-modify] applied code changes",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            print(c("  Changes committed. Restart the CLI to pick them up.", "green"))
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "checkout", ".",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            print(c("  Changes reverted.", "yellow"))
+
     def print_help(self):
         print(c("\n  Commands:", "bold"))
         print("  /user <name>          Switch active user")
@@ -359,6 +514,8 @@ class TestCLI:
         print("  /context              Show current context")
         print("  /search <query>       Web search + LLM summary")
         print("  /ddg                  Toggle DuckDuckGo / Tavily search")
+        print("  /model [name]         Show/switch active model (e.g. /model claude_code)")
+        print("  /modify <instruction> Use Claude Code to modify bot source code")
         print("  /prompt               Show current system prompt")
         print("  /set_prompt <text>    Set system prompt")
         print("  /reset_prompt         Reset to default system prompt")
@@ -374,7 +531,7 @@ class TestCLI:
         await js_renderer.start()
         js_status = "on" if js_renderer.available else "off"
         print(c("\n  Discord LLM Bot — Test CLI", "bold"))
-        print(c(f"  User: {self.current_user} | Model: {CHAT_MODEL} | JS renderer: {js_status}", "dim"))
+        print(c(f"  User: {self.current_user} | Model: {self.active_model} | JS renderer: {js_status}", "dim"))
         print(c("  Type /help for commands\n", "dim"))
 
         while True:
@@ -443,6 +600,42 @@ class TestCLI:
                     self.use_ddg = not self.use_ddg
                     engine = "DuckDuckGo" if self.use_ddg else "Tavily"
                     print(c(f"  Search engine: {engine}", "yellow"))
+                elif cmd == "/model":
+                    if arg:
+                        # Try to match by enum name or value
+                        matched = None
+                        for m in Txt2TxtModel:
+                            if arg.lower() in (m.name.lower(), m.value.lower()):
+                                matched = m
+                                break
+                        if matched:
+                            self.active_model = matched.value
+                            print(c(f"  Model switched to: {matched.name} ({matched.value})", "yellow"))
+                        else:
+                            # Allow setting raw model string (e.g. an Ollama model)
+                            self.active_model = arg
+                            print(c(f"  Model switched to: {arg}", "yellow"))
+                    else:
+                        print(c(f"  Current model: {self.active_model}", "dim"))
+                        # Show Claude Code options
+                        print(c("  Claude Code (Subscription):", "dim"))
+                        for val, label in [("claude-code", "Claude Sonnet"), ("claude-code-opus", "Claude Opus")]:
+                            marker = " *" if val == self.active_model else ""
+                            print(c(f"    {label:40s} {val}{marker}", "dim"))
+                        # Show live Ollama models
+                        print(c("  Local Models (Ollama):", "dim"))
+                        ollama_models = await self._fetch_ollama_models()
+                        if ollama_models:
+                            for m in ollama_models:
+                                marker = " *" if m["value"] == self.active_model else ""
+                                print(c(f"    {m['display_name']:40s} {m['size_str']:>6s}  {m['param_size']}{marker}", "dim"))
+                        else:
+                            print(c("    (could not reach Ollama)", "red"))
+                elif cmd == "/modify":
+                    if not arg:
+                        print(c("  Usage: /modify <instruction>", "red"))
+                    else:
+                        await self.handle_modify(arg)
                 else:
                     print(c(f"  Unknown command: {cmd}", "red"))
                 continue

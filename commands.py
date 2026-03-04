@@ -7,13 +7,91 @@ import asyncio
 import logging
 import os
 
+import aiohttp
 import discord
 from discord import app_commands
 
 from image_generation import ImageGenerator
+from models import Txt2TxtModel
+
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Set up logging
 logger = logging.getLogger("CommandHandlers")
+
+
+class ModelSelectView(discord.ui.View):
+    """Dropdown view for model selection."""
+
+    def __init__(self, bot, options: list):
+        super().__init__(timeout=60)
+        self.bot = bot
+        select = discord.ui.Select(
+            placeholder="Pick a model...",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        selected = interaction.data["values"][0]
+        self.bot.active_model = selected
+        self.bot.save_active_model()
+        logger.info(f"Model switched to {selected} by {interaction.user.name}")
+        await interaction.response.edit_message(
+            content=f"Model switched to: **{selected}**",
+            embed=None,
+            view=None,
+        )
+
+
+class RestartConfirmView(discord.ui.View):
+    """Confirm or revert bot code changes before restart."""
+
+    def __init__(self, bot, author_id: int):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.author_id = author_id
+
+    @discord.ui.button(label="Apply & Restart", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the requester can confirm.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="applying changes and restarting...", view=None)
+        # Commit the changes
+        proc = await asyncio.create_subprocess_exec(
+            "git", "add", "-A", cwd=PROJECT_DIR,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        proc = await asyncio.create_subprocess_exec(
+            "git", "commit", "-m", "[bot-self-modify] applied code changes",
+            cwd=PROJECT_DIR,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        # Save notification so the bot announces it's back after restart
+        self.bot._state["restart_notify"] = {
+            "channel_id": interaction.channel.id,
+            "message": "ok i'm back, changes have been applied",
+        }
+        self.bot._save_state()
+        await self.bot.request_restart(interaction.channel)
+
+    @discord.ui.button(label="Revert", style=discord.ButtonStyle.red)
+    async def revert(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the requester can revert.", ephemeral=True)
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", ".", cwd=PROJECT_DIR,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        await interaction.response.edit_message(content="Changes reverted.", view=None)
 
 
 class CommandHandlers:
@@ -315,6 +393,73 @@ class CommandHandlers:
 
             await interaction.followup.send(response_text)
 
+        @self.bot.tree.command(name="set_model", description="Switch the active LLM model")
+        async def set_model(interaction: discord.Interaction):
+            """Switch the active LLM model — shows an embed with a dropdown selector"""
+            logger.info(f"Set model command called by {interaction.user.name}#{interaction.user.discriminator}")
+            await interaction.response.defer(thinking=True, ephemeral=True)
+
+            # Fetch available local models from Ollama
+            local_models = await self._fetch_ollama_models()
+
+            # Build the embed listing all models
+            embed = discord.Embed(
+                title="Select a Model",
+                color=discord.Color.blurple(),
+            )
+
+            lines = []
+            # Claude Code options first
+            lines.append("**Claude Code (Subscription)**")
+            lines.append("`  Claude Sonnet`")
+            lines.append("`  Claude Opus`")
+
+            if local_models:
+                lines.append("")
+                lines.append("**Local Models (Ollama)**")
+                for m in local_models:
+                    lines.append(f"`  {m['display_name']:40s} {m['size_str']}`")
+
+            embed.description = "\n".join(lines)
+
+            current = self.bot.active_model
+            embed.set_footer(text=f"Current model: {current}")
+
+            # Build dropdown options
+            options = [
+                discord.SelectOption(
+                    label="Claude Sonnet",
+                    value=Txt2TxtModel.CLAUDE_CODE.value,
+                    description="Claude Code via subscription",
+                    default=(current == Txt2TxtModel.CLAUDE_CODE.value),
+                ),
+                discord.SelectOption(
+                    label="Claude Opus",
+                    value=Txt2TxtModel.CLAUDE_CODE_OPUS.value,
+                    description="Claude Code Opus via subscription",
+                    default=(current == Txt2TxtModel.CLAUDE_CODE_OPUS.value),
+                ),
+            ]
+            for m in local_models:
+                options.append(discord.SelectOption(
+                    label=m["display_name"][:100],
+                    value=m["value"],
+                    description=f"{m['param_size']} · {m['size_str']}",
+                    default=(current == m["value"]),
+                ))
+
+            # Cap at 25 options (Discord limit)
+            options = options[:25]
+
+            view = ModelSelectView(self.bot, options)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+        @self.bot.tree.command(name="get_model", description="Show the current active LLM model")
+        async def get_model(interaction: discord.Interaction):
+            """Show the current active model"""
+            logger.info(f"Get model command called by {interaction.user.name}#{interaction.user.discriminator}")
+            await interaction.response.send_message(f"Current model: **{self.bot.active_model}**")
+
         @self.bot.tree.command(name="sync_commands")
         async def sync_commands(interaction: discord.Interaction):
             """Manually sync slash commands to Discord (rate-limited, use sparingly)"""
@@ -324,3 +469,44 @@ class CommandHandlers:
             await interaction.followup.send("Commands synced successfully.")
 
         logger.info("All Discord slash commands registered successfully")
+
+    async def _fetch_ollama_models(self) -> list:
+        """Query Ollama API for available local models."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("http://localhost:11434/api/tags", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Ollama API returned status {resp.status}")
+                        return []
+                    data = await resp.json()
+        except Exception as e:
+            logger.warning(f"Failed to fetch Ollama models: {e}")
+            return []
+
+        models = []
+        for m in data.get("models", []):
+            name = m["name"]
+            size_bytes = m.get("size", 0)
+            param_size = m.get("details", {}).get("parameter_size", "?")
+
+            # Shorten display name: strip hf.co/... and huihui_ai/... prefixes
+            display = name
+            for prefix in ("hf.co/", "huihui_ai/"):
+                if display.startswith(prefix):
+                    display = display[len(prefix):]
+            size_gb = size_bytes / (1024 ** 3)
+            if size_gb >= 1:
+                size_str = f"{size_gb:.0f}GB"
+            else:
+                size_str = f"{size_gb * 1024:.0f}MB"
+
+            models.append({
+                "value": name,           # full Ollama model name for API calls
+                "display_name": display, # shortened for UI
+                "size_str": size_str,
+                "param_size": param_size,
+            })
+
+        models.sort(key=lambda x: x["display_name"].lower())
+        return models
+

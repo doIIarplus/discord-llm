@@ -10,5 +10,6 @@ beautifulsoup4
 pypdf
 trafilatura
 tavily-python
+anthropic
 # transformers (optional, for better token counting)
 # torch (optional, required by transformers)
