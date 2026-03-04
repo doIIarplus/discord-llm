@@ -476,6 +476,27 @@ class CommandHandlers:
                 logger.error(f"Ping failed: {e}", exc_info=True)
                 await interaction.followup.send(f"Ping failed: {e}")
 
+        @self.bot.tree.command(name="list_documents", description="List all folders in My Documents")
+        async def list_documents(interaction: discord.Interaction):
+            """List all folder names inside the My Documents directory."""
+            logger.info(f"List documents command called by {interaction.user.name}#{interaction.user.discriminator}")
+            await interaction.response.defer(thinking=True)
+            docs_path = "/mnt/c/Users/Daniel/Documents"
+            try:
+                folders = sorted(
+                    entry.name for entry in os.scandir(docs_path) if entry.is_dir()
+                )
+                if not folders:
+                    await interaction.followup.send("No folders found in My Documents.")
+                    return
+                result = ", ".join(folders)
+                if len(result) > 2000:
+                    result = result[:1997] + "..."
+                await interaction.followup.send(result)
+            except Exception as e:
+                logger.error(f"Error listing documents: {e}", exc_info=True)
+                await interaction.followup.send(f"Error: {e}")
+
         @self.bot.tree.command(name="sync_commands")
         async def sync_commands(interaction: discord.Interaction):
             """Manually sync slash commands to Discord (rate-limited, use sparingly)"""
