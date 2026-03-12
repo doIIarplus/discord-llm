@@ -219,6 +219,28 @@ class OllamaBot(discord.Client):
             except Exception as e:
                 print(f"Error handling crash sentinel: {e}")
 
+        # List all servers in the status channel
+        await self._send_server_list()
+
+    async def _send_server_list(self):
+        """Send a list of all connected servers to the status channel."""
+        STATUS_CHANNEL_ID = 1381051356894334999
+        channel = self.get_channel(STATUS_CHANNEL_ID)
+        if not channel:
+            print(f"Could not find status channel {STATUS_CHANNEL_ID}")
+            return
+
+        guilds = self.guilds
+        if not guilds:
+            await channel.send("not in any servers")
+            return
+
+        lines = [f"**connected to {len(guilds)} server(s):**"]
+        for g in guilds:
+            lines.append(f"- {g.name} (id: {g.id}, members: {g.member_count})")
+
+        await channel.send("\n".join(lines))
+
     def pick_model(self, server: int, channel: int) -> str:
         """Pick the appropriate model based on context and active backend"""
         # Claude Code doesn't support images via CLI
