@@ -12,6 +12,7 @@ from typing import Dict, List
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 
 from commands import CommandHandlers
 from config import (
@@ -153,9 +154,24 @@ class OllamaBot(discord.Client):
         except FileNotFoundError:
             return ""
 
+    @tasks.loop(hours=24)
+    async def _claude_code_max_reminder(self):
+        """Send a daily DM reminder to purchase Claude Code Max."""
+        try:
+            user = await self.fetch_user(134429572405002240)
+            await user.send("hey buy claude code max already you keep forgetting https://claude.ai/upgrade")
+        except Exception as e:
+            print(f"Failed to send Claude Code Max reminder: {e}")
+
+    @_claude_code_max_reminder.before_loop
+    async def _before_reminder(self):
+        await self.wait_until_ready()
+
     async def on_ready(self):
         """Called when the bot is fully connected. Send post-restart notification if pending."""
         print(f"Logged in as {self.user}")
+        if not self._claude_code_max_reminder.is_running():
+            self._claude_code_max_reminder.start()
         notify = self._state.pop("restart_notify", None)
         if notify:
             self._save_state()  # Clear the notification from disk
