@@ -53,19 +53,12 @@ class RAGSystem:
     ):
         self.db_path = db_path
         self.collection_name = collection_name
+        self._model_name = model_name
 
-        logger.info(f"Loading embedding model: {model_name}")
-        self.embedding_model = SentenceTransformer(model_name)
-        
-        # Initialize tokenizer for better token counting if available
-        if TOKENIZER_AVAILABLE:
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
-            except Exception as e:
-                logger.warning(f"Could not load tokenizer: {e}. Falling back to word counting.")
-                self.tokenizer = None
-        else:
-            self.tokenizer = None
+        # Defer model loading until RAG is actually used
+        self._embedding_model = None
+        self._tokenizer = None
+        self._models_loaded = False
 
         self.client = chromadb.PersistentClient(
             path=db_path,
@@ -98,6 +91,30 @@ class RAGSystem:
                 logger.info(f"Created new collection: {collection_name}")
 
         self.parser = WikiParser(chunk_size=500, chunk_overlap=100)  # Increased overlap for better context
+
+    def _load_models(self):
+        """Lazily load embedding model and tokenizer on first use."""
+        if self._models_loaded:
+            return
+        logger.info(f"Loading embedding model: {self._model_name}")
+        self._embedding_model = SentenceTransformer(self._model_name)
+        if TOKENIZER_AVAILABLE:
+            try:
+                self._tokenizer = AutoTokenizer.from_pretrained("gpt2")
+            except Exception as e:
+                logger.warning(f"Could not load tokenizer: {e}. Falling back to word counting.")
+                self._tokenizer = None
+        self._models_loaded = True
+
+    @property
+    def embedding_model(self):
+        self._load_models()
+        return self._embedding_model
+
+    @property
+    def tokenizer(self):
+        self._load_models()
+        return self._tokenizer
 
     def index_wiki_dump(self, xml_path: str, batch_size: int = 100):
         xml_path = safe_path(xml_path)

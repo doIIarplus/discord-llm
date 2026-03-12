@@ -516,6 +516,7 @@ class TestCLI:
         print("  /ddg                  Toggle DuckDuckGo / Tavily search")
         print("  /model [name]         Show/switch active model (e.g. /model claude_code)")
         print("  /modify <instruction> Use Claude Code to modify bot source code")
+        print("  /logs [N]             Show last N lines of bot.log (default 50)")
         print("  /prompt               Show current system prompt")
         print("  /set_prompt <text>    Set system prompt")
         print("  /reset_prompt         Reset to default system prompt")
@@ -631,6 +632,16 @@ class TestCLI:
                                 print(c(f"    {m['display_name']:40s} {m['size_str']:>6s}  {m['param_size']}{marker}", "dim"))
                         else:
                             print(c("    (could not reach Ollama)", "red"))
+                elif cmd == "/logs":
+                    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
+                    try:
+                        with open(log_path, "r", errors="replace") as f:
+                            lines = f.readlines()
+                        n = int(arg) if arg else 50
+                        for line in lines[-n:]:
+                            print(c(f"  {line.rstrip()}", "dim"))
+                    except FileNotFoundError:
+                        print(c("  No bot.log found", "red"))
                 elif cmd == "/modify":
                     if not arg:
                         print(c("  Usage: /modify <instruction>", "red"))

@@ -143,6 +143,16 @@ class OllamaBot(discord.Client):
         await self.tree.sync(guild=guild)
         await js_renderer.start()
 
+    def _read_recent_logs(self, max_lines: int = 200) -> str:
+        """Read the last N lines from bot.log."""
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                lines = f.readlines()
+            return "".join(lines[-max_lines:])
+        except FileNotFoundError:
+            return ""
+
     async def on_ready(self):
         """Called when the bot is fully connected. Send post-restart notification if pending."""
         print(f"Logged in as {self.user}")
@@ -155,6 +165,42 @@ class OllamaBot(discord.Client):
                     await channel.send(notify.get("message", "ok i'm back, changes have been applied"))
                 except Exception as e:
                     print(f"Failed to send restart notification: {e}")
+
+        # Check for crash sentinel written by run_bot.sh
+        sentinel_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_exit_code")
+        if os.path.exists(sentinel_path):
+            try:
+                with open(sentinel_path) as f:
+                    exit_code = f.read().strip()
+                os.remove(sentinel_path)
+
+                channel_id = self._state.get("last_active_channel_id")
+                channel = self.get_channel(channel_id) if channel_id else None
+                if channel:
+                    logs = self._read_recent_logs()
+                    # Extract just the traceback portion for the Discord message
+                    traceback_lines = []
+                    in_traceback = False
+                    for line in logs.splitlines():
+                        if line.startswith("Traceback"):
+                            in_traceback = True
+                            traceback_lines = [line]
+                        elif in_traceback:
+                            traceback_lines.append(line)
+                    error_display = "\n".join(traceback_lines[-20:]) if traceback_lines else logs[-500:]
+                    error_display = error_display[:1500]
+
+                    await channel.send(
+                        f"i just crashed (exit code {exit_code}). here's what went wrong:\n"
+                        f"```\n{error_display}\n```"
+                    )
+                    from commands import CrashFixView
+                    view = CrashFixView(self, logs)
+                    await channel.send("want me to try to fix it?", view=view)
+                else:
+                    print(f"Crash detected (exit {exit_code}) but no last active channel to report to")
+            except Exception as e:
+                print(f"Error handling crash sentinel: {e}")
 
     def pick_model(self, server: int, channel: int) -> str:
         """Pick the appropriate model based on context and active backend"""
@@ -221,6 +267,10 @@ class OllamaBot(discord.Client):
         # Only respond to direct mentions and replies
         if not (is_direct_mention or is_reply_to_bot):
             return
+
+        # Track last active channel for crash reporting
+        self._state["last_active_channel_id"] = channel
+        self._save_state()
 
         try:
             user_text = re.sub(r'<@!?\d+>', '', message.content).strip()
@@ -412,8 +462,15 @@ class OllamaBot(discord.Client):
 
     async def _execute_code_change(self, message: discord.Message, instruction: str):
         """Run Claude Code to modify bot source, show diff, offer apply/revert."""
-        channel = message.channel
+        log_context = self._read_recent_logs()
+        await self._execute_code_change_with_logs(
+            message.channel, message.author.id, instruction, log_context
+        )
 
+    async def _execute_code_change_with_logs(
+        self, channel, author_id: int, instruction: str, log_context: str = ""
+    ):
+        """Run Claude Code to modify bot source with log context, show diff, offer apply/revert."""
         # Git snapshot for safety
         project_dir = os.path.dirname(os.path.abspath(__file__))
         proc = await asyncio.create_subprocess_exec(
@@ -433,7 +490,9 @@ class OllamaBot(discord.Client):
 
         try:
             async with channel.typing():
-                response, exit_code = await self.claude_code_client.run_code_edit(instruction)
+                response, exit_code = await self.claude_code_client.run_code_edit(
+                    instruction, log_context=log_context
+                )
         except RateLimitError:
             reset = self.claude_code_client.rate_limit_resets_at or "unknown"
             await status_msg.edit(content=f"claude code is rate limited, resets at {reset}")
@@ -471,7 +530,7 @@ class OllamaBot(discord.Client):
 
         # Apply/Revert buttons
         from commands import RestartConfirmView
-        view = RestartConfirmView(self, message.author.id)
+        view = RestartConfirmView(self, author_id)
         await channel.send("apply changes and restart?", view=view)
 
     def format_prompt(self, messages: List[dict]) -> str:

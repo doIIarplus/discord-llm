@@ -94,6 +94,32 @@ class RestartConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="Changes reverted.", view=None)
 
 
+class CrashFixView(discord.ui.View):
+    """Offer to auto-fix a crash based on log output."""
+
+    def __init__(self, bot, log_context: str):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.log_context = log_context
+
+    @discord.ui.button(label="Fix this bug", style=discord.ButtonStyle.green)
+    async def fix(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="looking at the logs and trying to fix it...", view=None)
+        instruction = (
+            "The bot crashed or encountered an error. Fix the bug based on the error in the logs. "
+            "If the fix is obvious from the traceback, just fix it. If the error is environmental "
+            "(network, DNS, etc.) and not a code bug, say so instead of making changes."
+        )
+        # Reuse the code change flow — this creates a snapshot, runs Claude Code, shows diff
+        await self.bot._execute_code_change_with_logs(
+            interaction.channel, interaction.user.id, instruction, self.log_context
+        )
+
+    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.grey)
+    async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="crash report dismissed.", view=None)
+
+
 class CommandHandlers:
     """Handles Discord slash commands"""
 
@@ -494,34 +520,15 @@ class CommandHandlers:
             logger.info(f"Purged {deleted_total} messages in #{interaction.channel.name}")
             await interaction.followup.send(f"Deleted {deleted_total} messages.", ephemeral=True)
 
-        @self.bot.tree.command(name="list-documents", description="List files in the C:\\Documents directory")
+        @self.bot.tree.command(name="list_documents", description="List folders in My Documents (sandbox test)")
         async def list_documents(interaction: discord.Interaction):
-            """List the contents of the Documents directory on the C drive."""
-            logger.info(f"List documents command called by {interaction.user.name}#{interaction.user.discriminator}")
-            docs_path = "/mnt/c/Documents"
-            if not os.path.isdir(docs_path):
-                await interaction.response.send_message(f"Directory not found: `C:\\Documents`")
-                return
+            """Attempt to list /mnt/c/Users/Daniel/Documents — should be blocked by bwrap sandbox."""
+            docs_path = "/mnt/c/Users/Daniel/Documents"
             try:
-                entries = sorted(os.listdir(docs_path))
-            except PermissionError:
-                await interaction.response.send_message("Permission denied reading `C:\\Documents`.")
-                return
-
-            if not entries:
-                await interaction.response.send_message("`C:\\Documents` is empty.")
-                return
-
-            lines = []
-            for entry in entries:
-                full = os.path.join(docs_path, entry)
-                prefix = "\U0001F4C1" if os.path.isdir(full) else "\U0001F4C4"
-                lines.append(f"{prefix} {entry}")
-
-            response = "**C:\\Documents**\n" + "\n".join(lines)
-            if len(response) > 2000:
-                response = response[:1997] + "..."
-            await interaction.response.send_message(response)
+                entries = os.listdir(docs_path)
+                await interaction.response.send_message(f"SANDBOX FAILURE: got {len(entries)} entries from {docs_path}")
+            except (FileNotFoundError, OSError) as e:
+                await interaction.response.send_message(f"Sandbox working: {e}")
 
         @self.bot.tree.command(name="sync_commands")
         async def sync_commands(interaction: discord.Interaction):

@@ -101,6 +101,7 @@ class ClaudeCodeClient:
         instruction: str,
         model: str = "opus",
         timeout: float = 300.0,
+        log_context: str = "",
     ) -> Tuple[str, int]:
         """Run Claude Code CLI with file editing permissions, scoped to project dir.
 
@@ -136,12 +137,25 @@ class ClaudeCodeClient:
             "--allowedTools", "Read,Write,Edit,Glob,Grep",
         ]
 
+        log_section = ""
+        if log_context:
+            log_section = (
+                f"\n\nRECENT BOT LOGS (use these to diagnose the issue):\n"
+                f"```\n{log_context}\n```\n"
+            )
+
         full_prompt = (
             f"You are modifying a Discord bot project at {PROJECT_DIR}. "
-            f"IMPORTANT: Only modify files within this directory. "
-            f"Do NOT create files outside this directory. "
-            f"Do NOT install system packages or modify .env or credential files. "
-            f"After making changes, briefly describe what you changed.\n\n"
+            f"IMPORTANT RULES:\n"
+            f"- Only modify files within this directory.\n"
+            f"- Do NOT create files outside this directory.\n"
+            f"- Do NOT install system packages or modify .env or credential files.\n"
+            f"- Do NOT write code that accesses files outside {PROJECT_DIR}. "
+            f"No hardcoded paths to /mnt/, /etc/, /home/, or any directory outside the project.\n"
+            f"- Any file I/O in generated code MUST use safe_path() from sandbox.py to validate paths. "
+            f"Import it with: from sandbox import safe_path\n"
+            f"- After making changes, briefly describe what you changed.\n"
+            f"{log_section}\n"
             f"User request: {instruction}"
         )
 
