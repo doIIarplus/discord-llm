@@ -520,6 +520,7 @@ class TestCLI:
         print("  /prompt               Show current system prompt")
         print("  /set_prompt <text>    Set system prompt")
         print("  /reset_prompt         Reset to default system prompt")
+        print("  /time <human time>    Convert to Discord timestamp (e.g. /time sunday 9am)")
         print("  /help                 Show this help")
         print("  /quit                 Exit")
         print()
@@ -581,6 +582,18 @@ class TestCLI:
                     print(c("  Context cleared", "yellow"))
                 elif cmd == "/context":
                     self.show_context()
+                elif cmd == "/time":
+                    if not arg:
+                        print(c("  Usage: /time <human time>  (e.g. sunday 9am, tomorrow 3pm, in 2 hours)", "red"))
+                    else:
+                        from time_command import parse_time_input, format_discord_timestamp
+                        from zoneinfo import ZoneInfo
+                        tz = ZoneInfo('UTC')
+                        dt = parse_time_input(arg, tz)
+                        if dt is None:
+                            print(c(f"  couldn't parse \"{arg}\"", "red"))
+                        else:
+                            print(c(f"  {format_discord_timestamp(dt)} (UTC)", "green"))
                 elif cmd == "/search":
                     if not arg:
                         print(c("  Usage: /search <query>", "red"))

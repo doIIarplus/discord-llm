@@ -35,6 +35,7 @@ from file_parser import FileParser
 from mention_extractor import extract_mention_context
 from response_splitter import split_response_by_markers, split_response_by_paragraphs, split_long_message, calculate_typing_delay
 from sandbox import safe_path, SandboxViolation
+from time_command import handle_time_command
 
 # Exit code that tells the wrapper script (run_bot.sh) to restart the bot
 RESTART_EXIT_CODE = 42
@@ -249,6 +250,12 @@ class OllamaBot(discord.Client):
 
         server = message.guild.id
         channel = message.channel.id
+
+        # Handle !time prefix command (no mention required)
+        if message.content.strip().startswith('!time'):
+            time_text = message.content.strip()[5:].strip()
+            await handle_time_command(message, time_text)
+            return
 
         # Handle attachments
         image_files = []
