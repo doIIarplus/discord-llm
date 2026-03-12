@@ -295,7 +295,7 @@ class OllamaBot(discord.Client):
             pending = self._pending_code_change
             if pending and pending["channel_id"] == channel and pending["user_id"] == message.author.id:
                 self._pending_code_change = None
-                if re.match(r'^(y(es|eah|ep|a)?|sure|go ahead|do it|ok|yup|please|absolutely)\b', user_text, re.IGNORECASE):
+                if re.match(r'^(y(es|eah|ep|a|ea)?|sure|go ahead|do it|ok|yup|please|absolutely)\b', user_text, re.IGNORECASE):
                     await self._execute_code_change(message, pending["instruction"])
                     return
                 else:
