@@ -361,6 +361,57 @@ class OllamaBot(discord.Client):
                 )
                 return
 
+            # If replying to a message, inject the referenced message into context
+            if message.reference and ref_msg and ref_msg.author.id != self.user.id:
+                if server not in self.context:
+                    self.context[server] = {}
+                if channel not in self.context[server]:
+                    self.context[server][channel] = []
+                ctx = self.context[server][channel]
+                ref_content = ref_msg.clean_content
+
+                # Download and encode any attachments from the referenced message
+                ref_images = []
+                ref_doc_context = ""
+                for att in ref_msg.attachments:
+                    safe_filename = os.path.basename(att.filename)
+                    file_path = safe_path(os.path.join(FILE_INPUT_FOLDER, f"ref_{safe_filename}"))
+                    try:
+                        await att.save(file_path)
+                        ext = os.path.splitext(file_path)[1].lower()
+                        if ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']:
+                            ref_images.extend(encode_images_to_base64([file_path]))
+                        else:
+                            content = FileParser.parse_file(file_path)
+                            if content:
+                                ref_doc_context += f"\n\n--- Content of {att.filename} ---\n{content}\n--------------------------\n"
+                    except Exception as e:
+                        print(f"Error processing ref attachment {att.filename}: {e}")
+                    finally:
+                        try:
+                            os.remove(file_path)
+                        except OSError:
+                            pass
+
+                if ref_doc_context:
+                    ref_content += f"\n\n[Attached Documents Context]{ref_doc_context}"
+
+                # Only add if not already the last entry in context
+                already_in_ctx = (
+                    ctx and ctx[-1]["role"] == "user"
+                    and ctx[-1]["content"] == ref_content
+                )
+                if not already_in_ctx and (ref_content or ref_images):
+                    ctx.append({
+                        "role": "user",
+                        "name": ref_msg.author.display_name,
+                        "content": ref_content or "(attachment)",
+                        "timestamp": ref_msg.created_at.timestamp(),
+                        "images": ref_images,
+                    })
+                    if len(ctx) > CONTEXT_LIMIT:
+                        ctx.pop(0)
+
             fetched_sources = await self.build_context(message, server, False, image_files, document_files)
             await self._send_response(message, server, channel, fetched_sources)
 

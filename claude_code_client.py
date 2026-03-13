@@ -311,7 +311,7 @@ class ClaudeCodeClient:
         self,
         instruction: str,
         model: str = "opus",
-        timeout: float = 300.0,
+        timeout: float = 600.0,
         log_context: str = "",
     ) -> Tuple[str, int]:
         """Run Claude Code CLI with file editing permissions, scoped to project dir.
@@ -450,7 +450,7 @@ class ClaudeCodeClient:
         prompt: str,
         model: str,
         enable_search: bool = False,
-        timeout: float = 120.0,
+        timeout: float = 600.0,
         method: str = "generate",
     ) -> str:
         """Run the claude CLI and return the response text."""

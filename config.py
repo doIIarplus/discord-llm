@@ -25,7 +25,7 @@ logger.info(f"Discord configuration loaded. Guild ID: {GUILD_ID}")
 
 # Ollama Configuration
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5vl:72b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:35b-a3b-q8_0")
 logger.info(
     f"Ollama configuration loaded. API URL: {OLLAMA_API_URL}, Model: {OLLAMA_MODEL}"
 )
