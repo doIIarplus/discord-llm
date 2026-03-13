@@ -463,7 +463,6 @@ class ClaudeCodeClient:
             )
 
         model_alias = self._resolve_model(model)
-        is_ollama = self._is_ollama_model(model)
 
         cmd = [
             CLAUDE_CLI,
@@ -475,10 +474,7 @@ class ClaudeCodeClient:
         ]
 
         # Only allow web tools — no file editing, no bash
-        # Ollama models don't support tool use, so skip tools entirely
-        if is_ollama:
-            cmd.extend(["--tools", ""])
-        elif enable_search:
+        if enable_search:
             cmd.extend(["--allowedTools", "WebSearch,WebFetch"])
         else:
             cmd.extend(["--tools", ""])

@@ -465,6 +465,12 @@ class CommandHandlers:
                     description="Claude Code Opus via subscription",
                     default=(current == Txt2TxtModel.CLAUDE_CODE_OPUS.value),
                 ),
+                discord.SelectOption(
+                    label="Qwen 3.5 35B (via Claude Code)",
+                    value=Txt2TxtModel.CLAUDE_CODE_QWEN35.value,
+                    description="Local Ollama model routed through Claude Code CLI",
+                    default=(current == Txt2TxtModel.CLAUDE_CODE_QWEN35.value),
+                ),
             ]
             for m in local_models:
                 options.append(discord.SelectOption(
