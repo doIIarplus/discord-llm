@@ -664,6 +664,15 @@ class TestCLI:
                     print(c(f"  Unknown command: {cmd}", "red"))
                 continue
 
+            # --- 6-digit nhentai code ---
+            if re.fullmatch(r'\d{6}', text):
+                link = f"https://nhentai.net/g/{text}/"
+                preview = f"https://nhentai.net/g/{text}/3"
+                print(c(f"  {link}", "green"))
+                print(c(f"  preview: {preview}", "green"))
+                print()
+                continue
+
             # --- Regular message ---
             sources = await self.build_context(text, self.current_user)
             response_parts = await self.query()

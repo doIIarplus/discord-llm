@@ -302,6 +302,15 @@ class OllamaBot(discord.Client):
         try:
             user_text = re.sub(r'<@!?\d+>', '', message.content).strip()
 
+            # Handle 6-digit nhentai codes
+            nh_match = re.fullmatch(r'\d{6}', user_text)
+            if nh_match:
+                code = user_text
+                link = f"https://nhentai.net/g/{code}/"
+                preview = f"https://nhentai.net/g/{code}/3"
+                await message.channel.send(f"{link}\npreview: {preview}")
+                return
+
             # Check if user is confirming a pending code change
             pending = self._pending_code_change
             if pending and pending["channel_id"] == channel and pending["user_id"] == message.author.id:
