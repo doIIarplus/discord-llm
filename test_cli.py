@@ -667,9 +667,9 @@ class TestCLI:
             # --- 6-digit nhentai code ---
             if re.fullmatch(r'\d{6}', text):
                 link = f"https://nhentai.net/g/{text}/"
-                preview = f"https://nhentai.net/g/{text}/3"
+                preview_page = f"https://nhentai.net/g/{text}/3"
                 print(c(f"  {link}", "green"))
-                print(c(f"  preview: {preview}", "green"))
+                print(c(f"  (preview image fetched from page 3 and embedded)", "cyan"))
                 print()
                 continue
 

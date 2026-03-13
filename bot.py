@@ -307,8 +307,33 @@ class OllamaBot(discord.Client):
             if nh_match:
                 code = user_text
                 link = f"https://nhentai.net/g/{code}/"
-                preview = f"https://nhentai.net/g/{code}/3"
-                await message.channel.send(f"{link}\npreview: {preview}")
+                preview_page = f"https://nhentai.net/g/{code}/3"
+                # Fetch preview image from page 3 and embed it
+                try:
+                    import aiohttp
+                    from bs4 import BeautifulSoup
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(preview_page, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                            if resp.status == 200:
+                                html = await resp.text()
+                                soup = BeautifulSoup(html, "html.parser")
+                                img_tag = soup.select_one("#image-container img")
+                                img_url = img_tag["src"] if img_tag else None
+                                if img_url:
+                                    async with session.get(img_url, headers={"User-Agent": "Mozilla/5.0"}) as img_resp:
+                                        if img_resp.status == 200:
+                                            import io
+                                            img_data = await img_resp.read()
+                                            ext = img_url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
+                                            filename = f"preview.{ext}"
+                                            file = discord.File(io.BytesIO(img_data), filename=filename)
+                                            await message.channel.send(link, file=file)
+                                            return
+                    # Fallback if image fetch fails
+                    await message.channel.send(link)
+                except Exception as e:
+                    logger.error(f"Failed to fetch nhentai preview: {e}")
+                    await message.channel.send(link)
                 return
 
             # Check if user is confirming a pending code change
