@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import re
 import os
 import random
@@ -9,6 +10,8 @@ import sys
 import time
 import traceback
 from typing import Dict, List
+
+logger = logging.getLogger("Bot")
 
 import aiohttp
 import discord
@@ -57,11 +60,9 @@ _SEARCH_KEYWORDS = re.compile(
 )
 
 # Keywords that suggest the user wants the bot to modify its own code
-_CODE_CHANGE_KEYWORDS = re.compile(
-    r'\b(add|create|make|implement|build|write)\b.{0,30}\b(command|slash command|feature|function)\b'
-    r'|\b(change|modify|update|fix|edit)\b.{0,20}\b(the bot|your code|yourself|your behavior|the code)\b'
-    r'|\bmodify yourself\b',
-    re.IGNORECASE
+_EDIT_CODE_TAG = re.compile(
+    r'\[EDIT_CODE\](.*?)\[/EDIT_CODE\]',
+    re.DOTALL
 )
 
 
@@ -86,9 +87,6 @@ class OllamaBot(discord.Client):
         self._state = self._load_state()
         self.active_model = self._state.get("active_model", CHAT_MODEL)
 
-        # Pending code change: {channel_id, user_id, instruction}
-        self._pending_code_change = None
-
         # Initialize RAG system
         self.rag_system = RAGSystem()
         self.rag_enabled = False
@@ -111,7 +109,19 @@ class OllamaBot(discord.Client):
             "Use it when:\n"
             "- You want to greet then provide information\n"
             "- You have multiple distinct topics to address\n"
-            "- A dramatic pause or separate thought would feel natural"
+            "- A dramatic pause or separate thought would feel natural\n\n"
+            "CODE EDITING:\n"
+            "You ARE a Discord bot that can modify its own source code. When a user asks you to fix a bug, "
+            "add a feature, change behavior, or modify your code in any way, include an [EDIT_CODE] tag in your response "
+            "with a clear description of what to do. Format:\n"
+            "[EDIT_CODE]detailed instruction of what to change[/EDIT_CODE]\n"
+            "Examples:\n"
+            "- User: 'fix the logger error' → 'on it [EDIT_CODE]Add import logging and logger = logging.getLogger(__name__) to bot.py[/EDIT_CODE]'\n"
+            "- User: 'add a /ping command' → 'sure [EDIT_CODE]Add a /ping slash command that replies with pong and the bot latency[/EDIT_CODE]'\n"
+            "- User: 'you keep crashing when I send images' → 'lemme fix that [EDIT_CODE]Fix the image handling crash - check the error in bot.log and fix the root cause[/EDIT_CODE]'\n"
+            "Include your normal casual response text OUTSIDE the tag. The tag content should be a clear, "
+            "specific instruction — not conversational. Only use this when the user is genuinely asking for a code change. "
+            "Do NOT use it for general questions about code or programming help."
         )
         self.system_prompt = self.original_system_prompt
 
@@ -340,31 +350,6 @@ class OllamaBot(discord.Client):
                     await message.channel.send(link)
                 return
 
-            # Check if user is confirming a pending code change
-            pending = self._pending_code_change
-            if pending and pending["channel_id"] == channel and pending["user_id"] == message.author.id:
-                self._pending_code_change = None
-                if re.match(r'^(y(es|eah|ep|a|ea)?|sure|go ahead|do it|ok|yup|please|absolutely)\b', user_text, re.IGNORECASE):
-                    await self._execute_code_change(message, pending["instruction"])
-                    return
-                else:
-                    await message.channel.send("ok nvm, cancelled")
-                    return
-
-            # Check if user is asking for a code change (heuristic)
-            if _CODE_CHANGE_KEYWORDS.search(user_text):
-                self._pending_code_change = {
-                    "channel_id": channel,
-                    "user_id": message.author.id,
-                    "instruction": user_text,
-                }
-                await message.channel.send(
-                    f"sounds like you want me to modify my code. i'd do this:\n"
-                    f"> {user_text}\n"
-                    f"want me to go ahead?"
-                )
-                return
-
             # If replying to a message, inject the referenced message into context
             if message.reference and ref_msg and ref_msg.author.id != self.user.id:
                 if server not in self.context:
@@ -529,6 +514,20 @@ class OllamaBot(discord.Client):
             await message.channel.send(embed=response_data[0], file=response_data[1])
             return
 
+        # Check for [EDIT_CODE] tags in the response — LLM decided a code change is needed
+        edit_instruction = None
+        cleaned_response_data = []
+        for response_item in response_data:
+            if isinstance(response_item, str):
+                match = _EDIT_CODE_TAG.search(response_item)
+                if match:
+                    edit_instruction = match.group(1).strip()
+                    # Strip the tag from the displayed response
+                    response_item = _EDIT_CODE_TAG.sub('', response_item).strip()
+            if response_item:
+                cleaned_response_data.append(response_item)
+        response_data = cleaned_response_data
+
         # Collect all text parts to figure out where to append sources
         # Claude Code uses paragraph breaks; local models use ---MSG--- markers
         splitter = split_response_by_paragraphs if is_anthropic_model(self.active_model) else split_response_by_markers
@@ -576,6 +575,10 @@ class OllamaBot(discord.Client):
                 file = discord.File(response_item["image"])
                 await message.channel.send(file=file)
 
+        # If the LLM decided a code edit is needed, trigger it
+        if edit_instruction:
+            await self._execute_code_change(message, edit_instruction)
+
     async def _execute_code_change(self, message: discord.Message, instruction: str):
         """Run Claude Code to modify bot source, show diff, offer apply/revert."""
         log_context = self._read_recent_logs()
@@ -607,7 +610,7 @@ class OllamaBot(discord.Client):
         try:
             async with channel.typing():
                 response, exit_code = await self.claude_code_client.run_code_edit(
-                    instruction, log_context=log_context
+                    instruction, model=self.active_model, log_context=log_context
                 )
         except RateLimitError:
             reset = self.claude_code_client.rate_limit_resets_at or "unknown"
@@ -839,7 +842,7 @@ class OllamaBot(discord.Client):
                     if raw_response == "No response from Claude Code.":
                         print("No response from Claude Code")
                         return ["No response from Claude Code."]
-                except RateLimitError as rl_err:
+                except RateLimitError:
                     reset = self.claude_code_client.rate_limit_resets_at or "unknown"
                     print(f"  [Claude Code rate limited, resets at {reset}, falling back to local model]")
                     model = CHAT_MODEL
