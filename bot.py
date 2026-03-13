@@ -27,7 +27,7 @@ from config import (
 from image_generation import ImageGenerator
 from ollama_client import OllamaClient
 from claude_code_client import ClaudeCodeClient, RateLimitError
-from models import is_claude_code_model
+from models import is_claude_code_model, is_anthropic_model
 from utils import encode_images_to_base64
 from rag_system import RAGSystem
 from web_extractor import extract_webpage_context, web_search, format_search_results, js_renderer
@@ -95,6 +95,10 @@ class OllamaBot(discord.Client):
         # System prompts
         self.original_system_prompt = (
             "Your responses should be akin to that of a typical millenial texter: short, to the point, and mostly without punctuation. Do not offer any kind of assistance without being prompted. use slang *sparingly*. \n\n"
+            "CONVERSATION FORMAT:\n"
+            "The conversation history uses numbered [Turn N] tags. Each turn is a REAL message from a REAL user or your previous response. "
+            "ONLY respond to the LAST turn. Do NOT invent, fabricate, or continue with additional user messages. "
+            "Do NOT generate text inside [Turn] tags — only produce your own single response.\n\n"
             "MULTI-MESSAGE RESPONSES:\n"
             "When your response would naturally be multiple messages (like a greeting followed by information, "
             "or multiple distinct points), you can split them using the marker: ---MSG---\n"
@@ -218,28 +222,6 @@ class OllamaBot(discord.Client):
                     print(f"Crash detected (exit {exit_code}) but no last active channel to report to")
             except Exception as e:
                 print(f"Error handling crash sentinel: {e}")
-
-        # List all servers in the status channel
-        await self._send_server_list()
-
-    async def _send_server_list(self):
-        """Send a list of all connected servers to the status channel."""
-        STATUS_CHANNEL_ID = 1381051356894334999
-        channel = self.get_channel(STATUS_CHANNEL_ID)
-        if not channel:
-            print(f"Could not find status channel {STATUS_CHANNEL_ID}")
-            return
-
-        guilds = self.guilds
-        if not guilds:
-            await channel.send("not in any servers")
-            return
-
-        lines = [f"**connected to {len(guilds)} server(s):**"]
-        for g in guilds:
-            lines.append(f"- {g.name} (id: {g.id}, members: {g.member_count})")
-
-        await channel.send("\n".join(lines))
 
     def pick_model(self, server: int, channel: int) -> str:
         """Pick the appropriate model based on context and active backend"""
@@ -460,7 +442,7 @@ class OllamaBot(discord.Client):
 
         # Collect all text parts to figure out where to append sources
         # Claude Code uses paragraph breaks; local models use ---MSG--- markers
-        splitter = split_response_by_paragraphs if is_claude_code_model(self.active_model) else split_response_by_markers
+        splitter = split_response_by_paragraphs if is_anthropic_model(self.active_model) else split_response_by_markers
         all_parts = []
         for response_item in response_data:
             if isinstance(response_item, str) and response_item.strip():
@@ -579,14 +561,16 @@ class OllamaBot(discord.Client):
         await channel.send("apply changes and restart?", view=view)
 
     def format_prompt(self, messages: List[dict]) -> str:
-        """Format messages into a prompt"""
-        prompt = ""
-        for msg in messages:
-            role = "User" if msg["role"] == "user" else "Assistant"
-            name = f"({msg['name']})" if msg["role"] == "user" and "name" in msg else ""
-            prompt += f"{role} {name}: {msg['content']}\n"
-        prompt += "Assistant: "
-        return prompt
+        """Format messages into a prompt with clear turn boundaries."""
+        parts = []
+        for i, msg in enumerate(messages, 1):
+            if msg["role"] == "user":
+                name = msg.get("name", "Unknown")
+                parts.append(f"[Turn {i} | User ({name})]\n{msg['content']}\n[/Turn {i}]")
+            else:
+                parts.append(f"[Turn {i} | Assistant]\n{msg['content']}\n[/Turn {i}]")
+        parts.append(f"[Turn {len(messages) + 1} | Assistant]")
+        return "\n\n".join(parts) + "\n"
 
     def process_response(self, text: str, limit: int = MAX_DISCORD_MESSAGE_LENGTH) -> List:
         """Process response text, handling length limits"""
