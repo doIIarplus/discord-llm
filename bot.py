@@ -10,6 +10,7 @@ import time
 import traceback
 from typing import Dict, List
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -308,27 +309,30 @@ class OllamaBot(discord.Client):
                 code = user_text
                 link = f"https://nhentai.net/g/{code}/"
                 preview_page = f"https://nhentai.net/g/{code}/3"
-                # Fetch preview image from page 3 and embed it
+                # Fetch preview image from page 3 using Playwright (nhentai blocks plain HTTP)
                 try:
-                    import aiohttp
+                    import io
                     from bs4 import BeautifulSoup
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(preview_page, headers={"User-Agent": "Mozilla/5.0"}) as resp:
-                            if resp.status == 200:
-                                html = await resp.text()
-                                soup = BeautifulSoup(html, "html.parser")
-                                img_tag = soup.select_one("#image-container img")
-                                img_url = img_tag["src"] if img_tag else None
-                                if img_url:
-                                    async with session.get(img_url, headers={"User-Agent": "Mozilla/5.0"}) as img_resp:
-                                        if img_resp.status == 200:
-                                            import io
-                                            img_data = await img_resp.read()
-                                            ext = img_url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-                                            filename = f"preview.{ext}"
-                                            file = discord.File(io.BytesIO(img_data), filename=filename)
-                                            await message.channel.send(link, file=file)
-                                            return
+                    logger.info(f"Fetching nhentai page 3 preview for code {code} via Playwright")
+                    html = await js_renderer.render(preview_page, timeout=20000)
+                    if html:
+                        soup = BeautifulSoup(html, "html.parser")
+                        img_tag = soup.select_one("#image-container img")
+                        img_url = img_tag["src"] if img_tag else None
+                        logger.info(f"nhentai page 3 img_tag found: {img_tag is not None}, img_url: {img_url}")
+                        if img_url:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(img_url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://nhentai.net/"}) as img_resp:
+                                    logger.info(f"nhentai image download status: {img_resp.status}")
+                                    if img_resp.status == 200:
+                                        img_data = await img_resp.read()
+                                        ext = img_url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
+                                        filename = f"preview.{ext}"
+                                        file = discord.File(io.BytesIO(img_data), filename=filename)
+                                        await message.channel.send(link, file=file)
+                                        return
+                    else:
+                        logger.warning(f"Playwright render returned no HTML for {preview_page}")
                     # Fallback if image fetch fails
                     await message.channel.send(link)
                 except Exception as e:
