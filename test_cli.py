@@ -17,6 +17,10 @@ Commands:
     /prompt               Show current system prompt
     /set_prompt <text>    Set system prompt
     /reset_prompt         Reset to default system prompt
+    /plugins              List loaded plugins
+    /reload_plugin <name> Hot-reload a plugin
+    /load_plugin <name>   Load a plugin
+    /unload_plugin <name> Unload a plugin
     /help                 Show this help
     /quit                 Exit
 """
@@ -105,6 +109,33 @@ class TestCLI:
         self.current_user = "TestUser"
         self.pending_attachments: List[str] = []
         self.use_ddg = False
+        self.plugin_manager = self._init_plugin_manager()
+
+    def _init_plugin_manager(self):
+        """Create a PluginManager with a minimal mock bot for CLI testing."""
+        from plugin_manager import PluginManager
+
+        # Minimal mock so plugins can load (they need ctx.discord_client, etc.)
+        class _MockBot:
+            def __init__(self, cli):
+                self.context = {}
+                self.active_model = cli.active_model
+                self.system_prompt = cli.system_prompt
+                self.ollama_client = cli.ollama_client
+                self.claude_code_client = cli.claude_code_client
+                self.tree = None  # No command tree in CLI mode
+                self.rag_system = None
+                self.rag_enabled = False
+
+            def get_channel(self, _):
+                return None
+
+        mock = _MockBot(self)
+        pm = PluginManager(mock)
+        # Skip slash command registration in CLI mode
+        pm._register_commands = lambda instance: None
+        pm._unregister_commands = lambda instance: None
+        return pm
 
     async def _fetch_ollama_models(self) -> list:
         """Query Ollama API for available local models."""
@@ -521,6 +552,10 @@ class TestCLI:
         print("  /set_prompt <text>    Set system prompt")
         print("  /reset_prompt         Reset to default system prompt")
         print("  /time <human time>    Convert to Discord timestamp (e.g. /time sunday 9am)")
+        print("  /plugins              List loaded plugins")
+        print("  /reload_plugin <name> Hot-reload a plugin")
+        print("  /load_plugin <name>   Load a plugin")
+        print("  /unload_plugin <name> Unload a plugin")
         print("  /help                 Show this help")
         print("  /quit                 Exit")
         print()
@@ -660,6 +695,42 @@ class TestCLI:
                         print(c("  Usage: /modify <instruction>", "red"))
                     else:
                         await self.handle_modify(arg)
+                elif cmd == "/plugins":
+                    info = self.plugin_manager.list_plugins()
+                    if not info:
+                        print(c("  No plugins loaded. Use /load_plugin <name>", "dim"))
+                    for p in info:
+                        status = "DISABLED" if p["disabled"] else "active"
+                        cmds = ", ".join(f"/{cn}" for cn in p["commands"]) if p["commands"] else "none"
+                        print(c(f"  {p['name']} v{p['version']} [{status}] — {p['description'] or 'no description'}", "yellow"))
+                        print(c(f"    commands: {cmds} | handlers: {p['message_handlers']} | hooks: {p['hooks']}", "dim"))
+                elif cmd == "/reload_plugin":
+                    if not arg:
+                        print(c("  Usage: /reload_plugin <name>", "red"))
+                    else:
+                        success, error = await self.plugin_manager.reload_plugin_verbose(arg)
+                        if success:
+                            print(c(f"  Plugin '{arg}' reloaded successfully", "green"))
+                        else:
+                            print(c(f"  Failed to reload '{arg}': {error}", "red"))
+                elif cmd == "/load_plugin":
+                    if not arg:
+                        print(c("  Usage: /load_plugin <name>", "red"))
+                    else:
+                        success, error = await self.plugin_manager.load_plugin_verbose(arg)
+                        if success:
+                            print(c(f"  Plugin '{arg}' loaded successfully", "green"))
+                        else:
+                            print(c(f"  Failed to load '{arg}': {error}", "red"))
+                elif cmd == "/unload_plugin":
+                    if not arg:
+                        print(c("  Usage: /unload_plugin <name>", "red"))
+                    else:
+                        success = await self.plugin_manager.unload_plugin(arg)
+                        if success:
+                            print(c(f"  Plugin '{arg}' unloaded", "yellow"))
+                        else:
+                            print(c(f"  Plugin '{arg}' not found or not loaded", "red"))
                 else:
                     print(c(f"  Unknown command: {cmd}", "red"))
                 continue

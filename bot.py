@@ -39,7 +39,7 @@ from file_parser import FileParser
 from mention_extractor import extract_mention_context
 from response_splitter import split_response_by_markers, split_response_by_paragraphs, split_long_message, calculate_typing_delay
 from sandbox import safe_path, SandboxViolation
-from time_command import handle_time_command
+from plugin_manager import PluginManager
 
 # Exit code that tells the wrapper script (run_bot.sh) to restart the bot
 RESTART_EXIT_CODE = 42
@@ -91,6 +91,9 @@ class OllamaBot(discord.Client):
         self.rag_system = RAGSystem()
         self.rag_enabled = False
 
+        # Plugin system
+        self.plugin_manager = PluginManager(self)
+
         # System prompts
         self.original_system_prompt = (
             "Your responses should be akin to that of a typical millenial texter: short, to the point, and mostly without punctuation. Do not offer any kind of assistance without being prompted. use slang *sparingly*. \n\n"
@@ -111,13 +114,16 @@ class OllamaBot(discord.Client):
             "- You have multiple distinct topics to address\n"
             "- A dramatic pause or separate thought would feel natural\n\n"
             "CODE EDITING:\n"
-            "You ARE a Discord bot that can modify its own source code. When a user asks you to fix a bug, "
-            "add a feature, change behavior, or modify your code in any way, include an [EDIT_CODE] tag in your response "
-            "with a clear description of what to do. Format:\n"
+            "You ARE a Discord bot that can modify its own source code. You have a PLUGIN SYSTEM — "
+            "new features should be implemented as plugins (hot-reloaded without restart). "
+            "When a user asks you to add a feature, fix a bug, change behavior, or modify your code, "
+            "include an [EDIT_CODE] tag in your response with a clear description of what to do. Format:\n"
             "[EDIT_CODE]detailed instruction of what to change[/EDIT_CODE]\n"
-            "Examples:\n"
+            "For NEW features or commands, phrase it as a plugin:\n"
+            "- User: 'add a /hello command' → 'sure [EDIT_CODE]Create a new plugin that adds a /hello slash command that says hello[/EDIT_CODE]'\n"
+            "- User: 'add a dice roller' → 'on it [EDIT_CODE]Create a new plugin with a /roll command that rolls dice[/EDIT_CODE]'\n"
+            "For bug fixes or changes to existing behavior:\n"
             "- User: 'fix the logger error' → 'on it [EDIT_CODE]Add import logging and logger = logging.getLogger(__name__) to bot.py[/EDIT_CODE]'\n"
-            "- User: 'add a /ping command' → 'sure [EDIT_CODE]Add a /ping slash command that replies with pong and the bot latency[/EDIT_CODE]'\n"
             "- User: 'you keep crashing when I send images' → 'lemme fix that [EDIT_CODE]Fix the image handling crash - check the error in bot.log and fix the root cause[/EDIT_CODE]'\n"
             "Include your normal casual response text OUTSIDE the tag. The tag content should be a clear, "
             "specific instruction — not conversational. Only use this when the user is genuinely asking for a code change. "
@@ -154,6 +160,8 @@ class OllamaBot(discord.Client):
     async def setup_hook(self):
         """Setup hook for Discord bot"""
         self.command_handlers.setup_commands()
+        # Load all plugins before syncing commands
+        await self.plugin_manager.load_all()
         # Sync to specific guild for instant command visibility
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
@@ -266,10 +274,8 @@ class OllamaBot(discord.Client):
         server = message.guild.id
         channel = message.channel.id
 
-        # Handle !time prefix command (no mention required)
-        if message.content.strip().startswith('!time'):
-            time_text = message.content.strip()[5:].strip()
-            await handle_time_command(message, time_text)
+        # Let plugins handle the message first (hot-swappable)
+        if message.content.strip() and await self.plugin_manager.dispatch_message_handlers(message):
             return
 
         # Handle attachments
@@ -312,44 +318,6 @@ class OllamaBot(discord.Client):
 
         try:
             user_text = re.sub(r'<@!?\d+>', '', message.content).strip()
-
-            # Handle 6-digit nhentai codes
-            nh_match = re.fullmatch(r'\d{6}', user_text)
-            if nh_match:
-                code = user_text
-                link = f"https://nhentai.net/g/{code}/"
-                preview_page = f"https://nhentai.net/g/{code}/3"
-                # Fetch preview image from page 3 using Playwright (nhentai blocks plain HTTP)
-                try:
-                    import io
-                    from bs4 import BeautifulSoup
-                    logger.info(f"Fetching nhentai page 3 preview for code {code} via Playwright")
-                    html = await js_renderer.render(preview_page, timeout=20000)
-                    if html:
-                        soup = BeautifulSoup(html, "html.parser")
-                        # Try multiple selectors since nhentai page structure varies
-                        img_tag = soup.select_one("div.thumbnail-container a img") or soup.select_one("div#gallery-container img") or soup.select_one("img")
-                        img_url = img_tag["src"] if img_tag else None
-                        logger.info(f"nhentai page 3 img_tag found: {img_tag is not None}, img_url: {img_url}")
-                        if img_url:
-                            async with aiohttp.ClientSession() as session:
-                                async with session.get(img_url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://nhentai.net/"}) as img_resp:
-                                    logger.info(f"nhentai image download status: {img_resp.status}")
-                                    if img_resp.status == 200:
-                                        img_data = await img_resp.read()
-                                        ext = img_url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-                                        filename = f"preview.{ext}"
-                                        file = discord.File(io.BytesIO(img_data), filename=filename)
-                                        await message.channel.send(link, file=file)
-                                        return
-                    else:
-                        logger.warning(f"Playwright render returned no HTML for {preview_page}")
-                    # Fallback if image fetch fails
-                    await message.channel.send(link)
-                except Exception as e:
-                    logger.error(f"Failed to fetch nhentai preview: {e}")
-                    await message.channel.send(link)
-                return
 
             # If replying to a message, inject the referenced message into context
             if message.reference and ref_msg and ref_msg.author.id != self.user.id:
@@ -581,11 +549,139 @@ class OllamaBot(discord.Client):
             await self._execute_code_change(message, edit_instruction)
 
     async def _execute_code_change(self, message: discord.Message, instruction: str):
-        """Run Claude Code to modify bot source, show diff, offer apply/revert."""
+        """Run Claude Code to modify bot source, show diff, offer apply/revert.
+
+        Routes to plugin-scoped edit when the instruction looks like a new feature
+        or plugin modification. Falls back to core edit (with restart) otherwise.
+        """
         log_context = self._read_recent_logs()
-        await self._execute_code_change_with_logs(
-            message.channel, message.author.id, instruction, log_context
+
+        # Detect if this should be a plugin edit
+        plugin_keywords = [
+            "plugin", "add feature", "new command", "add command", "add a command",
+            "new feature", "add a feature",
+        ]
+        existing_plugins = self.plugin_manager.plugin_names
+        instruction_lower = instruction.lower()
+
+        is_plugin_edit = (
+            any(kw in instruction_lower for kw in plugin_keywords)
+            or any(p in instruction_lower for p in existing_plugins)
         )
+
+        if is_plugin_edit:
+            await self._execute_plugin_change(
+                message.channel, message.author.id, instruction, log_context
+            )
+        else:
+            await self._execute_code_change_with_logs(
+                message.channel, message.author.id, instruction, log_context
+            )
+
+    async def _execute_plugin_change(
+        self, channel, author_id: int, instruction: str, log_context: str = ""
+    ):
+        """Run Claude Code scoped to plugin files, show diff, offer hot-reload."""
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Git snapshot
+        proc = await asyncio.create_subprocess_exec(
+            "git", "add", "-A", cwd=project_dir,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        proc = await asyncio.create_subprocess_exec(
+            "git", "commit", "-m",
+            f"[auto] pre-plugin-edit snapshot {time.strftime('%Y%m%d_%H%M%S')}",
+            "--allow-empty", cwd=project_dir,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+        status_msg = await channel.send("on it, working on a plugin change...")
+
+        try:
+            async with channel.typing():
+                response, exit_code = await self.claude_code_client.run_plugin_edit(
+                    instruction,
+                    model=self.active_model,
+                    log_context=log_context,
+                    existing_plugins=self.plugin_manager.plugin_names,
+                )
+        except RateLimitError:
+            reset = self.claude_code_client.rate_limit_resets_at or "unknown"
+            await status_msg.edit(content=f"claude code is rate limited, resets at {reset}")
+            return
+        except Exception as e:
+            await status_msg.edit(content=f"something went wrong: {e}")
+            return
+
+        if exit_code != 0:
+            await status_msg.edit(content=f"plugin edit failed (exit {exit_code}):\n```\n{response[:1500]}\n```")
+            return
+
+        # Show diff (only plugins/ directory)
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff", "--", "plugins/", cwd=project_dir,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        diff = stdout.decode("utf-8", errors="replace")
+
+        # Also check for new untracked files in plugins/
+        proc = await asyncio.create_subprocess_exec(
+            "git", "ls-files", "--others", "--exclude-standard", "plugins/", cwd=project_dir,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        new_stdout, _ = await proc.communicate()
+        new_files = new_stdout.decode("utf-8", errors="replace").strip()
+
+        await status_msg.edit(content="done, here's what i changed:")
+
+        if diff or new_files:
+            display_parts = []
+            if diff:
+                diff_display = diff[:1500]
+                if len(diff) > 1500:
+                    diff_display += "\n... (truncated)"
+                display_parts.append(diff_display)
+            if new_files:
+                display_parts.append(f"New files:\n{new_files}")
+            await channel.send(f"```diff\n{''.join(display_parts)}\n```")
+        else:
+            # Check if changes were made outside plugins/
+            proc = await asyncio.create_subprocess_exec(
+                "git", "diff", cwd=project_dir,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            full_stdout, _ = await proc.communicate()
+            if full_stdout.decode().strip():
+                await channel.send("changes were made outside plugins/ — falling back to full edit flow")
+                from commands import RestartConfirmView
+                view = RestartConfirmView(self, author_id)
+                await channel.send(response[:1500])
+                await channel.send("apply changes and restart?", view=view)
+                return
+            await channel.send(f"no files changed.\n\nclaude said: {response[:1500]}")
+            return
+
+        # Summary
+        summary = response[:1500] if len(response) > 1500 else response
+        await channel.send(summary)
+
+        # Determine which plugins to reload
+        affected_plugins = []
+        all_changed = (diff + "\n" + new_files) if new_files else diff
+        for name in self.plugin_manager.discover_plugins():
+            if f"plugins/{name}" in all_changed:
+                affected_plugins.append(name)
+        # If we couldn't detect specific plugins, reload all
+        if not affected_plugins:
+            affected_plugins = self.plugin_manager.plugin_names
+
+        from commands import PluginApplyView
+        view = PluginApplyView(self, author_id, affected_plugins, original_instruction=instruction)
+        await channel.send("apply and hot-reload?", view=view)
 
     async def _execute_code_change_with_logs(
         self, channel, author_id: int, instruction: str, log_context: str = ""

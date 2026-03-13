@@ -445,6 +445,153 @@ class ClaudeCodeClient:
             print(traceback.format_exc())
             return str(e), -1
 
+    async def run_plugin_edit(
+        self,
+        instruction: str,
+        model: str = "opus",
+        timeout: float = 600.0,
+        log_context: str = "",
+        existing_plugins: List[str] = None,
+    ) -> Tuple[str, int]:
+        """Run Claude Code CLI scoped to plugin files only.
+
+        Same mechanism as run_code_edit but with a plugin-focused prompt
+        that restricts edits to the plugins/ directory.
+
+        Returns:
+            (response_text, exit_code)
+        """
+        if self.is_rate_limited:
+            reset = self.rate_limit_resets_at
+            raise RateLimitError(
+                f"Claude Code rate limited, resets at {reset}",
+                resets_at=self._rate_limited_until,
+            )
+
+        PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+        model_alias = self._resolve_model(model)
+
+        cmd = [
+            CLAUDE_CLI,
+            "-p",
+            "--output-format", "json",
+            "--verbose",
+            "--model", model_alias,
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+            "--allowedTools", "Read,Write,Edit,Glob,Grep",
+        ]
+
+        plugin_list = "\n".join(
+            f"  - plugins/{p}.py" for p in (existing_plugins or [])
+        )
+
+        log_section = ""
+        if log_context:
+            log_section = (
+                f"\n\nRECENT BOT LOGS (use these to diagnose issues):\n"
+                f"```\n{log_context}\n```\n"
+            )
+
+        full_prompt = (
+            f"You are modifying a Discord bot's PLUGIN system at {PROJECT_DIR}.\n\n"
+            f"PLUGIN SYSTEM RULES:\n"
+            f"- FIRST read plugin_base.py to understand the BasePlugin interface.\n"
+            f"- THEN read plugins/_example.py for a complete example of how to write a plugin.\n"
+            f"- All new features MUST be implemented as plugins in the plugins/ directory.\n"
+            f"- Each plugin is a single .py file with a class inheriting from BasePlugin.\n"
+            f"- Use self.ctx to access bot state (see PluginBotContext in plugin_base.py).\n"
+            f"- Do NOT modify core files: bot.py, plugin_manager.py, plugin_base.py, config.py, commands.py.\n"
+            f"- Do NOT modify other plugin files unless the instruction explicitly asks for it.\n"
+            f"- Any file I/O in generated code MUST use safe_path() from sandbox.py.\n"
+            f"- After creating/modifying a plugin, it will be hot-reloaded (no restart needed).\n"
+            f"- After making changes, briefly describe what you changed.\n"
+            f"\n"
+            f"EXISTING PLUGINS:\n{plugin_list or '  (none yet)'}\n"
+            f"{log_section}\n"
+            f"User request: {instruction}"
+        )
+
+        env = self._build_env(model)
+
+        try:
+            start_time = time.perf_counter()
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=PROJECT_DIR,
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=full_prompt.encode("utf-8")),
+                timeout=timeout,
+            )
+
+            duration = time.perf_counter() - start_time
+            print(f"Claude Code plugin edit took {duration:.2f}s")
+
+            raw_out = stdout.decode("utf-8", errors="replace").strip()
+            raw_err = stderr.decode("utf-8", errors="replace").strip()
+
+            parsed = _parse_verbose_output(raw_out)
+            result_data = parsed["result_data"]
+
+            if isinstance(result_data, dict):
+                self._check_rate_limit(result_data)
+
+            _log_request(
+                method="run_plugin_edit",
+                model=model_alias,
+                prompt=full_prompt,
+                raw_json=raw_out,
+                raw_stderr=raw_err,
+                exit_code=proc.returncode,
+                duration_ms=parsed["duration_ms"] or (duration * 1000),
+                thinking=parsed["thinking"],
+                response=parsed["result_text"],
+                cost_usd=parsed["cost_usd"],
+                input_tokens=parsed["input_tokens"],
+                output_tokens=parsed["output_tokens"],
+                cache_read_tokens=parsed["cache_read_tokens"],
+                cache_creation_tokens=parsed["cache_creation_tokens"],
+            )
+
+            if proc.returncode != 0:
+                detail = raw_err or raw_out
+                if self._is_rate_limit_error(detail, result_data):
+                    resets_at = self._extract_reset_time(result_data)
+                    if resets_at:
+                        self._rate_limited_until = resets_at
+                    else:
+                        self._rate_limited_until = time.time() + 1800
+                    raise RateLimitError(
+                        "Claude Code rate limited during plugin edit",
+                        resets_at=self._rate_limited_until,
+                    )
+
+            response_text = parsed["result_text"] or raw_out or "No response."
+            return response_text, proc.returncode
+
+        except asyncio.TimeoutError:
+            print(f"Claude Code plugin edit timed out after {timeout}s")
+            proc.kill()
+            _log_request(
+                method="run_plugin_edit", model=model_alias, prompt=full_prompt,
+                raw_json="", raw_stderr="timeout", exit_code=-1,
+                duration_ms=timeout * 1000,
+            )
+            return f"Timed out after {timeout}s", -1
+        except RateLimitError:
+            raise
+        except Exception as e:
+            print(f"Error in Claude Code plugin edit: {e}")
+            print(traceback.format_exc())
+            return str(e), -1
+
     async def _run_cli(
         self,
         prompt: str,

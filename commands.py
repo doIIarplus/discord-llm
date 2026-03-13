@@ -1,8 +1,6 @@
 """Discord command handlers for Discord LLM Bot"""
 
 import time
-import traceback
-from typing import Optional
 import asyncio
 import logging
 import os
@@ -11,7 +9,6 @@ import aiohttp
 import discord
 from discord import app_commands
 
-from image_generation import ImageGenerator
 from models import Txt2TxtModel
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -94,6 +91,166 @@ class RestartConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="Changes reverted.", view=None)
 
 
+class PluginApplyView(discord.ui.View):
+    """Confirm or revert plugin changes — hot-reloads instead of restarting."""
+
+    MAX_AUTO_FIX_RETRIES = 2
+
+    def __init__(self, bot, author_id: int, plugin_names: list, original_instruction: str = ""):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.author_id = author_id
+        self.plugin_names = plugin_names  # plugins to reload after apply
+        self.original_instruction = original_instruction
+
+    @discord.ui.button(label="Apply (Hot Reload)", style=discord.ButtonStyle.green)
+    async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the requester can confirm.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(content="applying and reloading...", view=None)
+        channel = interaction.channel
+
+        # Git commit the plugin changes
+        proc = await asyncio.create_subprocess_exec(
+            "git", "add", "plugins/", cwd=PROJECT_DIR,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        proc = await asyncio.create_subprocess_exec(
+            "git", "commit", "-m", "[plugin-edit] applied plugin changes",
+            cwd=PROJECT_DIR,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+        # Hot-reload affected plugins, collecting errors
+        results = []
+        failures = {}  # name -> error_message
+        for name in self.plugin_names:
+            success, error = await self.bot.plugin_manager.reload_plugin_verbose(name)
+            if success:
+                results.append(f"`{name}`: ok")
+            else:
+                results.append(f"`{name}`: FAILED — {error}")
+                failures[name] = error
+
+        # Load any new plugins that weren't previously loaded
+        discovered = self.bot.plugin_manager.discover_plugins()
+        for name in discovered:
+            if name not in self.bot.plugin_manager._plugins and name not in self.plugin_names:
+                success, error = await self.bot.plugin_manager.load_plugin_verbose(name)
+                if success:
+                    results.append(f"`{name}`: loaded (new)")
+                else:
+                    results.append(f"`{name}`: FAILED — {error}")
+                    failures[name] = error
+
+        status = "\n".join(results) if results else "no plugins to reload"
+        await channel.send(f"reload results:\n{status}")
+
+        # If there are failures, attempt auto-fix
+        if failures:
+            await self._auto_fix_loop(channel, failures)
+
+    async def _auto_fix_loop(self, channel, failures: dict):
+        """Feed errors back to Claude Code for auto-fix retries."""
+        from claude_code_client import RateLimitError
+
+        for attempt in range(1, self.MAX_AUTO_FIX_RETRIES + 1):
+            if not failures:
+                break
+
+            error_summary = "\n".join(
+                f"- plugins/{name}.py: {error}" for name, error in failures.items()
+            )
+            fix_instruction = (
+                f"The following plugins failed to load after editing. Fix the errors.\n\n"
+                f"ERRORS:\n{error_summary}\n\n"
+                f"Original request was: {self.original_instruction}"
+            )
+
+            await channel.send(
+                f"auto-fix attempt {attempt}/{self.MAX_AUTO_FIX_RETRIES}..."
+            )
+
+            try:
+                async with channel.typing():
+                    response, exit_code = await self.bot.claude_code_client.run_plugin_edit(
+                        fix_instruction,
+                        model=self.bot.active_model,
+                        existing_plugins=self.bot.plugin_manager.plugin_names,
+                    )
+            except RateLimitError:
+                await channel.send("rate limited, can't auto-fix right now")
+                break
+            except Exception as e:
+                await channel.send(f"auto-fix error: {e}")
+                break
+
+            if exit_code != 0:
+                await channel.send(f"auto-fix edit failed (exit {exit_code})")
+                break
+
+            # Git commit the fix
+            proc = await asyncio.create_subprocess_exec(
+                "git", "add", "plugins/", cwd=PROJECT_DIR,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            proc = await asyncio.create_subprocess_exec(
+                "git", "commit", "-m",
+                f"[plugin-autofix] attempt {attempt}",
+                cwd=PROJECT_DIR,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+
+            # Retry loading the failed plugins
+            new_failures = {}
+            for name in failures:
+                success, error = await self.bot.plugin_manager.reload_plugin_verbose(name)
+                if not success:
+                    new_failures[name] = error
+
+            if new_failures:
+                await channel.send(
+                    f"still failing: {', '.join(f'`{n}`' for n in new_failures)}"
+                )
+                failures = new_failures
+            else:
+                await channel.send("all plugins loaded successfully after auto-fix")
+                # Show what changed
+                await channel.send(f"fix: {response[:1500]}")
+                return
+
+        # If we exhausted retries, offer revert
+        if failures:
+            await channel.send(
+                f"couldn't auto-fix after {self.MAX_AUTO_FIX_RETRIES} attempts. "
+                f"failed plugins: {', '.join(f'`{n}`' for n in failures)}"
+            )
+
+    @discord.ui.button(label="Revert", style=discord.ButtonStyle.red)
+    async def revert(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the requester can revert.", ephemeral=True)
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", "--", "plugins/", cwd=PROJECT_DIR,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        # Also revert any new plugin files
+        proc = await asyncio.create_subprocess_exec(
+            "git", "clean", "-fd", "plugins/", cwd=PROJECT_DIR,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        await interaction.response.edit_message(content="Plugin changes reverted.", view=None)
+
+
 class CrashFixView(discord.ui.View):
     """Offer to auto-fix a crash based on log output."""
 
@@ -125,7 +282,6 @@ class CommandHandlers:
 
     def __init__(self, bot):
         self.bot = bot
-        self.image_gen = ImageGenerator()
         logger.info("CommandHandlers initialized")
 
     def setup_commands(self):
@@ -191,233 +347,6 @@ class CommandHandlers:
             await interaction.response.defer(thinking=True)
             logger.debug("Sending current system prompt")
             await interaction.followup.send(self.bot.system_prompt)
-
-        @self.bot.tree.command(name="generate_image")
-        @app_commands.describe(
-            prompt="Prompt for image generation. Comma separated.",
-            negative_prompt="Negative prompt. Same format as positive prompt, but for things you don't want to see.",
-            seed="Seed for image generation. Same seed with same parameters will generate the same image. -1 for random",
-            width="Width of image in pixels. Capped at 1500",
-            height="Height of image in pixels. Capped at 2000",
-            cfg_scale="Smaller values will produce more creative results. Larger values will conform to prompt more.",
-            steps="Number of steps for image generation",
-            upscale="Upscale factor (1.0 to 2.0)",
-            allow_nsfw="Allow NSFW content generation"
-        )
-        async def generate_image(
-            interaction: discord.Interaction,
-            prompt: str,
-            negative_prompt: Optional[str] = None,
-            seed: int = -1,
-            width: int = 832,
-            height: int = 1216,
-            cfg_scale: float = 3.0,
-            steps: int = 30,
-            upscale: float = 1.0,
-            allow_nsfw: bool = True,
-        ):
-            logger.info(f"Generate image command called by {interaction.user.name}#{interaction.user.discriminator}")
-            logger.debug(f"Image generation parameters: prompt='{prompt[:50]}...', seed={seed}, width={width}, height={height}, cfg_scale={cfg_scale}, steps={steps}, upscale={upscale}, allow_nsfw={allow_nsfw}")
-            await interaction.response.defer(thinking=True)
-
-            try:
-                file_path, image_info, is_nsfw = await self.image_gen.generate_image(
-                    prompt, negative_prompt, seed, width, height,
-                    cfg_scale, steps, upscale, allow_nsfw
-                )
-                logger.info(f"Image generated successfully: {file_path}")
-                logger.debug(f"Image info: steps={image_info.steps}, cfg={image_info.cfg_scale}, size={image_info.width}x{image_info.height}, seed={image_info.seed}")
-
-                file = discord.File(fp=file_path, filename='generated.png')
-                image_info_text = (
-                    f"steps: {image_info.steps}, "
-                    f"cfg: {image_info.cfg_scale}, "
-                    f"size: {image_info.width}x{image_info.height}, "
-                    f"seed: {image_info.seed}"
-                )
-
-                embed = discord.Embed()
-                embed.set_image(url='attachment://generated.png')
-                embed.set_footer(text=image_info_text)
-
-                if is_nsfw:
-                    file.spoiler = True
-                    logger.debug("Marking image as NSFW")
-
-                await interaction.followup.send(embed=embed, file=file)
-                logger.info("Image sent to Discord successfully")
-
-            except Exception as e:
-                logger.error(f"Error during image generation: {e}", exc_info=True)
-                await interaction.followup.send(f"An error occurred: {e}")
-
-        @self.bot.tree.command(name="index_wiki")
-        @app_commands.describe(
-            clear_existing="Clear existing index before indexing (default: False)"
-        )
-        async def index_wiki(interaction: discord.Interaction, clear_existing: bool = False):
-            """Index the MapleStory wiki dump for RAG"""
-            logger.info(f"Index wiki command called by {interaction.user.name}#{interaction.user.discriminator}")
-            logger.debug(f"Clear existing: {clear_existing}")
-            await interaction.response.defer(thinking=True)
-
-            wiki_path = "maplestorywikinet.xml"
-            if not os.path.exists(wiki_path):
-                logger.warning(f"Wiki file not found: {wiki_path}")
-                await interaction.followup.send(f"Wiki file not found: {wiki_path}")
-                return
-
-            try:
-                if clear_existing:
-                    logger.info("Clearing existing collection")
-                    self.bot.rag_system.clear_collection()
-                    await interaction.followup.send("Cleared existing index. Starting indexing...")
-                else:
-                    logger.info("Starting wiki indexing")
-                    await interaction.followup.send("Starting wiki indexing. This may take several minutes...")
-
-                # Run indexing in background
-                logger.debug("Running wiki indexing in background")
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    self.bot.rag_system.index_wiki_dump,
-                    wiki_path
-                )
-                logger.info("Wiki indexing completed successfully")
-
-                stats = self.bot.rag_system.get_stats()
-                logger.debug(f"Indexing stats: {stats}")
-                await interaction.channel.send(
-                    f"Wiki indexing complete!\n"
-                    f"Total chunks indexed: {stats['total_chunks']}"
-                )
-            except Exception as e:
-                logger.error(f"Error during wiki indexing: {e}", exc_info=True)
-                traceback.print_exc()
-                await interaction.channel.send(f"Error during indexing: {e}")
-
-        @self.bot.tree.command(name="enable_rag")
-        async def enable_rag(interaction: discord.Interaction):
-            """Enable RAG for wiki content"""
-            logger.info(f"Enable RAG command called by {interaction.user.name}#{interaction.user.discriminator}")
-            self.bot.rag_enabled = True
-            logger.debug("RAG enabled")
-            await interaction.response.send_message("RAG enabled. Wiki context will be added to queries.")
-
-        @self.bot.tree.command(name="disable_rag")
-        async def disable_rag(interaction: discord.Interaction):
-            """Disable RAG for wiki content"""
-            logger.info(f"Disable RAG command called by {interaction.user.name}#{interaction.user.discriminator}")
-            self.bot.rag_enabled = False
-            logger.debug("RAG disabled")
-            await interaction.response.send_message("RAG disabled. No wiki context will be added.")
-
-        @self.bot.tree.command(name="search_wiki")
-        @app_commands.describe(
-            query="Search query for the wiki",
-            n_results="Number of results to return (default: 3)"
-        )
-        async def search_wiki(interaction: discord.Interaction, query: str, n_results: int = 3):
-            """Search the indexed wiki content"""
-            logger.info(f"Search wiki command called by {interaction.user.name}#{interaction.user.discriminator} with query: {query[:50]}...")
-            logger.debug(f"Number of results requested: {n_results}")
-            await interaction.response.defer(thinking=True)
-
-            try:
-                results = self.bot.rag_system.search(query, n_results=n_results)
-                logger.debug(f"Search returned {len(results)} results")
-
-                if not results:
-                    logger.info("No results found for search query")
-                    await interaction.followup.send("No results found.")
-                    return
-
-                # Format results for Discord
-                response = f"**Search results for:** {query}\n\n"
-                for i, result in enumerate(results, 1):
-                    # Truncate content for display
-                    content = result['content'][:500] + "..." if len(result['content']) > 500 else result['content']
-                    response += f"**{i}. {result['title']}** (Score: {result['score']:.3f})\n{content}\n\n"
-
-                # Split if too long
-                if len(response) > 2000:
-                    response = response[:1997] + "..."
-
-                logger.debug(f"Sending search results: {response[:100]}...")
-                await interaction.followup.send(response)
-            except Exception as e:
-                logger.error(f"Error during wiki search: {e}", exc_info=True)
-                await interaction.followup.send(f"Error searching wiki: {e}")
-
-        @self.bot.tree.command(name="rag_stats")
-        async def rag_stats(interaction: discord.Interaction):
-            """Get statistics about the indexed wiki content"""
-            logger.info(f"RAG stats command called by {interaction.user.name}#{interaction.user.discriminator}")
-            stats = self.bot.rag_system.get_stats()
-            logger.debug(f"RAG stats: {stats}")
-            await interaction.response.send_message(
-                f"**RAG System Stats**\n"
-                f"Total chunks: {stats['total_chunks']}\n"
-                f"Collection: {stats['collection_name']}\n"
-                f"RAG enabled: {self.bot.rag_enabled}"
-            )
-
-        @self.bot.tree.command(name="search")
-        @app_commands.describe(
-            query="What to search the web for",
-            results="Number of results to return (default: 5)"
-        )
-        async def search(interaction: discord.Interaction, query: str, results: int = 5):
-            """Search the web and get a summary from the LLM"""
-            logger.info(f"Search command called by {interaction.user.name}#{interaction.user.discriminator} with query: {query[:50]}...")
-            await interaction.response.defer(thinking=True)
-
-            from web_extractor import web_search, format_search_results
-
-            search_results = await web_search(query, max_results=results)
-            if not search_results:
-                await interaction.followup.send("No search results found (is TAVILY_API_KEY set?).")
-                return
-
-            # Summarize search results, then use as context for the LLM
-            raw_context = format_search_results(search_results)
-            search_summary = await self.bot.ollama_client.summarize_search_results(query, raw_context)
-
-            llm_prompt = (
-                f"Search Results Summary:\n{search_summary}\n\n"
-                f"The user searched for: {query}"
-            )
-
-            response = await self.bot.query_ollama(
-                interaction.guild.id,
-                interaction.channel.id,
-                [{"role": "user", "content": llm_prompt, "images": []}]
-            )
-
-            if isinstance(response, list):
-                response_text = "\n".join(response)
-            else:
-                response_text = str(response)
-
-            # Append short domain sources (deduplicated)
-            seen = set()
-            domains = []
-            for r in search_results[:3]:
-                try:
-                    domain = r['url'].split('/')[2].removeprefix('www.')
-                except (IndexError, AttributeError):
-                    continue
-                if domain not in seen:
-                    seen.add(domain)
-                    domains.append(domain)
-            if domains:
-                response_text += f"\n-# Sources: {', '.join(domains)}"
-
-            if len(response_text) > 2000:
-                response_text = response_text[:1997] + "..."
-
-            await interaction.followup.send(response_text)
 
         @self.bot.tree.command(name="set_model", description="Switch the active LLM model")
         async def set_model(interaction: discord.Interaction):
@@ -492,22 +421,6 @@ class CommandHandlers:
             logger.info(f"Get model command called by {interaction.user.name}#{interaction.user.discriminator}")
             await interaction.response.send_message(f"Current model: **{self.bot.active_model}**")
 
-        @self.bot.tree.command(name="ping", description="Ping Google and show the latency")
-        async def ping(interaction: discord.Interaction):
-            """Ping Google and return the round-trip latency."""
-            logger.info(f"Ping command called by {interaction.user.name}#{interaction.user.discriminator}")
-            await interaction.response.defer(thinking=True)
-            try:
-                start = time.perf_counter()
-                async with aiohttp.ClientSession() as session:
-                    async with session.get("https://www.google.com", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        await resp.read()
-                latency_ms = (time.perf_counter() - start) * 1000
-                await interaction.followup.send(f"Pong! Google responded in **{latency_ms:.1f}ms**")
-            except Exception as e:
-                logger.error(f"Ping failed: {e}", exc_info=True)
-                await interaction.followup.send(f"Ping failed: {e}")
-
         @self.bot.tree.command(name="purge", description="Delete all messages in this channel")
         @app_commands.default_permissions(manage_messages=True)
         async def purge(interaction: discord.Interaction):
@@ -536,12 +449,68 @@ class CommandHandlers:
             except (FileNotFoundError, OSError) as e:
                 await interaction.response.send_message(f"Sandbox working: {e}")
 
+        # ── Plugin management commands ────────────────────────────────
+
+        @self.bot.tree.command(name="plugins", description="List loaded plugins")
+        async def plugins(interaction: discord.Interaction):
+            """Show all loaded plugins and their status."""
+            info = self.bot.plugin_manager.list_plugins()
+            if not info:
+                await interaction.response.send_message("No plugins loaded.")
+                return
+            lines = []
+            for p in info:
+                status = "DISABLED" if p["disabled"] else "active"
+                cmds = ", ".join(f"/{c}" for c in p["commands"]) if p["commands"] else "none"
+                lines.append(
+                    f"**{p['name']}** v{p['version']} [{status}] — {p['description'] or 'no description'}\n"
+                    f"  commands: {cmds} | handlers: {p['message_handlers']} | hooks: {p['hooks']}"
+                )
+            await interaction.response.send_message("\n".join(lines))
+
+        @self.bot.tree.command(name="reload_plugin", description="Hot-reload a plugin")
+        @app_commands.describe(name="Plugin name to reload")
+        async def reload_plugin(interaction: discord.Interaction, name: str):
+            """Unload then re-load a plugin without restarting the bot."""
+            logger.info(f"Reload plugin '{name}' requested by {interaction.user.name}")
+            await interaction.response.defer(thinking=True)
+            success = await self.bot.plugin_manager.reload_plugin(name)
+            if success:
+                await interaction.followup.send(f"Plugin `{name}` reloaded successfully.")
+            else:
+                await interaction.followup.send(f"Failed to reload plugin `{name}`. Check logs for details.")
+
+        @self.bot.tree.command(name="load_plugin", description="Load a plugin")
+        @app_commands.describe(name="Plugin name to load")
+        async def load_plugin(interaction: discord.Interaction, name: str):
+            """Load a plugin from the plugins/ directory."""
+            logger.info(f"Load plugin '{name}' requested by {interaction.user.name}")
+            await interaction.response.defer(thinking=True)
+            success = await self.bot.plugin_manager.load_plugin(name)
+            if success:
+                await interaction.followup.send(f"Plugin `{name}` loaded successfully.")
+            else:
+                await interaction.followup.send(f"Failed to load plugin `{name}`. Check logs for details.")
+
+        @self.bot.tree.command(name="unload_plugin", description="Unload a plugin")
+        @app_commands.describe(name="Plugin name to unload")
+        async def unload_plugin(interaction: discord.Interaction, name: str):
+            """Unload a plugin, removing its commands and handlers."""
+            logger.info(f"Unload plugin '{name}' requested by {interaction.user.name}")
+            await interaction.response.defer(thinking=True)
+            success = await self.bot.plugin_manager.unload_plugin(name)
+            if success:
+                await interaction.followup.send(f"Plugin `{name}` unloaded.")
+            else:
+                await interaction.followup.send(f"Plugin `{name}` not found or already unloaded.")
+
         @self.bot.tree.command(name="sync_commands")
         async def sync_commands(interaction: discord.Interaction):
             """Manually sync slash commands to Discord (rate-limited, use sparingly)"""
             logger.info(f"Sync commands called by {interaction.user.name}#{interaction.user.discriminator}")
             await interaction.response.defer(thinking=True)
             await self.bot.tree.sync()
+            self.bot.plugin_manager._pending_sync = False
             await interaction.followup.send("Commands synced successfully.")
 
         logger.info("All Discord slash commands registered successfully")
