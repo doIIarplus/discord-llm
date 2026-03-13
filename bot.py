@@ -327,7 +327,8 @@ class OllamaBot(discord.Client):
                     html = await js_renderer.render(preview_page, timeout=20000)
                     if html:
                         soup = BeautifulSoup(html, "html.parser")
-                        img_tag = soup.select_one("#image-container img")
+                        # Try multiple selectors since nhentai page structure varies
+                        img_tag = soup.select_one("div.thumbnail-container a img") or soup.select_one("img#")
                         img_url = img_tag["src"] if img_tag else None
                         logger.info(f"nhentai page 3 img_tag found: {img_tag is not None}, img_url: {img_url}")
                         if img_url:
