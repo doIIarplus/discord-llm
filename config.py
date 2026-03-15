@@ -70,4 +70,7 @@ logger.info(f"Output directories created: {OUTPUT_DIR_T2I}, {OUTPUT_DIR_I2I}")
 # Tavily Web Search
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
+# Splitwise
+SPLITWISE_API_KEY = os.getenv("SPLITWISE_API_KEY", "")
+
 logger.info("Configuration module initialization complete")
