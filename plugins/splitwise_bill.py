@@ -1,10 +1,16 @@
-"""Splitwise bill plugin — create expenses, parse receipts, check balances."""
+"""Splitwise bill plugin — create expenses, parse receipts, check balances.
 
+Supports equal splits, ratio-based splits, itemized receipt assignment,
+smart friend resolution with disambiguation, and natural language parsing.
+"""
+
+import asyncio
 import base64
 import json
 import logging
 import os
 import re
+import time
 from typing import Optional
 
 import aiohttp
@@ -16,22 +22,186 @@ from plugin_base import BasePlugin
 logger = logging.getLogger("Plugin.splitwise_bill")
 
 SPLITWISE_BASE_URL = "https://secure.splitwise.com/api/v3.0"
+FRIENDS_CACHE_TTL = 300  # 5 minutes
+
+
+# --- Discord UI Views ---
+
+class ConfirmView(discord.ui.View):
+    """Confirm/Cancel buttons. Only the original user can interact."""
+
+    def __init__(self, owner_id: int, timeout: float = 120):
+        super().__init__(timeout=timeout)
+        self.owner_id = owner_id
+        self.result: Optional[bool] = None
+        self._event = asyncio.Event()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who started this bill can confirm.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green, emoji="✓")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.result = True
+        self._event.set()
+        self.stop()
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red, emoji="✗")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.result = False
+        self._event.set()
+        self.stop()
+        await interaction.response.defer()
+
+    async def wait_for_result(self) -> Optional[bool]:
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=self.timeout)
+        except asyncio.TimeoutError:
+            pass
+        return self.result
+
+    async def on_timeout(self):
+        self._event.set()
+        for child in self.children:
+            child.disabled = True
+
+
+class FriendDisambiguationSelect(discord.ui.Select):
+    """Dropdown to pick from ambiguous friend matches."""
+
+    def __init__(self, matches: list, original_name: str):
+        options = []
+        for f in matches[:25]:
+            first = f.get("first_name", "")
+            last = f.get("last_name", "")
+            email = f.get("email", "")
+            label = f"{first} {last}".strip() or email
+            desc = email if email else f"ID: {f['id']}"
+            options.append(discord.SelectOption(
+                label=label[:100], description=desc[:100], value=str(f["id"])
+            ))
+        super().__init__(
+            placeholder=f"Select the right '{original_name}'...",
+            options=options,
+        )
+        self.selected_id: Optional[int] = None
+
+    async def callback(self, interaction: discord.Interaction):
+        self.selected_id = int(self.values[0])
+        self.view.stop()
+        await interaction.response.defer()
+
+
+class FriendDisambiguationView(discord.ui.View):
+    """View wrapping a FriendDisambiguationSelect."""
+
+    def __init__(self, matches: list, original_name: str, owner_id: int, timeout: float = 120):
+        super().__init__(timeout=timeout)
+        self.owner_id = owner_id
+        self.select = FriendDisambiguationSelect(matches, original_name)
+        self.add_item(self.select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who started this can select.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+
+class ItemAssignmentView(discord.ui.View):
+    """View for assigning a single receipt item to a person or splitting it."""
+
+    def __init__(self, item: dict, people: list, owner_id: int, timeout: float = 300):
+        """
+        item: {"name": str, "price": float, "quantity": int}
+        people: [{"id": int/str, "name": str}, ...]
+        """
+        super().__init__(timeout=timeout)
+        self.owner_id = owner_id
+        self.item = item
+        self.assigned_to: Optional[str] = None  # person id or "split"
+        self.done_early = False
+        self._event = asyncio.Event()
+
+        options = []
+        for p in people[:25]:
+            options.append(discord.SelectOption(
+                label=p["name"][:100], value=str(p["id"])
+            ))
+        self.select = discord.ui.Select(
+            placeholder="Assign this item to...", options=options
+        )
+        self.select.callback = self._select_callback
+        self.add_item(self.select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who started this can assign items.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _select_callback(self, interaction: discord.Interaction):
+        self.assigned_to = self.select.values[0]
+        self._event.set()
+        self.stop()
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Split this item", style=discord.ButtonStyle.blurple)
+    async def split_item(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.assigned_to = "split"
+        self._event.set()
+        self.stop()
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Done (split remaining equally)", style=discord.ButtonStyle.grey)
+    async def done_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.done_early = True
+        self._event.set()
+        self.stop()
+        await interaction.response.defer()
+
+    async def wait_for_result(self):
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=self.timeout)
+        except asyncio.TimeoutError:
+            pass
+
+    async def on_timeout(self):
+        self._event.set()
+        for child in self.children:
+            child.disabled = True
 
 
 class SplitwiseBillPlugin(BasePlugin):
     name = "splitwise_bill"
-    version = "1.0.0"
-    description = "Splitwise integration: add bills, parse receipts, check balances"
+    version = "2.0.0"
+    description = "Splitwise integration: bills, receipts, ratios, itemized splits, balances"
 
     async def on_load(self):
         self._api_key = os.getenv("SPLITWISE_API_KEY", "")
 
-        # Pending receipt confirmations: channel_id -> {expense_data, parsed_items, user_id}
+        # Pending receipt states: channel_id -> {...}
         self._pending_receipts = {}
+
+        # Friends cache: {"friends": [...], "fetched_at": float}
+        self._friends_cache = None
 
         self.register_slash_command(
             name="bill",
-            description="Add a bill to Splitwise, split equally",
+            description="Add a bill to Splitwise (equal or ratio split)",
             callback=self._bill_command,
         )
         self.register_slash_command(
@@ -51,7 +221,7 @@ class SplitwiseBillPlugin(BasePlugin):
         )
 
         self.register_message_handler(
-            pattern=r'(?i)(splitwise|add.*bill|split.*cost)',
+            pattern=r'(?i)(splitwise|add.*bill|split.*cost|split.*between|owe.*split|bill.*split|split.*ratio|split.*even(ly)?|split.*equal(ly)?)',
             callback=self._handle_splitwise_message,
             priority=50,
         )
@@ -90,21 +260,135 @@ class SplitwiseBillPlugin(BasePlugin):
         return result.get("user", {})
 
     async def _get_friends(self) -> list:
-        result = await self._api_get("/get_friends")
-        return result.get("friends", [])
+        """Fetch friends list with caching (TTL-based)."""
+        now = time.time()
+        if (
+            self._friends_cache
+            and now - self._friends_cache["fetched_at"] < FRIENDS_CACHE_TTL
+        ):
+            return self._friends_cache["friends"]
 
-    async def _find_friend(self, identifier: str) -> Optional[dict]:
-        """Find a friend by email or name (case-insensitive)."""
+        result = await self._api_get("/get_friends")
+        friends = result.get("friends", [])
+        self._friends_cache = {"friends": friends, "fetched_at": now}
+        return friends
+
+    def _invalidate_friends_cache(self):
+        self._friends_cache = None
+
+    # --- Smart friend resolution ---
+
+    async def _resolve_friends(self, names: list) -> dict:
+        """Resolve a list of name strings to Splitwise friends.
+
+        Returns: {
+            "resolved": [{"name": str, "friend": dict}, ...],
+            "ambiguous": [{"name": str, "matches": [dict, ...]}, ...],
+            "not_found": [str, ...],
+        }
+        """
         friends = await self._get_friends()
-        identifier_lower = identifier.strip().lower()
-        for f in friends:
-            email = (f.get("email") or "").lower()
-            first = (f.get("first_name") or "").lower()
-            last = (f.get("last_name") or "").lower()
-            full = f"{first} {last}".strip()
-            if identifier_lower in (email, first, last, full):
-                return f
-        return None
+        result = {"resolved": [], "ambiguous": [], "not_found": []}
+
+        for name in names:
+            name_lower = name.strip().lower()
+            if not name_lower:
+                continue
+
+            # Pass 1: match on first_name
+            matches = [
+                f for f in friends
+                if (f.get("first_name") or "").lower() == name_lower
+            ]
+            if len(matches) == 1:
+                result["resolved"].append({"name": name, "friend": matches[0]})
+                continue
+            if len(matches) > 1:
+                result["ambiguous"].append({"name": name, "matches": matches})
+                continue
+
+            # Pass 2: match on last_name
+            matches = [
+                f for f in friends
+                if (f.get("last_name") or "").lower() == name_lower
+            ]
+            if len(matches) == 1:
+                result["resolved"].append({"name": name, "friend": matches[0]})
+                continue
+            if len(matches) > 1:
+                result["ambiguous"].append({"name": name, "matches": matches})
+                continue
+
+            # Pass 3: match on full name
+            matches = [
+                f for f in friends
+                if f"{(f.get('first_name') or '')} {(f.get('last_name') or '')}".strip().lower() == name_lower
+            ]
+            if len(matches) == 1:
+                result["resolved"].append({"name": name, "friend": matches[0]})
+                continue
+            if len(matches) > 1:
+                result["ambiguous"].append({"name": name, "matches": matches})
+                continue
+
+            # Pass 4: match on email
+            matches = [
+                f for f in friends
+                if (f.get("email") or "").lower() == name_lower
+            ]
+            if len(matches) == 1:
+                result["resolved"].append({"name": name, "friend": matches[0]})
+                continue
+
+            result["not_found"].append(name)
+
+        return result
+
+    async def _resolve_friends_with_disambiguation(
+        self, names: list, channel, owner_id: int
+    ) -> Optional[list]:
+        """Resolve friends, prompting for disambiguation via Discord UI.
+
+        Returns list of friend dicts, or None if resolution failed/cancelled.
+        """
+        resolution = await self._resolve_friends(names)
+
+        if resolution["not_found"]:
+            await channel.send(
+                f"Could not find Splitwise friends: {', '.join(resolution['not_found'])}\n"
+                "Use their name or email as it appears on Splitwise."
+            )
+            return None
+
+        resolved_friends = [r["friend"] for r in resolution["resolved"]]
+
+        # Handle ambiguous matches
+        for ambig in resolution["ambiguous"]:
+            view = FriendDisambiguationView(
+                ambig["matches"], ambig["name"], owner_id
+            )
+            msg = await channel.send(
+                f"Multiple matches for **{ambig['name']}** — pick one:",
+                view=view,
+            )
+            await view.wait()
+            if view.select.selected_id is None:
+                await channel.send("Timed out waiting for selection. Cancelled.")
+                return None
+            # Find the selected friend
+            selected = next(
+                (f for f in ambig["matches"] if f["id"] == view.select.selected_id),
+                None,
+            )
+            if selected:
+                resolved_friends.append(selected)
+            else:
+                await channel.send("Selection error. Cancelled.")
+                return None
+
+        return resolved_friends
+
+    # --- Expense creation ---
 
     async def _create_equal_expense(
         self, amount: float, description: str, friend_ids: list, group_id: int = 0
@@ -133,7 +417,48 @@ class SplitwiseBillPlugin(BasePlugin):
             data[f"users__{i}__paid_share"] = "0.00"
             data[f"users__{i}__owed_share"] = str(share)
 
-        # Splitwise create_expense uses form-style keys, post as form
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{SPLITWISE_BASE_URL}/create_expense",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                data=data,
+            ) as resp:
+                return await resp.json()
+
+    async def _create_ratio_expense(
+        self, amount: float, description: str, ratios: list,
+        user_ids: list, group_id: int = 0
+    ) -> dict:
+        """Create an expense split by ratios.
+
+        ratios: list of numeric ratios, same length as user_ids.
+        user_ids[0] is the current user (payer).
+        """
+        current_user = await self._get_current_user()
+        payer_id = current_user["id"]
+
+        total_ratio = sum(ratios)
+        shares = [round(amount * r / total_ratio, 2) for r in ratios]
+        # Fix rounding: adjust the largest share
+        diff = round(amount - sum(shares), 2)
+        if diff != 0:
+            max_idx = shares.index(max(shares))
+            shares[max_idx] = round(shares[max_idx] + diff, 2)
+
+        data = {
+            "cost": str(round(amount, 2)),
+            "description": description,
+            "currency_code": "USD",
+            "split_equally": False,
+        }
+        if group_id:
+            data["group_id"] = group_id
+
+        for i, (uid, share) in enumerate(zip(user_ids, shares)):
+            data[f"users__{i}__user_id"] = uid
+            data[f"users__{i}__paid_share"] = str(round(amount, 2)) if uid == payer_id else "0.00"
+            data[f"users__{i}__owed_share"] = str(share)
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{SPLITWISE_BASE_URL}/create_expense",
@@ -163,7 +488,6 @@ class SplitwiseBillPlugin(BasePlugin):
         if group_id:
             data["group_id"] = group_id
 
-        # Current user pays the full amount
         data["users__0__user_id"] = user_id
         data["users__0__paid_share"] = str(round(total, 2))
         data["users__0__owed_share"] = str(round(user_shares.get(user_id, 0), 2))
@@ -212,7 +536,6 @@ class SplitwiseBillPlugin(BasePlugin):
             response = await self.ctx.ollama_client.generate(
                 prompt, IMAGE_RECOGNITION_MODEL, images=[image_b64]
             )
-            # Try to extract JSON from the response
             json_match = re.search(r'\{[\s\S]*\}', response)
             if json_match:
                 return json.loads(json_match.group())
@@ -227,14 +550,14 @@ class SplitwiseBillPlugin(BasePlugin):
         lines.append(f"**Receipt from {store}**\n")
 
         items = parsed.get("items", [])
-        for item in items:
+        for i, item in enumerate(items, 1):
             name = item.get("name", "???")
             price = item.get("price", 0)
             qty = item.get("quantity", 1)
             if qty > 1:
-                lines.append(f"  {name} x{qty} — ${price:.2f}")
+                lines.append(f"  {i}. {name} x{qty} — ${price:.2f}")
             else:
-                lines.append(f"  {name} — ${price:.2f}")
+                lines.append(f"  {i}. {name} — ${price:.2f}")
 
         lines.append("")
         subtotal = parsed.get("subtotal", 0) or 0
@@ -251,6 +574,139 @@ class SplitwiseBillPlugin(BasePlugin):
 
         return "\n".join(lines)
 
+    # --- Itemized assignment flow ---
+
+    async def _run_item_assignment(
+        self, channel, owner_id: int, parsed: dict, people: list
+    ) -> Optional[dict]:
+        """Run the item-by-item assignment flow with Discord UI.
+
+        people: [{"id": int/str, "name": str}, ...]
+        Returns: {person_id: total_owed, ...} or None if cancelled/timed out.
+        """
+        items = parsed.get("items", [])
+        if not items:
+            return None
+
+        tallies = {str(p["id"]): 0.0 for p in people}
+        num_people = len(people)
+
+        for idx, item in enumerate(items):
+            name = item.get("name", "???")
+            price = float(item.get("price", 0))
+            qty = int(item.get("quantity", 1) or 1)
+            item_total = price * qty
+
+            view = ItemAssignmentView(item, people, owner_id)
+            msg = await channel.send(
+                f"**Item {idx + 1}/{len(items)}:** {name}"
+                + (f" x{qty}" if qty > 1 else "")
+                + f" — **${item_total:.2f}**\nAssign to someone, split it, or finish early.",
+                view=view,
+            )
+            await view.wait_for_result()
+
+            if view.done_early:
+                # Split all remaining items equally
+                remaining_items = items[idx:]
+                remaining_total = sum(
+                    float(it.get("price", 0)) * int(it.get("quantity", 1) or 1)
+                    for it in remaining_items
+                )
+                per_person = remaining_total / num_people
+                for pid in tallies:
+                    tallies[pid] += per_person
+                break
+            elif view.assigned_to == "split":
+                per_person = item_total / num_people
+                for pid in tallies:
+                    tallies[pid] += per_person
+            elif view.assigned_to is not None:
+                tallies[view.assigned_to] = tallies.get(view.assigned_to, 0) + item_total
+            else:
+                # Timed out — split remaining equally
+                remaining_items = items[idx:]
+                remaining_total = sum(
+                    float(it.get("price", 0)) * int(it.get("quantity", 1) or 1)
+                    for it in remaining_items
+                )
+                per_person = remaining_total / num_people
+                for pid in tallies:
+                    tallies[pid] += per_person
+                await channel.send("Timed out — splitting remaining items equally.")
+                break
+
+        # Add tax/tip proportionally
+        subtotal = sum(
+            float(it.get("price", 0)) * int(it.get("quantity", 1) or 1)
+            for it in items
+        )
+        tax = float(parsed.get("tax", 0) or 0)
+        tip = float(parsed.get("tip", 0) or 0)
+        extras = tax + tip
+
+        if extras > 0 and subtotal > 0:
+            for pid in tallies:
+                proportion = tallies[pid] / subtotal if subtotal else 1.0 / num_people
+                tallies[pid] += extras * proportion
+
+        # Round
+        for pid in tallies:
+            tallies[pid] = round(tallies[pid], 2)
+
+        return tallies
+
+    # --- Natural language parsing ---
+
+    async def _parse_split_intent(self, text: str) -> Optional[dict]:
+        """Use the LLM to parse a natural language split request.
+
+        Returns: {"action": str, "amount": float|null, "people": [str],
+                  "ratio": [int]|null, "description": str|null}
+        """
+        prompt = (
+            "Parse the following message into a JSON object for a bill-splitting request. "
+            "Extract these fields:\n"
+            '- "action": one of "split", "add_bill", "check_balance", "unknown"\n'
+            '- "amount": the total dollar amount as a number, or null if not stated\n'
+            '- "people": list of people\'s names mentioned (exclude "me" or the speaker)\n'
+            '- "ratio": list of integer ratios if a ratio is mentioned (e.g. "1:1:2" -> [1,1,2]), '
+            "or null if equal split or not specified\n"
+            '- "description": a short description of what the bill is for, or null\n\n'
+            "Return ONLY valid JSON, no other text.\n\n"
+            f"Message: {text}"
+        )
+        try:
+            response = await self.ctx.query_llm(prompt)
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                return json.loads(json_match.group())
+        except (json.JSONDecodeError, Exception) as e:
+            logger.error(f"Intent parsing failed: {e}")
+        return None
+
+    # --- Confirm/cancel with buttons ---
+
+    async def _confirm_expense(self, channel, owner_id: int, summary: str) -> bool:
+        """Show a confirmation view with buttons. Returns True if confirmed."""
+        view = ConfirmView(owner_id)
+        msg = await channel.send(f"{summary}\n", view=view)
+        result = await view.wait_for_result()
+        # Disable buttons after interaction
+        for child in view.children:
+            child.disabled = True
+        try:
+            await msg.edit(view=view)
+        except Exception:
+            pass
+        if result is True:
+            return True
+        if result is False:
+            await channel.send("Cancelled.")
+        else:
+            await channel.send("Timed out — cancelled.")
+        return False
+
     # --- Slash commands ---
 
     async def _bill_command(
@@ -259,8 +715,9 @@ class SplitwiseBillPlugin(BasePlugin):
         amount: float,
         description: str,
         split_with: str,
+        ratios: Optional[str] = None,
     ):
-        """Add a simple bill split equally."""
+        """Add a bill split equally or by ratio."""
         if not self._api_key:
             await interaction.response.send_message(
                 "Splitwise API key not configured. Set SPLITWISE_API_KEY in .env.",
@@ -271,36 +728,82 @@ class SplitwiseBillPlugin(BasePlugin):
         await interaction.response.defer(thinking=True)
 
         names = [n.strip() for n in split_with.split(",") if n.strip()]
-        friend_ids = []
-        not_found = []
 
-        for name in names:
-            friend = await self._find_friend(name)
-            if friend:
-                friend_ids.append(friend["id"])
-            else:
-                not_found.append(name)
-
-        if not_found:
-            await interaction.followup.send(
-                f"Could not find Splitwise friends: {', '.join(not_found)}\n"
-                "Use their email or name as it appears on Splitwise."
-            )
+        # Resolve friends with disambiguation
+        friends = await self._resolve_friends_with_disambiguation(
+            names, interaction.channel, interaction.user.id
+        )
+        if friends is None:
+            await interaction.followup.send("Could not resolve all friends. Bill cancelled.")
             return
-
-        if not friend_ids:
+        if not friends:
             await interaction.followup.send("No valid friends specified to split with.")
             return
 
-        result = await self._create_equal_expense(amount, description, friend_ids)
+        friend_ids = [f["id"] for f in friends]
 
-        if "expenses" in result:
+        # Parse ratios if provided
+        if ratios:
+            try:
+                ratio_list = [int(r.strip()) for r in ratios.split(":")]
+            except ValueError:
+                await interaction.followup.send(
+                    "Invalid ratios format. Use colon-separated integers like `1:1:2`."
+                )
+                return
+
+            # Ratios must match payer + friends
+            expected = len(friend_ids) + 1
+            if len(ratio_list) != expected:
+                await interaction.followup.send(
+                    f"Ratio count ({len(ratio_list)}) doesn't match number of people "
+                    f"({expected} including you). Provide {expected} ratios."
+                )
+                return
+
+            current_user = await self._get_current_user()
+            user_ids = [current_user["id"]] + friend_ids
+
+            total_ratio = sum(ratio_list)
+            shares = [round(amount * r / total_ratio, 2) for r in ratio_list]
+            share_lines = []
+            for uid, share, fr in zip(user_ids, shares, ["You"] + [
+                f"{f.get('first_name', '')} {f.get('last_name', '')}".strip()
+                for f in friends
+            ]):
+                share_lines.append(f"  {fr}: ${share:.2f}")
+
+            summary = (
+                f"**{description}** — ${amount:.2f} (ratio {ratios})\n"
+                + "\n".join(share_lines)
+            )
+            confirmed = await self._confirm_expense(
+                interaction.channel, interaction.user.id, summary
+            )
+            if not confirmed:
+                return
+
+            result = await self._create_ratio_expense(
+                amount, description, ratio_list, user_ids
+            )
+        else:
+            # Equal split
             num_people = len(friend_ids) + 1
             share = amount / num_people
-            await interaction.followup.send(
-                f"Bill added to Splitwise!\n"
-                f"**{description}** — ${amount:.2f} split {num_people} ways (${share:.2f} each)"
+            summary = (
+                f"**{description}** — ${amount:.2f} split {num_people} ways "
+                f"(${share:.2f} each)"
             )
+            confirmed = await self._confirm_expense(
+                interaction.channel, interaction.user.id, summary
+            )
+            if not confirmed:
+                return
+
+            result = await self._create_equal_expense(amount, description, friend_ids)
+
+        if "expenses" in result:
+            await interaction.followup.send("Bill added to Splitwise!")
         elif "errors" in result:
             errors = result["errors"]
             err_msg = errors if isinstance(errors, str) else json.dumps(errors)
@@ -314,8 +817,12 @@ class SplitwiseBillPlugin(BasePlugin):
         image: discord.Attachment,
         split_with: str,
         description: Optional[str] = None,
+        split_mode: Optional[str] = None,
     ):
-        """Add a bill by attaching a receipt image."""
+        """Add a bill by attaching a receipt image.
+
+        split_mode: "equal", "itemized", or "ratio". Defaults to "itemized".
+        """
         if not self._api_key:
             await interaction.response.send_message(
                 "Splitwise API key not configured. Set SPLITWISE_API_KEY in .env.",
@@ -326,6 +833,13 @@ class SplitwiseBillPlugin(BasePlugin):
         if not image.content_type or not image.content_type.startswith("image/"):
             await interaction.response.send_message(
                 "Please attach an image file.", ephemeral=True
+            )
+            return
+
+        mode = (split_mode or "itemized").lower()
+        if mode not in ("equal", "itemized", "ratio"):
+            await interaction.response.send_message(
+                "split_mode must be one of: equal, itemized, ratio", ephemeral=True
             )
             return
 
@@ -348,39 +862,90 @@ class SplitwiseBillPlugin(BasePlugin):
 
         # Resolve friends
         names = [n.strip() for n in split_with.split(",") if n.strip()]
-        friend_ids = []
-        not_found = []
-        for name in names:
-            friend = await self._find_friend(name)
-            if friend:
-                friend_ids.append(friend["id"])
-            else:
-                not_found.append(name)
-
-        if not_found:
-            await interaction.followup.send(
-                f"Could not find Splitwise friends: {', '.join(not_found)}"
-            )
+        friends = await self._resolve_friends_with_disambiguation(
+            names, interaction.channel, interaction.user.id
+        )
+        if friends is None:
+            return
+        if not friends:
+            await interaction.followup.send("No valid friends specified to split with.")
             return
 
-        total = parsed.get("total", 0) or 0
+        friend_ids = [f["id"] for f in friends]
+        total = float(parsed.get("total", 0) or 0)
         desc = description or parsed.get("store_name", "Receipt")
 
-        # Store pending receipt for confirmation
-        self._pending_receipts[interaction.channel_id] = {
-            "parsed": parsed,
-            "total": total,
-            "description": desc,
-            "friend_ids": friend_ids,
-            "user_id": interaction.user.id,
-        }
-
         receipt_text = self._format_receipt(parsed)
-        await interaction.followup.send(
-            f"{receipt_text}\n\n"
-            f"Split equally with {len(friend_ids)} {'person' if len(friend_ids) == 1 else 'people'}.\n"
-            f"Reply **yes** or **confirm** to submit to Splitwise, or **cancel** to abort."
-        )
+        await interaction.followup.send(receipt_text)
+
+        if mode == "equal":
+            num_people = len(friend_ids) + 1
+            share = total / num_people
+            summary = f"${total:.2f} split {num_people} ways = ${share:.2f} each"
+            confirmed = await self._confirm_expense(
+                interaction.channel, interaction.user.id, summary
+            )
+            if not confirmed:
+                return
+            result = await self._create_equal_expense(total, desc, friend_ids)
+
+        elif mode == "ratio":
+            await interaction.channel.send(
+                "Enter ratios (colon-separated, e.g. `1:1:2`). "
+                f"You need {len(friend_ids) + 1} values (you + {len(friend_ids)} friends)."
+            )
+            # Store pending for ratio input
+            self._pending_receipts[interaction.channel.id] = {
+                "parsed": parsed,
+                "total": total,
+                "description": desc,
+                "friend_ids": friend_ids,
+                "friends": friends,
+                "user_id": interaction.user.id,
+                "awaiting": "ratio_input",
+            }
+            return
+
+        elif mode == "itemized":
+            current_user = await self._get_current_user()
+            people = [{"id": str(current_user["id"]), "name": "Me (payer)"}]
+            for f in friends:
+                fname = f"{f.get('first_name', '')} {f.get('last_name', '')}".strip()
+                people.append({"id": str(f["id"]), "name": fname})
+
+            tallies = await self._run_item_assignment(
+                interaction.channel, interaction.user.id, parsed, people
+            )
+            if not tallies:
+                await interaction.channel.send("Item assignment failed or timed out.")
+                return
+
+            # Build summary
+            share_lines = []
+            for p in people:
+                amt = tallies.get(str(p["id"]), 0)
+                share_lines.append(f"  {p['name']}: ${amt:.2f}")
+            summary = f"**{desc}** — ${total:.2f}\n" + "\n".join(share_lines)
+
+            confirmed = await self._confirm_expense(
+                interaction.channel, interaction.user.id, summary
+            )
+            if not confirmed:
+                return
+
+            user_shares = {int(pid): amt for pid, amt in tallies.items()}
+            result = await self._create_itemized_expense(
+                parsed.get("items", []), desc, total, user_shares
+            )
+
+        if "expenses" in result:
+            await interaction.channel.send("Bill added to Splitwise!")
+        elif "errors" in result:
+            errors = result["errors"]
+            err_msg = errors if isinstance(errors, str) else json.dumps(errors)
+            await interaction.channel.send(f"Splitwise error: {err_msg}")
+        else:
+            await interaction.channel.send(f"Unexpected response: {json.dumps(result)[:500]}")
 
     async def _groups_command(self, interaction: discord.Interaction):
         if not self._api_key:
@@ -468,49 +1033,153 @@ class SplitwiseBillPlugin(BasePlugin):
             )
             return True
 
-        # Check for confirmation of pending receipt
         text_lower = message.content.lower()
         text_clean = re.sub(r'<@!?\d+>', '', text_lower).strip()
 
+        # --- Handle pending states ---
         if message.channel.id in self._pending_receipts:
             pending = self._pending_receipts[message.channel.id]
             if message.author.id != pending["user_id"]:
                 return False
 
-            if text_clean in ("yes", "confirm", "looks good", "y", "ok"):
+            if text_clean in ("cancel", "n", "nah", "no", "nevermind"):
                 del self._pending_receipts[message.channel.id]
+                await message.channel.send("Cancelled.")
+                return True
+
+            # Awaiting friend names
+            if pending.get("needs_friends"):
+                names_text = re.sub(r'<@!?\d+>', '', message.content).strip()
+                names = [n.strip() for n in names_text.split(",") if n.strip()]
+
+                friends = await self._resolve_friends_with_disambiguation(
+                    names, message.channel, message.author.id
+                )
+                if friends is None:
+                    return True
+                if not friends:
+                    await message.channel.send("need at least one person to split with")
+                    return True
+
+                friend_ids = [f["id"] for f in friends]
+                pending["friend_ids"] = friend_ids
+                pending["friends"] = friends
+                pending["needs_friends"] = False
+
+                # Default to itemized for receipts
+                current_user = await self._get_current_user()
+                people = [{"id": str(current_user["id"]), "name": "Me (payer)"}]
+                for f in friends:
+                    fname = f"{f.get('first_name', '')} {f.get('last_name', '')}".strip()
+                    people.append({"id": str(f["id"]), "name": fname})
+
+                tallies = await self._run_item_assignment(
+                    message.channel, message.author.id, pending["parsed"], people
+                )
+                if not tallies:
+                    del self._pending_receipts[message.channel.id]
+                    await message.channel.send("Item assignment failed or timed out.")
+                    return True
+
+                total = pending["total"]
+                desc = pending["description"]
+                share_lines = []
+                for p in people:
+                    amt = tallies.get(str(p["id"]), 0)
+                    share_lines.append(f"  {p['name']}: ${amt:.2f}")
+                summary = f"**{desc}** — ${total:.2f}\n" + "\n".join(share_lines)
+
+                confirmed = await self._confirm_expense(
+                    message.channel, message.author.id, summary
+                )
+                del self._pending_receipts[message.channel.id]
+                if not confirmed:
+                    return True
+
+                user_shares = {int(pid): amt for pid, amt in tallies.items()}
                 try:
-                    result = await self._create_equal_expense(
-                        pending["total"],
-                        pending["description"],
-                        pending["friend_ids"],
+                    result = await self._create_itemized_expense(
+                        pending["parsed"].get("items", []), desc, total, user_shares
                     )
                     if "expenses" in result:
-                        num_people = len(pending["friend_ids"]) + 1
-                        share = pending["total"] / num_people
-                        await message.channel.send(
-                            f"Bill submitted to Splitwise!\n"
-                            f"**{pending['description']}** — ${pending['total']:.2f} "
-                            f"split {num_people} ways (${share:.2f} each)"
-                        )
+                        await message.channel.send("Bill added to Splitwise!")
                     elif "errors" in result:
                         err = result["errors"]
                         await message.channel.send(
                             f"Splitwise error: {err if isinstance(err, str) else json.dumps(err)}"
                         )
                     else:
-                        await message.channel.send(f"Unexpected response from Splitwise.")
+                        await message.channel.send("Unexpected response from Splitwise.")
                 except Exception as e:
                     logger.error(f"Expense creation failed: {e}")
                     await message.channel.send(f"Failed to create expense: {e}")
                 return True
 
-            elif text_clean in ("no", "cancel", "n", "nah"):
+            # Awaiting ratio input
+            if pending.get("awaiting") == "ratio_input":
+                try:
+                    ratio_list = [int(r.strip()) for r in text_clean.split(":")]
+                except ValueError:
+                    await message.channel.send(
+                        "Invalid format. Use colon-separated integers like `1:1:2`."
+                    )
+                    return True
+
+                expected = len(pending["friend_ids"]) + 1
+                if len(ratio_list) != expected:
+                    await message.channel.send(
+                        f"Need {expected} ratios (you + {expected - 1} friends), "
+                        f"got {len(ratio_list)}."
+                    )
+                    return True
+
+                current_user = await self._get_current_user()
+                user_ids = [current_user["id"]] + pending["friend_ids"]
+                amount = pending["total"]
+                desc = pending["description"]
+
+                total_ratio = sum(ratio_list)
+                shares = [round(amount * r / total_ratio, 2) for r in ratio_list]
+                friends = pending.get("friends", [])
+                people_names = ["You"] + [
+                    f"{f.get('first_name', '')} {f.get('last_name', '')}".strip()
+                    for f in friends
+                ]
+                share_lines = [
+                    f"  {name}: ${share:.2f}"
+                    for name, share in zip(people_names, shares)
+                ]
+                summary = (
+                    f"**{desc}** — ${amount:.2f} (ratio {text_clean})\n"
+                    + "\n".join(share_lines)
+                )
+
+                confirmed = await self._confirm_expense(
+                    message.channel, message.author.id, summary
+                )
                 del self._pending_receipts[message.channel.id]
-                await message.channel.send("Receipt cancelled.")
+                if not confirmed:
+                    return True
+
+                try:
+                    result = await self._create_ratio_expense(
+                        amount, desc, ratio_list, user_ids
+                    )
+                    if "expenses" in result:
+                        await message.channel.send("Bill added to Splitwise!")
+                    elif "errors" in result:
+                        err = result["errors"]
+                        await message.channel.send(
+                            f"Splitwise error: {err if isinstance(err, str) else json.dumps(err)}"
+                        )
+                    else:
+                        await message.channel.send("Unexpected response from Splitwise.")
+                except Exception as e:
+                    logger.error(f"Expense creation failed: {e}")
+                    await message.channel.send(f"Failed to create expense: {e}")
                 return True
 
-        # Check for attached receipt image
+        # --- Check for attached receipt image ---
         if message.attachments:
             img_attachment = None
             for att in message.attachments:
@@ -537,13 +1206,11 @@ class SplitwiseBillPlugin(BasePlugin):
                     total = parsed.get("total", 0) or 0
                     desc = parsed.get("store_name", "Receipt")
 
-                    # Try to extract who to split with from the message
-                    # For now, store as pending and ask
                     self._pending_receipts[message.channel.id] = {
                         "parsed": parsed,
                         "total": total,
                         "description": desc,
-                        "friend_ids": [],  # Will be resolved on confirmation
+                        "friend_ids": [],
                         "user_id": message.author.id,
                         "needs_friends": True,
                     }
@@ -556,41 +1223,153 @@ class SplitwiseBillPlugin(BasePlugin):
                     )
                     return True
 
-        # Handle pending that needs friends list
-        if message.channel.id in self._pending_receipts:
-            pending = self._pending_receipts[message.channel.id]
-            if pending.get("needs_friends") and message.author.id == pending["user_id"]:
-                names_text = re.sub(r'<@!?\d+>', '', message.content).strip()
-                names = [n.strip() for n in names_text.split(",") if n.strip()]
+        # --- Natural language parsing via LLM ---
+        async with message.channel.typing():
+            intent = await self._parse_split_intent(text_clean)
 
-                friend_ids = []
-                not_found = []
-                for name in names:
-                    friend = await self._find_friend(name)
-                    if friend:
-                        friend_ids.append(friend["id"])
-                    else:
-                        not_found.append(name)
+        if not intent or intent.get("action") == "unknown":
+            return False
 
-                if not_found:
+        action = intent.get("action", "")
+        if action == "check_balance":
+            # Redirect to balance display
+            try:
+                friends = await self._get_friends()
+                lines = ["**Splitwise Balances:**\n"]
+                has_balances = False
+                for f in friends:
+                    balances = f.get("balance", [])
+                    for b in balances:
+                        amt = float(b.get("amount", 0))
+                        if amt == 0:
+                            continue
+                        has_balances = True
+                        currency = b.get("currency_code", "USD")
+                        first = f.get("first_name", "")
+                        last = f.get("last_name", "")
+                        name = f"{first} {last}".strip()
+                        if amt > 0:
+                            lines.append(f"  **{name}** owes you {currency} {abs(amt):.2f}")
+                        else:
+                            lines.append(f"  You owe **{name}** {currency} {abs(amt):.2f}")
+                if not has_balances:
+                    lines.append("  All settled up!")
+                await message.channel.send("\n".join(lines))
+            except Exception as e:
+                await message.channel.send(f"Error fetching balances: {e}")
+            return True
+
+        if action in ("split", "add_bill"):
+            amount = intent.get("amount")
+            people = intent.get("people", [])
+            ratio = intent.get("ratio")
+            desc = intent.get("description") or "Bill"
+
+            if not people:
+                await message.channel.send(
+                    "who do you want to split with? give me some names"
+                )
+                return True
+
+            if not amount:
+                await message.channel.send(
+                    "how much is the total? need an amount to split"
+                )
+                return True
+
+            amount = float(amount)
+
+            # Resolve friends
+            friends = await self._resolve_friends_with_disambiguation(
+                people, message.channel, message.author.id
+            )
+            if friends is None:
+                return True
+            if not friends:
+                await message.channel.send("couldn't resolve any friends from those names")
+                return True
+
+            friend_ids = [f["id"] for f in friends]
+
+            if ratio:
+                ratio_list = [int(r) for r in ratio]
+                expected = len(friend_ids) + 1
+                if len(ratio_list) != expected:
                     await message.channel.send(
-                        f"couldn't find: {', '.join(not_found)}. try again or say **cancel**"
+                        f"ratio has {len(ratio_list)} parts but there are {expected} people "
+                        f"(including you). fix the ratio and try again"
                     )
                     return True
 
-                if not friend_ids:
-                    await message.channel.send("need at least one person to split with")
+                current_user = await self._get_current_user()
+                user_ids = [current_user["id"]] + friend_ids
+                total_ratio = sum(ratio_list)
+                shares = [round(amount * r / total_ratio, 2) for r in ratio_list]
+                people_names = ["You"] + [
+                    f"{f.get('first_name', '')} {f.get('last_name', '')}".strip()
+                    for f in friends
+                ]
+                share_lines = [
+                    f"  {name}: ${share:.2f}"
+                    for name, share in zip(people_names, shares)
+                ]
+                summary = (
+                    f"**{desc}** — ${amount:.2f} (ratio {':'.join(str(r) for r in ratio_list)})\n"
+                    + "\n".join(share_lines)
+                )
+
+                confirmed = await self._confirm_expense(
+                    message.channel, message.author.id, summary
+                )
+                if not confirmed:
                     return True
 
-                pending["friend_ids"] = friend_ids
-                pending["needs_friends"] = False
+                try:
+                    result = await self._create_ratio_expense(
+                        amount, desc, ratio_list, user_ids
+                    )
+                    if "expenses" in result:
+                        await message.channel.send("added to splitwise!")
+                    elif "errors" in result:
+                        err = result["errors"]
+                        await message.channel.send(
+                            f"splitwise error: {err if isinstance(err, str) else json.dumps(err)}"
+                        )
+                    else:
+                        await message.channel.send("unexpected response from splitwise")
+                except Exception as e:
+                    logger.error(f"Expense creation failed: {e}")
+                    await message.channel.send(f"failed to create expense: {e}")
+            else:
                 num_people = len(friend_ids) + 1
-                share = pending["total"] / num_people
-
-                await message.channel.send(
-                    f"${pending['total']:.2f} split {num_people} ways = ${share:.2f} each\n"
-                    f"reply **yes** to confirm or **cancel** to abort"
+                share = amount / num_people
+                summary = (
+                    f"**{desc}** — ${amount:.2f} split {num_people} ways "
+                    f"(${share:.2f} each)"
                 )
-                return True
+
+                confirmed = await self._confirm_expense(
+                    message.channel, message.author.id, summary
+                )
+                if not confirmed:
+                    return True
+
+                try:
+                    result = await self._create_equal_expense(
+                        amount, desc, friend_ids
+                    )
+                    if "expenses" in result:
+                        await message.channel.send("added to splitwise!")
+                    elif "errors" in result:
+                        err = result["errors"]
+                        await message.channel.send(
+                            f"splitwise error: {err if isinstance(err, str) else json.dumps(err)}"
+                        )
+                    else:
+                        await message.channel.send("unexpected response from splitwise")
+                except Exception as e:
+                    logger.error(f"Expense creation failed: {e}")
+                    await message.channel.send(f"failed to create expense: {e}")
+            return True
 
         return False
