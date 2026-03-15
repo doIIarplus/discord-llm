@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import os
 import re
 from typing import Optional
 
@@ -23,8 +24,7 @@ class SplitwiseBillPlugin(BasePlugin):
     description = "Splitwise integration: add bills, parse receipts, check balances"
 
     async def on_load(self):
-        from config import SPLITWISE_API_KEY
-        self._api_key = SPLITWISE_API_KEY
+        self._api_key = os.getenv("SPLITWISE_API_KEY", "")
 
         # Pending receipt confirmations: channel_id -> {expense_data, parsed_items, user_id}
         self._pending_receipts = {}
