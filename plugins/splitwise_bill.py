@@ -58,8 +58,7 @@ class SplitwiseBillPlugin(BasePlugin):
 
     async def self_test(self) -> bool:
         if not self._api_key:
-            self.logger.warning("SPLITWISE_API_KEY not configured")
-            return False
+            self.logger.warning("SPLITWISE_API_KEY not configured — commands will prompt to set it")
         return True
 
     # --- HTTP helpers ---
