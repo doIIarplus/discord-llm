@@ -70,6 +70,10 @@ logger.info(f"Output directories created: {OUTPUT_DIR_T2I}, {OUTPUT_DIR_I2I}")
 # Tavily Web Search
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
+# Anthropic Claude API
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MONTHLY_BUDGET = float(os.getenv("CLAUDE_MONTHLY_BUDGET", "50.0"))
+
 # Splitwise
 SPLITWISE_API_KEY = os.getenv("SPLITWISE_API_KEY", "")
 

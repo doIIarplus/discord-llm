@@ -72,6 +72,10 @@ class PluginBotContext:
         return self._bot.ollama_client
 
     @property
+    def claude_client(self):
+        return self._bot.claude_client
+
+    @property
     def claude_code_client(self):
         return self._bot.claude_code_client
 

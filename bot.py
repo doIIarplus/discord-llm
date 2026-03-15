@@ -30,6 +30,7 @@ from config import (
 )
 from image_generation import ImageGenerator
 from ollama_client import OllamaClient
+from claude_client import ClaudeClient
 from claude_code_client import ClaudeCodeClient, RateLimitError
 from models import is_claude_code_model, is_anthropic_model
 from utils import encode_images_to_base64
@@ -78,6 +79,7 @@ class OllamaBot(discord.Client):
 
         # Initialize clients
         self.ollama_client = OllamaClient()
+        self.claude_client = ClaudeClient()
         self.claude_code_client = ClaudeCodeClient()
         self.image_gen = ImageGenerator()
         self._last_search_sources: List[dict] = []
@@ -274,7 +276,9 @@ class OllamaBot(discord.Client):
         server = message.guild.id
         channel = message.channel.id
 
-        # Let plugins handle the message first (hot-swappable)
+        # Let plugins handle the message first (hot-swappable).
+        # Plugins use LLM-based intent classification and return False for
+        # messages they don't handle (e.g. code modification requests).
         if message.content.strip() and await self.plugin_manager.dispatch_message_handlers(message):
             return
 
