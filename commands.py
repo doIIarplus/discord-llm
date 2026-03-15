@@ -47,10 +47,15 @@ class ModelSelectView(discord.ui.View):
 class RestartConfirmView(discord.ui.View):
     """Confirm or revert bot code changes before restart."""
 
-    def __init__(self, bot, author_id: int):
+    def __init__(self, bot, author_id: int, test_passed: bool = True):
         super().__init__(timeout=120)
         self.bot = bot
         self.author_id = author_id
+        self.test_passed = test_passed
+
+        if not test_passed:
+            self.confirm.label = "Apply Anyway & Restart"
+            self.confirm.style = discord.ButtonStyle.red
 
     @discord.ui.button(label="Apply & Restart", style=discord.ButtonStyle.green)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -96,12 +101,17 @@ class PluginApplyView(discord.ui.View):
 
     MAX_AUTO_FIX_RETRIES = 2
 
-    def __init__(self, bot, author_id: int, plugin_names: list, original_instruction: str = ""):
+    def __init__(self, bot, author_id: int, plugin_names: list, original_instruction: str = "", test_passed: bool = True):
         super().__init__(timeout=120)
         self.bot = bot
         self.author_id = author_id
         self.plugin_names = plugin_names  # plugins to reload after apply
         self.original_instruction = original_instruction
+        self.test_passed = test_passed
+
+        if not test_passed:
+            self.apply.label = "Apply Anyway (Hot Reload)"
+            self.apply.style = discord.ButtonStyle.red
 
     @discord.ui.button(label="Apply (Hot Reload)", style=discord.ButtonStyle.green)
     async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):

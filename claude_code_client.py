@@ -9,8 +9,10 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 import traceback
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
@@ -192,6 +194,40 @@ class RateLimitError(Exception):
     def __init__(self, message: str, resets_at: Optional[float] = None):
         super().__init__(message)
         self.resets_at = resets_at
+
+
+@dataclass
+class TestResult:
+    """Results from the pre-apply test step."""
+
+    passed: bool
+    tier1_report: str
+    tier2_report: str = ""
+    tier1_passed: bool = True
+    tier2_passed: bool = True
+    tier2_skipped: bool = False
+
+    @property
+    def summary(self) -> str:
+        parts = []
+        if not self.tier1_passed:
+            parts.append("Import check failed")
+        if not self.tier2_passed:
+            parts.append("Validation tests failed")
+        if self.tier2_skipped:
+            parts.append("Deep validation skipped")
+        return "; ".join(parts) if parts else "All tests passed"
+
+    @property
+    def full_report(self) -> str:
+        lines = ["**Tier 1 (Import Check):**"]
+        lines.append(f"```\n{self.tier1_report[:500]}\n```")
+        if self.tier2_report:
+            lines.append("**Tier 2 (Validation Tests):**")
+            lines.append(f"```\n{self.tier2_report[:800]}\n```")
+        elif self.tier2_skipped:
+            lines.append("*Tier 2 skipped (rate limited or Tier 1 failed)*")
+        return "\n".join(lines)
 
 
 class ClaudeCodeClient:
@@ -591,6 +627,235 @@ class ClaudeCodeClient:
             print(f"Error in Claude Code plugin edit: {e}")
             print(traceback.format_exc())
             return str(e), -1
+
+    async def run_tests(
+        self,
+        diff: str,
+        change_type: str = "core",
+        plugin_names: List[str] = None,
+        model: str = "sonnet",
+        timeout: float = 120.0,
+    ) -> TestResult:
+        """Run validation tests on pending code changes.
+
+        Tier 1: Direct import check via subprocess (fast, free).
+        Tier 2: Claude Code writes and runs tests based on the diff (if Tier 1 passes).
+
+        Returns:
+            TestResult with pass/fail status and reports.
+        """
+        PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+        # ── Tier 1: Import checks ──────────────────────────────────────
+        tier1_results = []
+        tier1_passed = True
+
+        if change_type == "plugin" and plugin_names:
+            for name in plugin_names:
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-c", f"import plugins.{name}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=PROJECT_DIR,
+                )
+                try:
+                    _, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=15.0
+                    )
+                    if proc.returncode == 0:
+                        tier1_results.append(f"PASS: import plugins.{name}")
+                    else:
+                        tier1_passed = False
+                        err = stderr.decode("utf-8", errors="replace").strip()
+                        # Show last 3 lines of traceback for brevity
+                        err_lines = err.splitlines()
+                        short_err = "\n".join(err_lines[-3:]) if len(err_lines) > 3 else err
+                        tier1_results.append(f"FAIL: import plugins.{name}\n  {short_err}")
+                except asyncio.TimeoutError:
+                    tier1_passed = False
+                    tier1_results.append(f"FAIL: import plugins.{name} (timed out)")
+                    proc.kill()
+        else:
+            # Core change: verify main module imports
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "import bot",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=PROJECT_DIR,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=30.0
+                )
+                if proc.returncode == 0:
+                    tier1_results.append("PASS: import bot")
+                else:
+                    tier1_passed = False
+                    err = stderr.decode("utf-8", errors="replace").strip()
+                    err_lines = err.splitlines()
+                    short_err = "\n".join(err_lines[-3:]) if len(err_lines) > 3 else err
+                    tier1_results.append(f"FAIL: import bot\n  {short_err}")
+            except asyncio.TimeoutError:
+                tier1_passed = False
+                tier1_results.append("FAIL: import bot (timed out)")
+                proc.kill()
+
+        tier1_report = "\n".join(tier1_results)
+
+        # If Tier 1 failed, skip Tier 2
+        if not tier1_passed:
+            return TestResult(
+                passed=False,
+                tier1_report=tier1_report,
+                tier1_passed=False,
+                tier2_skipped=True,
+            )
+
+        # ── Tier 2: Claude Code validation tests ──────────────────────
+        # Skip if rate limited
+        if self.is_rate_limited:
+            return TestResult(
+                passed=True,  # Tier 1 passed, so cautiously optimistic
+                tier1_report=tier1_report,
+                tier1_passed=True,
+                tier2_skipped=True,
+            )
+
+        model_alias = self._resolve_model(model)
+
+        cmd = [
+            CLAUDE_CLI,
+            "-p",
+            "--output-format", "json",
+            "--verbose",
+            "--model", model_alias,
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+            "--allowedTools", "Read,Bash,Glob,Grep",
+        ]
+
+        # Truncate diff for prompt
+        diff_for_prompt = diff[:8000]
+        if len(diff) > 8000:
+            diff_for_prompt += "\n... (diff truncated, read changed files for full context)"
+
+        test_prompt = (
+            f"You are a test engineer validating changes to a Discord bot at {PROJECT_DIR}.\n\n"
+            f"Here is the diff of changes that were just made:\n```diff\n{diff_for_prompt}\n```\n\n"
+            f"INSTRUCTIONS:\n"
+            f"1. Read the changed files to understand the full context.\n"
+            f"2. Write and run a short Python test script using Bash that validates:\n"
+            f"   - The changed code is syntactically valid\n"
+            f"   - Key functions/classes can be imported and instantiated where possible\n"
+            f"   - Any obvious logic errors (wrong arg counts, missing attributes, type mismatches)\n"
+            f"   - For plugins: instantiate the plugin class with a mock context if feasible\n"
+            f"3. STRICT RULES:\n"
+            f"   - Do NOT start the bot or connect to Discord/Ollama/any external service.\n"
+            f"   - Do NOT make any network requests (no HTTP, no API calls, no sockets).\n"
+            f"   - Do NOT use .env variables, API keys, or tokens.\n"
+            f"   - Do NOT modify any source files. You are READ-ONLY except for Bash.\n"
+            f"   - Do NOT install any packages.\n"
+            f"   - Keep tests focused and fast (under 10 seconds total).\n"
+            f"4. End your response with exactly one of:\n"
+            f"   TEST_RESULT: PASS\n"
+            f"   TEST_RESULT: FAIL\n"
+            f"   followed by a one-line explanation.\n"
+        )
+
+        env = self._build_env(model)
+        tier2_report = ""
+        tier2_passed = True
+
+        try:
+            start_time = time.perf_counter()
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=PROJECT_DIR,
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=test_prompt.encode("utf-8")),
+                timeout=timeout,
+            )
+
+            duration = time.perf_counter() - start_time
+            print(f"Claude Code test validation took {duration:.2f}s")
+
+            raw_out = stdout.decode("utf-8", errors="replace").strip()
+            raw_err = stderr.decode("utf-8", errors="replace").strip()
+
+            parsed = _parse_verbose_output(raw_out)
+            result_data = parsed["result_data"]
+
+            if isinstance(result_data, dict):
+                self._check_rate_limit(result_data)
+
+            _log_request(
+                method="run_tests",
+                model=model_alias,
+                prompt=test_prompt,
+                raw_json=raw_out,
+                raw_stderr=raw_err,
+                exit_code=proc.returncode,
+                duration_ms=parsed["duration_ms"] or (duration * 1000),
+                thinking=parsed["thinking"],
+                response=parsed["result_text"],
+                cost_usd=parsed["cost_usd"],
+                input_tokens=parsed["input_tokens"],
+                output_tokens=parsed["output_tokens"],
+                cache_read_tokens=parsed["cache_read_tokens"],
+                cache_creation_tokens=parsed["cache_creation_tokens"],
+            )
+
+            tier2_report = parsed["result_text"] or raw_out or "No test output."
+
+            # Check for TEST_RESULT marker
+            if "TEST_RESULT: FAIL" in tier2_report:
+                tier2_passed = False
+            elif "TEST_RESULT: PASS" in tier2_report:
+                tier2_passed = True
+            elif proc.returncode != 0:
+                # CLI error but no explicit marker — check for rate limit
+                if self._is_rate_limit_error(raw_err or raw_out, result_data):
+                    resets_at = self._extract_reset_time(result_data)
+                    if resets_at:
+                        self._rate_limited_until = resets_at
+                    else:
+                        self._rate_limited_until = time.time() + 1800
+                    # Treat as skipped, not failed
+                    return TestResult(
+                        passed=True,
+                        tier1_report=tier1_report,
+                        tier1_passed=True,
+                        tier2_skipped=True,
+                        tier2_report="Tier 2 skipped: rate limited",
+                    )
+                tier2_passed = False
+                tier2_report = f"Test runner exited with code {proc.returncode}:\n{tier2_report}"
+
+        except asyncio.TimeoutError:
+            print(f"Claude Code test validation timed out after {timeout}s")
+            proc.kill()
+            tier2_report = f"Test validation timed out after {timeout}s"
+            tier2_passed = False
+        except Exception as e:
+            print(f"Error in Claude Code test validation: {e}")
+            print(traceback.format_exc())
+            tier2_report = f"Test runner error: {e}"
+            tier2_passed = False
+
+        return TestResult(
+            passed=tier1_passed and tier2_passed,
+            tier1_report=tier1_report,
+            tier2_report=tier2_report,
+            tier1_passed=tier1_passed,
+            tier2_passed=tier2_passed,
+        )
 
     async def _run_cli(
         self,

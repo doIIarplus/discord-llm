@@ -515,8 +515,33 @@ class TestCLI:
 
         print(c(f"\n  Summary: {response[:500]}", "green"))
 
+        # Run tests before asking to apply
+        if diff:
+            print(c("\n  Running tests...", "yellow"))
+            try:
+                test_result = await self.claude_code_client.run_tests(
+                    diff=diff,
+                    change_type="core",
+                )
+                status_color = "green" if test_result.passed else "red"
+                status_word = "PASSED" if test_result.passed else "FAILED"
+                print(c(f"  Tests {status_word}", status_color))
+                print(c(f"  {test_result.tier1_report}", "dim"))
+                if test_result.tier2_report:
+                    for line in test_result.tier2_report[:300].splitlines():
+                        print(c(f"  {line}", "dim"))
+                test_passed = test_result.passed
+            except Exception as e:
+                print(c(f"  Test runner error: {e}", "red"))
+                test_passed = True  # Don't block if tests couldn't run
+        else:
+            test_passed = True
+
         # Ask to apply or revert
-        answer = input(c("\n  Apply changes? [y/N] ", "yellow")).strip().lower()
+        if test_passed:
+            answer = input(c("\n  Apply changes? [y/N] ", "yellow")).strip().lower()
+        else:
+            answer = input(c("\n  Tests FAILED. Apply anyway? [y/N] ", "red")).strip().lower()
         if answer == "y":
             proc = await asyncio.create_subprocess_exec(
                 "git", "add", "-A",

@@ -484,18 +484,19 @@ class OllamaBot(discord.Client):
             return
 
         # Check for [EDIT_CODE] tags in the response — LLM decided a code change is needed
+        # Join all text parts first since the tag may span multiple response items
         edit_instruction = None
-        cleaned_response_data = []
-        for response_item in response_data:
-            if isinstance(response_item, str):
-                match = _EDIT_CODE_TAG.search(response_item)
-                if match:
-                    edit_instruction = match.group(1).strip()
-                    # Strip the tag from the displayed response
-                    response_item = _EDIT_CODE_TAG.sub('', response_item).strip()
-            if response_item:
-                cleaned_response_data.append(response_item)
-        response_data = cleaned_response_data
+        full_text = "\n".join(
+            item for item in response_data if isinstance(item, str)
+        )
+        match = _EDIT_CODE_TAG.search(full_text)
+        if match:
+            edit_instruction = match.group(1).strip()
+            full_text = _EDIT_CODE_TAG.sub('', full_text).strip()
+
+        # Preserve any non-string items (images, etc.) and replace text with cleaned version
+        non_text_items = [item for item in response_data if not isinstance(item, str)]
+        response_data = [full_text] + non_text_items if full_text else non_text_items
 
         # Collect all text parts to figure out where to append sources
         # Claude Code uses paragraph breaks; local models use ---MSG--- markers
@@ -679,9 +680,33 @@ class OllamaBot(discord.Client):
         if not affected_plugins:
             affected_plugins = self.plugin_manager.plugin_names
 
+        # ── Test step ──────────────────────────────────────────────────
+        test_msg = await channel.send("running tests...")
+        try:
+            async with channel.typing():
+                test_result = await self.claude_code_client.run_tests(
+                    diff=diff,
+                    change_type="plugin",
+                    plugin_names=affected_plugins,
+                    model="sonnet",
+                )
+        except Exception as e:
+            await test_msg.edit(content=f"test runner error: {e}")
+            test_result = None
+
+        if test_result:
+            status = "PASSED" if test_result.passed else "FAILED"
+            await test_msg.edit(content=f"tests {status}")
+            report = test_result.full_report[:1500]
+            await channel.send(report)
+            test_passed = test_result.passed
+        else:
+            test_passed = True  # If tests couldn't run, don't block
+
         from commands import PluginApplyView
-        view = PluginApplyView(self, author_id, affected_plugins, original_instruction=instruction)
-        await channel.send("apply and hot-reload?", view=view)
+        view = PluginApplyView(self, author_id, affected_plugins, original_instruction=instruction, test_passed=test_passed)
+        label = "apply and hot-reload?" if test_passed else "tests failed. apply anyway, or revert?"
+        await channel.send(label, view=view)
 
     async def _execute_code_change_with_logs(
         self, channel, author_id: int, instruction: str, log_context: str = ""
@@ -744,10 +769,33 @@ class OllamaBot(discord.Client):
         summary = response[:1500] if len(response) > 1500 else response
         await channel.send(summary)
 
+        # ── Test step ──────────────────────────────────────────────────
+        test_msg = await channel.send("running tests...")
+        try:
+            async with channel.typing():
+                test_result = await self.claude_code_client.run_tests(
+                    diff=diff,
+                    change_type="core",
+                    model="sonnet",
+                )
+        except Exception as e:
+            await test_msg.edit(content=f"test runner error: {e}")
+            test_result = None
+
+        if test_result:
+            status = "PASSED" if test_result.passed else "FAILED"
+            await test_msg.edit(content=f"tests {status}")
+            report = test_result.full_report[:1500]
+            await channel.send(report)
+            test_passed = test_result.passed
+        else:
+            test_passed = True  # If tests couldn't run, don't block
+
         # Apply/Revert buttons
         from commands import RestartConfirmView
-        view = RestartConfirmView(self, author_id)
-        await channel.send("apply changes and restart?", view=view)
+        view = RestartConfirmView(self, author_id, test_passed=test_passed)
+        label = "apply changes and restart?" if test_passed else "tests failed. apply anyway, or revert?"
+        await channel.send(label, view=view)
 
     def format_prompt(self, messages: List[dict]) -> str:
         """Format messages into a prompt with clear turn boundaries."""
