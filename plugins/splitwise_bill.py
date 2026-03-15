@@ -33,6 +33,7 @@ _api_logger.addHandler(_api_fh)
 
 SPLITWISE_BASE_URL = "https://secure.splitwise.com/api/v3.0"
 FRIENDS_CACHE_TTL = 300  # 5 minutes
+SPLITWISE_OWNER_ID = 118567805678256128  # Only this Discord user can use splitwise commands
 
 
 # --- Discord UI Views ---
@@ -737,6 +738,12 @@ class SplitwiseBillPlugin(BasePlugin):
         ratios: Optional[str] = None,
     ):
         """Add a bill split equally or by ratio."""
+        if interaction.user.id != SPLITWISE_OWNER_ID:
+            await interaction.response.send_message(
+                "Only dollarplus can use this command since it's tied to his Splitwise account.",
+                ephemeral=True,
+            )
+            return
         if not self._api_key:
             await interaction.response.send_message(
                 "Splitwise API key not configured. Set SPLITWISE_API_KEY in .env.",
@@ -842,6 +849,12 @@ class SplitwiseBillPlugin(BasePlugin):
 
         split_mode: "equal", "itemized", or "ratio". Defaults to "itemized".
         """
+        if interaction.user.id != SPLITWISE_OWNER_ID:
+            await interaction.response.send_message(
+                "Only dollarplus can use this command since it's tied to his Splitwise account.",
+                ephemeral=True,
+            )
+            return
         if not self._api_key:
             await interaction.response.send_message(
                 "Splitwise API key not configured. Set SPLITWISE_API_KEY in .env.",
@@ -967,6 +980,12 @@ class SplitwiseBillPlugin(BasePlugin):
             await interaction.channel.send(f"Unexpected response: {json.dumps(result)[:500]}")
 
     async def _groups_command(self, interaction: discord.Interaction):
+        if interaction.user.id != SPLITWISE_OWNER_ID:
+            await interaction.response.send_message(
+                "Only dollarplus can use this command since it's tied to his Splitwise account.",
+                ephemeral=True,
+            )
+            return
         if not self._api_key:
             await interaction.response.send_message(
                 "Splitwise API key not configured.", ephemeral=True
@@ -996,6 +1015,12 @@ class SplitwiseBillPlugin(BasePlugin):
             await interaction.followup.send(f"Error fetching groups: {e}")
 
     async def _balance_command(self, interaction: discord.Interaction):
+        if interaction.user.id != SPLITWISE_OWNER_ID:
+            await interaction.response.send_message(
+                "Only dollarplus can use this command since it's tied to his Splitwise account.",
+                ephemeral=True,
+            )
+            return
         if not self._api_key:
             await interaction.response.send_message(
                 "Splitwise API key not configured.", ephemeral=True
@@ -1045,6 +1070,9 @@ class SplitwiseBillPlugin(BasePlugin):
 
         if not (is_mentioned or is_reply):
             return False
+
+        if message.author.id != SPLITWISE_OWNER_ID:
+            return False  # Silently ignore non-owner messages for the message handler
 
         if not self._api_key:
             await message.channel.send(
