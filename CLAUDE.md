@@ -127,9 +127,92 @@ Key packages: `discord.py`, `python-dotenv`, `aiohttp`, `trafilatura`, `tavily-p
 
 Optional (better token counting in RAG): `transformers`, `torch`.
 
+## CLI Tools
+
+Standalone Python scripts in `tools/` that Claude can call via Bash. Each tool uses argparse, outputs JSON to stdout, and errors to stderr (exit 1). All tools are stateless and self-contained.
+
+**Calling convention:** `python tools/<integration>/<tool>.py [args]`
+**Discovery:** `python tools/<integration>/<tool>.py --help` for usage.
+
+### Confirmation policy
+- **Read-only tools** (list, get, search, stats): Execute immediately, report results.
+- **Mutating tools** (create, delete, generate, schedule): Describe the action and wait for user confirmation before executing.
+
+### Access control
+- **Splitwise tools**: Only available to Discord user `118567805678256128` (dollarplus). If any other user requests Splitwise actions, politely decline — the tools are tied to dollarplus's personal Splitwise account. The requesting user's Discord ID is included in the prompt as `discord_id=`.
+
+### Splitwise (`tools/splitwise/`)
+Requires `SPLITWISE_API_KEY` in environment.
+
+| Tool | Description |
+|------|-------------|
+| `get_current_user.py` | Get authenticated user's ID, name, email |
+| `list_friends.py` | List all friends with IDs, names, emails, balances |
+| `get_balances.py [--all]` | Show non-zero balances (--all includes zero) |
+| `create_expense.py --amount N --description TEXT --split-with ID [ID ...] [--ratios R ...] [--shares S ...] [--group-id G] [--currency C] [--paid-by ID]` | Create expense (equal/ratio/custom split) |
+| `delete_expense.py EXPENSE_ID` | Delete an expense |
+| `list_groups.py` | List Splitwise groups and members |
+| `get_group.py GROUP_ID` | Get group details and balances |
+| `list_expenses.py [--limit N] [--friend-id ID] [--group-id ID] [--dated-after DATE] [--dated-before DATE]` | List recent expenses with filters |
+
+**Workflow example:** To split $50 with "Jason":
+1. `list_friends.py` → find Jason's user ID
+2. `create_expense.py --amount 50 --description "Dinner" --split-with <jason_id>`
+
+### Web Search (`tools/web_search/`)
+Requires `TAVILY_API_KEY` in environment.
+
+| Tool | Description |
+|------|-------------|
+| `search.py QUERY [--max-results N]` | Search the web, return raw results (no LLM summarization) |
+
+### Stable Diffusion (`tools/stable_diffusion/`)
+Requires SD WebUI running at `SD_API_URL`.
+
+| Tool | Description |
+|------|-------------|
+| `generate.py --prompt TEXT [--negative-prompt TEXT] [--width N] [--height N] [--cfg-scale F] [--steps N] [--seed N]` | Generate image, returns file path |
+
+### nhentai (`tools/nhentai/`)
+
+| Tool | Description |
+|------|-------------|
+| `fetch_preview.py CODE [--output-dir DIR]` | Fetch preview image for 6-digit code |
+
+### Discord (`tools/discord/`)
+Requires webhook URLs in env as `DISCORD_WEBHOOK_<NAME>` (e.g., `DISCORD_WEBHOOK_GENERAL`).
+
+| Tool | Description |
+|------|-------------|
+| `send_webhook.py --webhook NAME --content TEXT [--username NAME]` | Send message to a Discord channel via webhook. Supports `<@USER_ID>` mentions. |
+
+### RAG Wiki (`tools/rag/`)
+
+| Tool | Description |
+|------|-------------|
+| `search.py QUERY [--n-results N]` | Search indexed wiki content |
+| `index.py [--wiki-dump PATH] [--clear-existing]` | Index a MediaWiki XML dump |
+| `stats.py` | Show ChromaDB collection statistics |
+
+### Scheduler (`tools/scheduler/`)
+For recurring tasks. Optional dependency: `pip install croniter`
+
+| Tool | Description |
+|------|-------------|
+| `create_task.py --name NAME --schedule CRON --command CMD [--description TEXT]` | Create recurring task |
+| `list_tasks.py [--all]` | List scheduled tasks |
+| `delete_task.py TASK_ID` | Delete a task |
+| `run_due.py [--dry-run]` | Execute due tasks (called by system cron) |
+
+**Cron setup for scheduler:**
+```bash
+* * * * * cd /home/dollarplus/projects/discord_llm_bot && /home/dollarplus/projects/discord_llm_bot/venv/bin/python tools/scheduler/run_due.py >> /tmp/scheduler.log 2>&1
+```
+
 ## File I/O
 
 - Uploaded attachments temporarily saved to `multimodal_input/`, deleted after processing
 - Generated images saved to `api_out/txt2img/` and `api_out/img2img/`
 - LaTeX renders saved to `latex_images/` (if latex rendering is re-enabled)
 - RAG vector DB: `chroma_db/`
+- Scheduler tasks: `tools/scheduler/tasks.json`

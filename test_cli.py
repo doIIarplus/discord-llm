@@ -339,7 +339,7 @@ class TestCLI:
         start = time.perf_counter()
         if using_claude_code:
             try:
-                raw_response, _ = await self.claude_code_client.generate_with_search(prompt, model)
+                raw_response, _ = await self.claude_code_client.generate_with_tools(prompt, model)
                 if raw_response == "No response from Claude Code.":
                     return ["No response from Claude Code."]
             except RateLimitError as rl_err:

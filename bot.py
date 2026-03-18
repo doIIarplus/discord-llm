@@ -447,6 +447,7 @@ class OllamaBot(discord.Client):
         self.context[server][channel].append({
             "role": "user",
             "name": message.author.display_name,
+            "discord_user_id": message.author.id,
             "content": prompt,
             "timestamp": time.time(),
             "images": images,
@@ -807,7 +808,9 @@ class OllamaBot(discord.Client):
         for i, msg in enumerate(messages, 1):
             if msg["role"] == "user":
                 name = msg.get("name", "Unknown")
-                parts.append(f"[Turn {i} | User ({name})]\n{msg['content']}\n[/Turn {i}]")
+                uid = msg.get("discord_user_id", "")
+                user_label = f"User ({name}, discord_id={uid})" if uid else f"User ({name})"
+                parts.append(f"[Turn {i} | {user_label}]\n{msg['content']}\n[/Turn {i}]")
             else:
                 parts.append(f"[Turn {i} | Assistant]\n{msg['content']}\n[/Turn {i}]")
         parts.append(f"[Turn {len(messages) + 1} | Assistant]")
@@ -985,7 +988,7 @@ class OllamaBot(discord.Client):
 
             if using_claude_code:
                 try:
-                    raw_response, _ = await self.claude_code_client.generate_with_search(
+                    raw_response, _ = await self.claude_code_client.generate_with_tools(
                         prompt, model, images
                     )
                     if raw_response == "No response from Claude Code.":

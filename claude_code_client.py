@@ -343,6 +343,26 @@ class ClaudeCodeClient:
         text = await self._run_cli(prompt, model, enable_search=True, method="generate_with_search")
         return text, []
 
+    async def generate_with_tools(
+        self,
+        prompt: str,
+        model: str = "sonnet",
+        images: Optional[List[str]] = None,
+    ) -> Tuple[str, List[dict]]:
+        """Generate a response with Bash + web tools enabled.
+
+        Claude can call CLI tools in tools/ via Bash and search the web.
+        Tool documentation is picked up automatically from CLAUDE.md.
+
+        Returns:
+            (response_text, sources) — same interface as generate_with_search.
+        """
+        if images:
+            print("  [warning: images not supported via Claude Code CLI, ignoring]")
+
+        text = await self._run_cli(prompt, model, enable_tools=True, method="generate_with_tools")
+        return text, []
+
     async def run_code_edit(
         self,
         instruction: str,
@@ -862,6 +882,7 @@ class ClaudeCodeClient:
         prompt: str,
         model: str,
         enable_search: bool = False,
+        enable_tools: bool = False,
         timeout: float = 600.0,
         method: str = "generate",
     ) -> str:
@@ -885,8 +906,13 @@ class ClaudeCodeClient:
             "--no-session-persistence",
         ]
 
-        # Only allow web tools — no file editing, no bash
-        if enable_search:
+        # Tool access modes (mutually exclusive):
+        #   enable_tools: Bash + web (for CLI tool calling)
+        #   enable_search: web only
+        #   default: no tools
+        if enable_tools:
+            cmd.extend(["--allowedTools", "Bash,WebSearch,WebFetch"])
+        elif enable_search:
             cmd.extend(["--allowedTools", "WebSearch,WebFetch"])
         else:
             cmd.extend(["--tools", ""])

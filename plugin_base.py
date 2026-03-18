@@ -57,7 +57,7 @@ class PluginBotContext:
         from models import is_claude_code_model
         m = model or self._bot.active_model
         if is_claude_code_model(m):
-            resp, _ = await self._bot.claude_code_client.generate_with_search(prompt, m, images)
+            resp, _ = await self._bot.claude_code_client.generate_with_tools(prompt, m, images)
             return resp
         return await self._bot.ollama_client.generate(prompt, m, images)
 
