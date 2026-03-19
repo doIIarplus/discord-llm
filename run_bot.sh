@@ -18,6 +18,13 @@ cd "$SCRIPT_DIR"
 
 source venv/bin/activate
 
+# Load CLAUDE_CODE_OAUTH_TOKEN from .env if set (long-lived OAuth token for Claude CLI)
+OAUTH_TOKEN=$(grep -oP '^CLAUDE_CODE_OAUTH_TOKEN=\K.*' "$SCRIPT_DIR/.env" 2>/dev/null)
+if [ -n "$OAUTH_TOKEN" ]; then
+    export CLAUDE_CODE_OAUTH_TOKEN="$OAUTH_TOKEN"
+    echo "[auth] Using long-lived OAuth token from .env"
+fi
+
 RESTART_EXIT_CODE=42
 HOME_DIR="$HOME"
 LOG_FILE="$SCRIPT_DIR/bot.log"

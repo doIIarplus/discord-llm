@@ -129,7 +129,16 @@ class OllamaBot(discord.Client):
             "- User: 'you keep crashing when I send images' → 'lemme fix that [EDIT_CODE]Fix the image handling crash - check the error in bot.log and fix the root cause[/EDIT_CODE]'\n"
             "Include your normal casual response text OUTSIDE the tag. The tag content should be a clear, "
             "specific instruction — not conversational. Only use this when the user is genuinely asking for a code change. "
-            "Do NOT use it for general questions about code or programming help."
+            "Do NOT use it for general questions about code or programming help.\n\n"
+            "CLI TOOLS:\n"
+            "You have access to CLI tools via Bash in the tools/ directory. Use them when users ask about "
+            "Splitwise (bills, balances, expenses), scheduled tasks, web searches, or other tool-related actions. "
+            "Run `python tools/<integration>/<tool>.py --help` to see usage. Key tools:\n"
+            "- tools/splitwise/ — list_friends, get_balances, create_expense, delete_expense, list_groups, list_expenses (ONLY for discord_id=118567805678256128)\n"
+            "- tools/scheduler/ — create_task, list_tasks, delete_task\n"
+            "- tools/web_search/search.py — search the web\n"
+            "- tools/discord/send_webhook.py — send Discord messages via webhook\n"
+            "Always use these tools when the user's request matches their capabilities instead of making up answers."
         )
         self.system_prompt = self.original_system_prompt
 
