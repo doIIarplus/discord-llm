@@ -356,7 +356,10 @@ class CommandHandlers:
             logger.info(f"Get system prompt command called by {interaction.user.name}#{interaction.user.discriminator}")
             await interaction.response.defer(thinking=True)
             logger.debug("Sending current system prompt")
-            await interaction.followup.send(self.bot.system_prompt)
+            from response_splitter import split_long_message
+            chunks = split_long_message(self.bot.system_prompt)
+            for chunk in chunks:
+                await interaction.followup.send(chunk)
 
         @self.bot.tree.command(name="set_model", description="Switch the active LLM model")
         async def set_model(interaction: discord.Interaction):
