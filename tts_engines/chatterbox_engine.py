@@ -55,10 +55,12 @@ class ChatterboxEngine(TTSEngine):
     # Default generation parameters — tuned for natural, expressive speech.
     # Override per-call via kwargs.
     DEFAULT_PARAMS = {
-        "exaggeration": 0.7,     # emotional expressiveness (0.5=neutral, higher=more dramatic)
-        "cfg_weight": 0.3,       # pacing/deliberateness (lower=slower, more pauses)
+        "exaggeration": 0.5,     # emotional expressiveness (Chatterbox default)
+        "cfg_weight": 0.5,       # classifier-free guidance (Chatterbox default)
         "temperature": 0.8,      # sampling randomness
         "repetition_penalty": 1.2,
+        "min_p": 0.05,           # minimum probability threshold for token sampling
+        "top_p": 1.0,            # nucleus sampling cutoff
     }
 
     def __init__(self, device: str = "cuda"):
@@ -112,6 +114,8 @@ class ChatterboxEngine(TTSEngine):
                     "cfg_weight": params["cfg_weight"],
                     "temperature": params["temperature"],
                     "repetition_penalty": params["repetition_penalty"],
+                    "min_p": params["min_p"],
+                    "top_p": params["top_p"],
                 }
                 if ref_audio is not None:
                     gen_kwargs["audio_prompt_path"] = str(ref_audio)

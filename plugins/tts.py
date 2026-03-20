@@ -50,7 +50,14 @@ VOICE_CONFIG = {
     },
     "trump": {
         "personality": "You are Donald Trump.",
-        "tts_params": {},
+        "tts_params": {
+            "exaggeration": 0.3,
+            "cfg_weight": 0.7,
+            "temperature": 0.9,
+            "top_p": 0.8,
+            "repetition_penalty": 1.5,
+            "min_p": 0.05,
+        },
         "voice_file": "trump.mp3",
     },
     "trumpv2": {
@@ -63,8 +70,8 @@ VOICE_CONFIG = {
             "but the vibe and word choices should unmistakably be Trump."
         ),
         "tts_params": {
-            "exaggeration": 0.85,  # bold, dramatic delivery
-            "cfg_weight": 0.35,    # slightly faster but still deliberate
+            "exaggeration": 0.5,   # slightly more expressive than trump
+            "cfg_weight": 0.2,     # slower, more deliberate pacing
         },
     },
 }
