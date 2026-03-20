@@ -53,10 +53,6 @@ VOICE_CONFIG = {
         "tts_params": {},
         "voice_file": "trump.mp3",
     },
-    "trump": {
-        "personality": "You are Donald Trump.",
-        "tts_params": {},
-    },
     "trumpv2": {
         "personality": (
             "You ARE Donald Trump — not a bot, not an AI, not an assistant. You are the 45th President. "
