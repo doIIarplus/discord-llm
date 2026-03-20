@@ -29,9 +29,10 @@ RESTART_EXIT_CODE=42
 HOME_DIR="$HOME"
 LOG_FILE="$SCRIPT_DIR/bot.log"
 
-# Ensure Claude Code state dirs exist (bwrap --bind requires them)
+# Ensure state dirs exist (bwrap --bind requires them)
 mkdir -p "$HOME_DIR/.claude"
 mkdir -p "$HOME_DIR/.local/share/claude"
+mkdir -p "$HOME_DIR/.cache/huggingface"
 
 run_bot() {
     # Trim log file to last 200 lines before each start
@@ -59,8 +60,14 @@ run_bot() {
         --bind "$SCRIPT_DIR" "$SCRIPT_DIR"
         --bind "$HOME_DIR/.claude" "$HOME_DIR/.claude"
         --bind "$HOME_DIR/.local/share/claude" "$HOME_DIR/.local/share/claude"
+        --bind "$HOME_DIR/.cache/huggingface" "$HOME_DIR/.cache/huggingface"
         --tmpfs /mnt
     )
+
+    # WSL2 GPU passthrough: /dev/dxg is the DirectX GPU device
+    if [ -e /dev/dxg ]; then
+        BWRAP_ARGS+=(--dev-bind /dev/dxg /dev/dxg)
+    fi
 
     # On WSL2, /etc/resolv.conf -> /mnt/wsl/resolv.conf. Since we mask /mnt,
     # we must bind the real file back in so DNS works inside the sandbox.

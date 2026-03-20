@@ -132,21 +132,28 @@ class BasePlugin:
             **kwargs,
         })
 
-    def register_message_handler(self, pattern: str, callback, priority: int = 100):
+    def register_message_handler(self, pattern: str, callback, priority: int = 100, timeout: float = None):
         """Register a regex-based message handler.
 
         If the callback returns True, the message is considered consumed
         and won't be passed to the LLM or other handlers.
+        timeout: override the default CALLBACK_TIMEOUT (seconds).
         """
-        self._message_handlers.append({
+        entry = {
             "pattern": pattern,
             "callback": callback,
             "priority": priority,
-        })
+        }
+        if timeout is not None:
+            entry["timeout"] = timeout
+        self._message_handlers.append(entry)
 
-    def register_hook(self, hook_type: HookType, callback):
+    def register_hook(self, hook_type: HookType, callback, timeout: float = None):
         """Register a lifecycle hook."""
-        self._hooks.append({
+        entry = {
             "hook_type": hook_type,
             "callback": callback,
-        })
+        }
+        if timeout is not None:
+            entry["timeout"] = timeout
+        self._hooks.append(entry)

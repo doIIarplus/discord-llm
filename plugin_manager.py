@@ -253,7 +253,8 @@ class PluginManager:
         """Register plugin's hooks into the dispatch table."""
         for hook_info in instance._hooks:
             hook_type = hook_info["hook_type"]
-            entry = (instance.name, hook_info["callback"], instance.priority)
+            entry = (instance.name, hook_info["callback"], instance.priority,
+                     hook_info.get("timeout"))
             self._hooks[hook_type].append(entry)
             # Keep sorted by priority (lower = first)
             self._hooks[hook_type].sort(key=lambda x: x[2])
@@ -286,7 +287,8 @@ class PluginManager:
         for plugin_name, handler in all_handlers:
             if re.search(handler["pattern"], message.content, re.IGNORECASE):
                 result = await self._safe_call(
-                    plugin_name, handler["callback"](message)
+                    plugin_name, handler["callback"](message),
+                    timeout=handler.get("timeout"),
                 )
                 if result is True:
                     return True
@@ -295,20 +297,56 @@ class PluginManager:
     async def dispatch_hook(self, hook_type: HookType, **kwargs) -> List[Any]:
         """Call all registered hooks of a given type, in priority order."""
         results = []
-        for plugin_name, callback, _priority in self._hooks.get(hook_type, []):
+        for entry in self._hooks.get(hook_type, []):
+            plugin_name, callback, _priority = entry[0], entry[1], entry[2]
+            hook_timeout = entry[3] if len(entry) > 3 else None
             if plugin_name in self._disabled:
                 continue
-            result = await self._safe_call(plugin_name, callback(**kwargs))
+            result = await self._safe_call(
+                plugin_name, callback(**kwargs), timeout=hook_timeout,
+            )
             if result is not None:
                 results.append(result)
         return results
 
+    def should_suppress_text(self, message) -> bool:
+        """Check if any plugin wants to suppress text for this message.
+
+        Plugins can define a `suppress_text(message)` method that returns True
+        to signal the bot should not send text (e.g. voice mode sends audio instead).
+        """
+        for name, instance in self._plugins.items():
+            if name in self._disabled:
+                continue
+            if hasattr(instance, "suppress_text"):
+                result = instance.suppress_text(message)
+                logger.info(f"[TTS-DEBUG] {name}.suppress_text() = {result} "
+                            f"for user {message.author.id}")
+                if result:
+                    return True
+        return False
+
+    def get_system_prompt_override(self, user_id: int) -> str | None:
+        """Check if any plugin wants to override the system prompt for this user.
+
+        Plugins can define a `get_system_prompt_override(user_id)` method that
+        returns a replacement system prompt, or None to use the default.
+        """
+        for name, instance in self._plugins.items():
+            if name in self._disabled:
+                continue
+            if hasattr(instance, "get_system_prompt_override"):
+                override = instance.get_system_prompt_override(user_id)
+                if override is not None:
+                    return override
+        return None
+
     # ── Error isolation ────────────────────────────────────────────────
 
-    async def _safe_call(self, plugin_name: str, coro) -> Any:
+    async def _safe_call(self, plugin_name: str, coro, timeout: float = None) -> Any:
         """Execute a plugin coroutine with error containment."""
         try:
-            return await asyncio.wait_for(coro, timeout=CALLBACK_TIMEOUT)
+            return await asyncio.wait_for(coro, timeout=timeout or CALLBACK_TIMEOUT)
         except asyncio.TimeoutError:
             logger.error(f"Plugin {plugin_name} timed out")
             self._record_failure(plugin_name)

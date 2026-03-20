@@ -288,6 +288,10 @@ class OllamaBot(discord.Client):
         server = message.guild.id
         channel = message.channel.id
 
+        logger.info(f"[MSG-DEBUG] on_message: msg_id={message.id} author={message.author.display_name}"
+                     f"({message.author.id}) channel={channel} server={server} "
+                     f"content={message.content[:80]!r}")
+
         # Let plugins handle the message first (hot-swappable).
         # Plugins use LLM-based intent classification and return False for
         # messages they don't handle (e.g. code modification requests).
@@ -387,6 +391,7 @@ class OllamaBot(discord.Client):
                         ctx.pop(0)
 
             fetched_sources = await self.build_context(message, server, False, image_files, document_files)
+            logger.info(f"[MSG-DEBUG] Calling _send_response: msg_id={message.id} channel={channel}")
             await self._send_response(message, server, channel, fetched_sources)
 
         except Exception as e:
@@ -506,12 +511,20 @@ class OllamaBot(discord.Client):
         full_text = "\n".join(
             item for item in response_data if isinstance(item, str)
         )
-        # Dispatch POST_QUERY hook (e.g. TTS voice mode)
+        # Check if any plugin wants to suppress text BEFORE dispatching hooks
+        # (e.g. TTS voice mode — we don't want to send text then audio)
+        suppress_text = self.plugin_manager.should_suppress_text(message)
+        logger.info(f"[TTS-DEBUG] suppress_text={suppress_text} for user={message.author.id} "
+                     f"(voice_mode check before POST_QUERY hook)")
+
+        # Dispatch POST_QUERY hook (e.g. TTS voice mode generates + sends audio)
+        logger.info(f"[TTS-DEBUG] Dispatching POST_QUERY hook, full_text length={len(full_text)}")
         hook_results = await self.plugin_manager.dispatch_hook(
             HookType.POST_QUERY,
             message=message,
             response_text=full_text,
         )
+        logger.info(f"[TTS-DEBUG] POST_QUERY hook returned {len(hook_results)} results: {hook_results}")
 
         match = _EDIT_CODE_TAG.search(full_text)
         if match:
@@ -550,36 +563,29 @@ class OllamaBot(discord.Client):
                 else:
                     all_parts.append(f"-# Sources: {' | '.join(source_links)}")
 
-        # Send text parts with typing delays
-        for i, part in enumerate(all_parts):
-            async with message.channel.typing():
-                delay = calculate_typing_delay(part)
-                delay *= random.uniform(0.9, 1.3)
-                await asyncio.sleep(delay)
+        # Send text parts with typing delays (unless a hook suppressed text, e.g. voice mode)
+        logger.info(f"[TTS-DEBUG] About to send text. suppress_text={suppress_text}, "
+                     f"all_parts count={len(all_parts)}")
+        if not suppress_text:
+            for i, part in enumerate(all_parts):
+                async with message.channel.typing():
+                    delay = calculate_typing_delay(part)
+                    delay *= random.uniform(0.9, 1.3)
+                    await asyncio.sleep(delay)
 
-            print(f"Sending response part {i+1}/{len(all_parts)}: {part[:50]}...")
-            await message.channel.send(part)
+                print(f"Sending response part {i+1}/{len(all_parts)}: {part[:50]}...")
+                await message.channel.send(part)
 
-            if i < len(all_parts) - 1:
-                await asyncio.sleep(random.uniform(0.3, 0.8))
+                if i < len(all_parts) - 1:
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
 
-        # Handle any image items
-        for response_item in response_data:
-            if isinstance(response_item, dict) and "image" in response_item:
-                file = discord.File(response_item["image"])
-                await message.channel.send(file=file)
-
-        # Send audio attachments from POST_QUERY hooks (e.g. TTS voice mode)
-        for hook_result in hook_results:
-            if isinstance(hook_result, dict) and "audio" in hook_result:
-                audio_path = hook_result["audio"]
-                try:
-                    await message.channel.send(file=discord.File(audio_path))
-                finally:
-                    try:
-                        os.remove(audio_path)
-                    except OSError:
-                        pass
+            # Handle any image items
+            for response_item in response_data:
+                if isinstance(response_item, dict) and "image" in response_item:
+                    file = discord.File(response_item["image"])
+                    await message.channel.send(file=file)
+        else:
+            logger.info(f"[TTS-DEBUG] Text suppressed — skipping {len(all_parts)} text parts")
 
         # If the LLM decided a code edit is needed, trigger it
         if edit_instruction:
@@ -1001,7 +1007,14 @@ class OllamaBot(discord.Client):
                 if wiki_context:
                     prompt = f"Wiki Context:\n{wiki_context}\n\n{prompt}"
 
+        # Check for per-user personality override (e.g. TTS voice mode)
+        last_user_id = messages[-1].get("discord_user_id")
         system_prompt = self.system_prompt
+        if last_user_id:
+            override = self.plugin_manager.get_system_prompt_override(last_user_id)
+            if override:
+                system_prompt = override
+                logger.info(f"[TTS-DEBUG] Using personality override for user {last_user_id}")
         prompt = f"System: {system_prompt}\n" + prompt
 
         # Extract Discord mentions (users, channels, roles) from the last message
