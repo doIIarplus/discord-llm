@@ -11,5 +11,11 @@ pypdf
 trafilatura
 tavily-python
 anthropic
+chatterbox-tts
+torchaudio
+soundfile
+chatterbox-tts
+torchaudio
+soundfile
 # transformers (optional, for better token counting)
 # torch (optional, required by transformers)

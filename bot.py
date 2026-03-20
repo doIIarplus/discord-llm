@@ -40,6 +40,7 @@ from file_parser import FileParser
 from mention_extractor import extract_mention_context
 from response_splitter import split_response_by_markers, split_response_by_paragraphs, split_long_message, calculate_typing_delay
 from sandbox import safe_path, SandboxViolation
+from plugin_base import HookType
 from plugin_manager import PluginManager
 
 # Exit code that tells the wrapper script (run_bot.sh) to restart the bot
@@ -503,6 +504,13 @@ class OllamaBot(discord.Client):
         full_text = "\n".join(
             item for item in response_data if isinstance(item, str)
         )
+        # Dispatch POST_QUERY hook (e.g. TTS voice mode)
+        hook_results = await self.plugin_manager.dispatch_hook(
+            HookType.POST_QUERY,
+            message=message,
+            response_text=full_text,
+        )
+
         match = _EDIT_CODE_TAG.search(full_text)
         if match:
             edit_instruction = match.group(1).strip()
@@ -558,6 +566,18 @@ class OllamaBot(discord.Client):
             if isinstance(response_item, dict) and "image" in response_item:
                 file = discord.File(response_item["image"])
                 await message.channel.send(file=file)
+
+        # Send audio attachments from POST_QUERY hooks (e.g. TTS voice mode)
+        for hook_result in hook_results:
+            if isinstance(hook_result, dict) and "audio" in hook_result:
+                audio_path = hook_result["audio"]
+                try:
+                    await message.channel.send(file=discord.File(audio_path))
+                finally:
+                    try:
+                        os.remove(audio_path)
+                    except OSError:
+                        pass
 
         # If the LLM decided a code edit is needed, trigger it
         if edit_instruction:
