@@ -43,6 +43,8 @@ from sandbox import safe_path, SandboxViolation
 from plugin_base import HookType
 from plugin_manager import PluginManager
 
+# charlie was here
+
 # Exit code that tells the wrapper script (run_bot.sh) to restart the bot
 RESTART_EXIT_CODE = 42
 
