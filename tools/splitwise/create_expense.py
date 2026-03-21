@@ -48,20 +48,6 @@ def _check_duplicate(client, description, amount):
             sys.exit(1)
 
 
-def _check_duplicate(client, description, amount):
-    """Check if a matching expense was created in the last 60 seconds."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%S")
-    result = client.get(f"/get_expenses?limit=5&dated_after={cutoff}")
-    for exp in result.get("expenses", []):
-        if exp.get("deleted_at"):
-            continue
-        if (exp.get("description", "").strip().lower() == description.strip().lower()
-                and float(exp.get("cost", 0)) == round(amount, 2)):
-            json.dump({"error": f"Duplicate expense detected (id: {exp['id']}), skipping creation"}, sys.stdout)
-            print()
-            sys.exit(1)
-
-
 def _build_equal_split(amount, payer_id, friend_ids, group_id):
     """Build form data for an equal split."""
     all_ids = [payer_id] + friend_ids
@@ -203,9 +189,6 @@ def main():
         data["group_id"] = args.group_id
 
     # Check for duplicate before creating
-    _check_duplicate(client, args.description, args.amount)
-
-    # Check for duplicate expense created in the last 60 seconds
     _check_duplicate(client, args.description, args.amount)
 
     result = client.post_form("/create_expense", data)
