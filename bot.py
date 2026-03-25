@@ -138,9 +138,20 @@ class OllamaBot(discord.Client):
             "Splitwise (bills, balances, expenses), scheduled tasks, web searches, or other tool-related actions. "
             "Run `python tools/<integration>/<tool>.py --help` to see usage. Key tools:\n"
             "- tools/splitwise/ — list_friends, get_balances, create_expense, delete_expense, list_groups, list_expenses (ONLY for discord_id=118567805678256128)\n"
-            "- tools/scheduler/ — create_task, list_tasks, delete_task\n"
+            "- tools/scheduler/ — create_task (--once for one-shot reminders), list_tasks, delete_task\n"
             "- tools/web_search/search.py — search the web\n"
+            "- tools/discord/send_message.py — send a message as the bot to any channel\n"
+            "- tools/discord/get_channel_history.py — fetch recent messages from a channel\n"
+            "- tools/discord/search_messages.py — search messages in the server\n"
+            "- tools/discord/add_role.py / remove_role.py — manage user roles\n"
+            "- tools/discord/list_roles.py — list server roles\n"
+            "- tools/discord/react.py — add a reaction to a message\n"
+            "- tools/discord/pin_message.py — pin/unpin a message\n"
             "- tools/discord/send_webhook.py — send Discord messages via webhook\n"
+            "For reminders: use tools/scheduler/create_task.py --once with a command that calls tools/discord/send_message.py. "
+            "Use the channel_id from [Current context] unless the user specifies a different channel. "
+            "Example: create_task --name 'reminder' --schedule '0 9 30 3 *' --once "
+            "--command 'python tools/discord/send_message.py --channel-id CHAN --content \"<@USER> reminder text\"'\n"
             "Always use these tools when the user's request matches their capabilities instead of making up answers."
         )
         self.system_prompt = self.original_system_prompt
@@ -1016,6 +1027,9 @@ class OllamaBot(discord.Client):
                 system_prompt = override
                 logger.info(f"[TTS-DEBUG] Using personality override for user {last_user_id}")
         prompt = f"System: {system_prompt}\n" + prompt
+
+        # Inject current channel/guild context so tools (reminders, etc.) default to here
+        prompt += f"\n\n[Current context: guild_id={server}, channel_id={channel}]"
 
         # Extract Discord mentions (users, channels, roles) from the last message
         guild = self.get_guild(server)

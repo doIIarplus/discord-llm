@@ -114,8 +114,13 @@ def main():
         if next_run:
             task["next_run"] = next_run
 
-    # Save updated tasks
+    # Remove one-shot tasks that have been executed
     if not args.dry_run and executed:
+        executed_ids = {e["task_id"] for e in executed}
+        tasks = [
+            t for t in tasks
+            if not (t.get("once") and t["task_id"] in executed_ids)
+        ]
         with open(TASKS_FILE, "w") as f:
             json.dump(tasks, f, indent=2, default=str)
 

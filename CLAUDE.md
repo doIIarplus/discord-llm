@@ -180,11 +180,28 @@ Requires SD WebUI running at `SD_API_URL`.
 | `fetch_preview.py CODE [--output-dir DIR]` | Fetch preview image for 6-digit code |
 
 ### Discord (`tools/discord/`)
-Requires webhook URLs in env as `DISCORD_WEBHOOK_<NAME>` (e.g., `DISCORD_WEBHOOK_GENERAL`).
+Requires `DISCORD_BOT_TOKEN` in env. Webhook tools also need `DISCORD_WEBHOOK_<NAME>` URLs.
 
 | Tool | Description |
 |------|-------------|
-| `send_webhook.py --webhook NAME --content TEXT [--username NAME]` | Send message to a Discord channel via webhook. Supports `<@USER_ID>` mentions. |
+| `send_message.py --channel-id ID --content TEXT [--reply-to MSG_ID]` | Send message as the bot to any channel. Supports mentions. |
+| `get_channel_history.py --channel-id ID [--limit N] [--before MSG_ID] [--after MSG_ID] [--user-id ID]` | Fetch recent messages (max 100, default 10) |
+| `search_messages.py --guild-id ID --query TEXT [--channel-id ID] [--author-id ID] [--max-results N]` | Search messages across the server |
+| `add_role.py --guild-id ID --user-id ID --role-id ID` | Add a role to a user |
+| `remove_role.py --guild-id ID --user-id ID --role-id ID` | Remove a role from a user |
+| `list_roles.py --guild-id ID` | List all server roles with IDs |
+| `react.py --channel-id ID --message-id ID --emoji EMOJI` | Add reaction (Unicode or custom name:id) |
+| `pin_message.py --channel-id ID --message-id ID [--unpin]` | Pin or unpin a message |
+| `send_webhook.py --webhook NAME --content TEXT [--username NAME]` | Send message via webhook (different identity). Supports `<@USER_ID>` mentions. |
+
+**Reminder workflow:** Combine scheduler `--once` with `send_message.py`:
+```bash
+python tools/scheduler/create_task.py \
+  --name "reminder-buy-cream-puffs" \
+  --schedule "0 9 30 3 *" \
+  --once \
+  --command "python tools/discord/send_message.py --channel-id 123456 --content '<@118567805678256128> Reminder: buy cream puffs'"
+```
 
 ### RAG Wiki (`tools/rag/`)
 
@@ -199,7 +216,7 @@ For recurring tasks. Optional dependency: `pip install croniter`
 
 | Tool | Description |
 |------|-------------|
-| `create_task.py --name NAME --schedule CRON --command CMD [--description TEXT]` | Create recurring task |
+| `create_task.py --name NAME --schedule CRON --command CMD [--description TEXT] [--once]` | Create task (--once for one-shot reminders that auto-delete after running) |
 | `list_tasks.py [--all]` | List scheduled tasks |
 | `delete_task.py TASK_ID` | Delete a task |
 | `run_due.py [--dry-run]` | Execute due tasks (called by system cron) |

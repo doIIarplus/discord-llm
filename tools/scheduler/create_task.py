@@ -77,6 +77,8 @@ def main():
                         help="Full CLI command to execute when due")
     parser.add_argument("--description", default="",
                         help="Optional longer description")
+    parser.add_argument("--once", action="store_true",
+                        help="Run only once then auto-delete (for one-shot reminders)")
     args = parser.parse_args()
 
     _validate_cron(args.schedule)
@@ -93,6 +95,7 @@ def main():
         "last_run": None,
         "next_run": _next_run(args.schedule),
         "enabled": True,
+        "once": args.once,
     }
 
     tasks.append(task)
