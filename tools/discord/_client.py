@@ -28,6 +28,7 @@ class DiscordClient:
         return {
             "Authorization": f"Bot {self.token}",
             "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://discord.com, 1.0)",
         }
 
     def get(self, endpoint, params=None):
