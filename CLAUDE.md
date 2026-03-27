@@ -223,8 +223,10 @@ For recurring tasks. Optional dependency: `pip install croniter`
 
 **Cron setup for scheduler:**
 ```bash
-* * * * * cd /home/dollarplus/projects/discord_llm_bot && /home/dollarplus/projects/discord_llm_bot/venv/bin/python tools/scheduler/run_due.py >> /tmp/scheduler.log 2>&1
+* * * * * cd /home/dollarplus/projects/discord_llm_bot && /home/dollarplus/projects/discord_llm_bot/venv/bin/python tools/scheduler/run_due.py 2>&1
 ```
+
+Logs are written to `scheduler.log` in the project root. Check it for task execution results, failures, and one-shot task cleanup.
 
 ## File I/O
 
