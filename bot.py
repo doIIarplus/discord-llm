@@ -26,7 +26,8 @@ from config import (
     GUILD_ID,
     IMAGE_RECOGNITION_MODEL,
     CHAT_MODEL,
-    MAX_DISCORD_MESSAGE_LENGTH
+    MAX_DISCORD_MESSAGE_LENGTH,
+    VISION_MODEL_CTX,
 )
 from image_generation import ImageGenerator
 from ollama_client import OllamaClient
@@ -1056,20 +1057,23 @@ class OllamaBot(discord.Client):
                     reset = self.claude_code_client.rate_limit_resets_at or "unknown"
                     print(f"  [Claude Code rate limited, resets at {reset}, falling back to local model]")
                     model = CHAT_MODEL
-                    raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1)
+                    ctx = VISION_MODEL_CTX if images else None
+                    raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1, num_ctx=ctx)
 
                     if raw_response == "No response from Ollama.":
                         return ["No response from Ollama."]
                 except Exception as cc_err:
                     print(f"  [Claude Code error: {cc_err}, falling back to local model]")
                     model = CHAT_MODEL
-                    raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1)
+                    ctx = VISION_MODEL_CTX if images else None
+                    raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1, num_ctx=ctx)
 
                     if raw_response == "No response from Ollama.":
                         return ["No response from Ollama."]
 
             else:
-                raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1)
+                ctx = VISION_MODEL_CTX if images else None
+                raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1, num_ctx=ctx)
 
                 if raw_response == "No response from Ollama.":
                     print("No response from Ollama")

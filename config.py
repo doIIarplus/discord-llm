@@ -58,6 +58,7 @@ OUTPUT_DIR_I2I = os.path.join(OUTPUT_DIR, "img2img")
 
 # Context Configuration
 CONTEXT_LIMIT = 10
+VISION_MODEL_CTX = 32768  # Cap context window for vision models to avoid OOM (default 256K is way too much)
 
 # Discord Message Configuration
 MAX_DISCORD_MESSAGE_LENGTH = 1900

@@ -112,6 +112,7 @@ async def _extract_with_vision(screenshot_b64: str) -> str:
         "prompt": _VISION_EXTRACT_PROMPT,
         "images": [screenshot_b64],
         "stream": False,
+        "options": {"num_ctx": 32768},
     }
 
     try:

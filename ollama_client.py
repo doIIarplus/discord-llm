@@ -27,12 +27,16 @@ class OllamaClient:
         model: str = CHAT_MODEL,
         images: Optional[List[str]] = None,
         keep_alive: Optional[int] = None,
+        num_ctx: Optional[int] = None,
     ) -> str:
         """Generate a response from Ollama.
 
         Args:
             keep_alive: Ollama keep_alive value. -1 = stay loaded forever,
                         None = use Ollama's default timeout.
+            num_ctx: Context window size. Defaults to None (Ollama model default).
+                     Set explicitly for vision models to avoid allocating huge
+                     KV caches (e.g. qwen3-vl defaults to 256K).
         """
         try:
             payload = {
@@ -43,6 +47,9 @@ class OllamaClient:
 
             if keep_alive is not None:
                 payload["keep_alive"] = keep_alive
+
+            if num_ctx is not None:
+                payload["options"] = {"num_ctx": num_ctx}
 
             if images:
                 payload["images"] = images
@@ -174,5 +181,5 @@ class OllamaClient:
         user_prompt = "Is this image NSFW?"
         full_prompt = f"System: {system_prompt}\nUser: {user_prompt}\nAssistant: "
 
-        response = await self.generate(full_prompt, model=NSFW_CLASSIFICATION_MODEL, images=images)
+        response = await self.generate(full_prompt, model=NSFW_CLASSIFICATION_MODEL, images=images, num_ctx=2048)
         return "nsfw" in response.lower()
