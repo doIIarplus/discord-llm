@@ -42,6 +42,7 @@ from mention_extractor import extract_mention_context
 from response_splitter import split_response_by_markers, split_response_by_paragraphs, split_long_message, calculate_typing_delay
 from sandbox import safe_path, SandboxViolation
 from plugin_base import HookType
+import chat_history
 from plugin_manager import PluginManager
 
 # charlie was here
@@ -261,7 +262,7 @@ class OllamaBot(discord.Client):
                         f"```\n{error_display}\n```"
                     )
                     from commands import CrashFixView
-                    view = CrashFixView(self, logs)
+                    view = CrashFixView(self)
                     await channel.send("want me to try to fix it?", view=view)
                 else:
                     print(f"Crash detected (exit {exit_code}) but no last active channel to report to")
@@ -296,6 +297,9 @@ class OllamaBot(discord.Client):
         # Ignore DMs (no guild)
         if message.guild is None:
             return
+
+        # Record to persistent chat history (before any early returns)
+        await chat_history.record_message(message)
 
         server = message.guild.id
         channel = message.channel.id
@@ -526,17 +530,17 @@ class OllamaBot(discord.Client):
         # Check if any plugin wants to suppress text BEFORE dispatching hooks
         # (e.g. TTS voice mode — we don't want to send text then audio)
         suppress_text = self.plugin_manager.should_suppress_text(message)
-        logger.info(f"[TTS-DEBUG] suppress_text={suppress_text} for user={message.author.id} "
+        logger.debug(f"[TTS-DEBUG] suppress_text={suppress_text} for user={message.author.id} "
                      f"(voice_mode check before POST_QUERY hook)")
 
         # Dispatch POST_QUERY hook (e.g. TTS voice mode generates + sends audio)
-        logger.info(f"[TTS-DEBUG] Dispatching POST_QUERY hook, full_text length={len(full_text)}")
+        logger.debug(f"[TTS-DEBUG] Dispatching POST_QUERY hook, full_text length={len(full_text)}")
         hook_results = await self.plugin_manager.dispatch_hook(
             HookType.POST_QUERY,
             message=message,
             response_text=full_text,
         )
-        logger.info(f"[TTS-DEBUG] POST_QUERY hook returned {len(hook_results)} results: {hook_results}")
+        logger.debug(f"[TTS-DEBUG] POST_QUERY hook returned {len(hook_results)} results: {hook_results}")
 
         match = _EDIT_CODE_TAG.search(full_text)
         if match:
@@ -576,7 +580,7 @@ class OllamaBot(discord.Client):
                     all_parts.append(f"-# Sources: {' | '.join(source_links)}")
 
         # Send text parts with typing delays (unless a hook suppressed text, e.g. voice mode)
-        logger.info(f"[TTS-DEBUG] About to send text. suppress_text={suppress_text}, "
+        logger.debug(f"[TTS-DEBUG] About to send text. suppress_text={suppress_text}, "
                      f"all_parts count={len(all_parts)}")
         if not suppress_text:
             for i, part in enumerate(all_parts):
@@ -586,7 +590,18 @@ class OllamaBot(discord.Client):
                     await asyncio.sleep(delay)
 
                 print(f"Sending response part {i+1}/{len(all_parts)}: {part[:50]}...")
-                await message.channel.send(part)
+                sent_msg = await message.channel.send(part)
+
+                # Record bot response to persistent chat history
+                await chat_history.record_bot_response(
+                    guild_id=server,
+                    channel_id=channel,
+                    bot_user_id=self.user.id,
+                    bot_name=self.user.display_name,
+                    content=part,
+                    message_id=sent_msg.id,
+                    reply_to_message_id=message.id if i == 0 else None,
+                )
 
                 if i < len(all_parts) - 1:
                     await asyncio.sleep(random.uniform(0.3, 0.8))
@@ -597,7 +612,7 @@ class OllamaBot(discord.Client):
                     file = discord.File(response_item["image"])
                     await message.channel.send(file=file)
         else:
-            logger.info(f"[TTS-DEBUG] Text suppressed — skipping {len(all_parts)} text parts")
+            logger.debug(f"[TTS-DEBUG] Text suppressed — skipping {len(all_parts)} text parts")
 
         # If the LLM decided a code edit is needed, trigger it
         if edit_instruction:
@@ -609,8 +624,6 @@ class OllamaBot(discord.Client):
         Routes to plugin-scoped edit when the instruction looks like a new feature
         or plugin modification. Falls back to core edit (with restart) otherwise.
         """
-        log_context = self._read_recent_logs()
-
         # Detect if this should be a plugin edit
         plugin_keywords = [
             "plugin", "add feature", "new command", "add command", "add a command",
@@ -626,15 +639,15 @@ class OllamaBot(discord.Client):
 
         if is_plugin_edit:
             await self._execute_plugin_change(
-                message.channel, message.author.id, instruction, log_context
+                message.channel, message.author.id, instruction
             )
         else:
             await self._execute_code_change_with_logs(
-                message.channel, message.author.id, instruction, log_context
+                message.channel, message.author.id, instruction
             )
 
     async def _execute_plugin_change(
-        self, channel, author_id: int, instruction: str, log_context: str = ""
+        self, channel, author_id: int, instruction: str
     ):
         """Run Claude Code scoped to plugin files, show diff, offer hot-reload."""
         project_dir = os.path.dirname(os.path.abspath(__file__))
@@ -660,7 +673,6 @@ class OllamaBot(discord.Client):
                 response, exit_code = await self.claude_code_client.run_plugin_edit(
                     instruction,
                     model=self.active_model,
-                    log_context=log_context,
                     existing_plugins=self.plugin_manager.plugin_names,
                 )
         except RateLimitError:
@@ -763,9 +775,9 @@ class OllamaBot(discord.Client):
         await channel.send(label, view=view)
 
     async def _execute_code_change_with_logs(
-        self, channel, author_id: int, instruction: str, log_context: str = ""
+        self, channel, author_id: int, instruction: str
     ):
-        """Run Claude Code to modify bot source with log context, show diff, offer apply/revert."""
+        """Run Claude Code to modify bot source, show diff, offer apply/revert."""
         # Git snapshot for safety
         project_dir = os.path.dirname(os.path.abspath(__file__))
         proc = await asyncio.create_subprocess_exec(
@@ -786,7 +798,7 @@ class OllamaBot(discord.Client):
         try:
             async with channel.typing():
                 response, exit_code = await self.claude_code_client.run_code_edit(
-                    instruction, model=self.active_model, log_context=log_context
+                    instruction, model=self.active_model
                 )
         except RateLimitError:
             reset = self.claude_code_client.rate_limit_resets_at or "unknown"
@@ -1026,8 +1038,13 @@ class OllamaBot(discord.Client):
             override = self.plugin_manager.get_system_prompt_override(last_user_id)
             if override:
                 system_prompt = override
-                logger.info(f"[TTS-DEBUG] Using personality override for user {last_user_id}")
+                logger.debug(f"[TTS-DEBUG] Using personality override for user {last_user_id}")
         prompt = f"System: {system_prompt}\n" + prompt
+
+        # Inject persistent memory (user profiles + recent server events)
+        memory_context = chat_history.get_memory_context(str(server), channel_id=str(channel))
+        if memory_context:
+            prompt = f"{prompt}\n\n{memory_context}"
 
         # Inject current channel/guild context so tools (reminders, etc.) default to here
         prompt += f"\n\n[Current context: guild_id={server}, channel_id={channel}]"

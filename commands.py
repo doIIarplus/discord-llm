@@ -264,22 +264,20 @@ class PluginApplyView(discord.ui.View):
 class CrashFixView(discord.ui.View):
     """Offer to auto-fix a crash based on log output."""
 
-    def __init__(self, bot, log_context: str):
+    def __init__(self, bot):
         super().__init__(timeout=300)
         self.bot = bot
-        self.log_context = log_context
 
     @discord.ui.button(label="Fix this bug", style=discord.ButtonStyle.green)
     async def fix(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="looking at the logs and trying to fix it...", view=None)
         instruction = (
-            "The bot crashed or encountered an error. Fix the bug based on the error in the logs. "
+            "The bot crashed or encountered an error. Read bot.log to find the error/traceback and fix the bug. "
             "If the fix is obvious from the traceback, just fix it. If the error is environmental "
             "(network, DNS, etc.) and not a code bug, say so instead of making changes."
         )
-        # Reuse the code change flow — this creates a snapshot, runs Claude Code, shows diff
         await self.bot._execute_code_change_with_logs(
-            interaction.channel, interaction.user.id, instruction, self.log_context
+            interaction.channel, interaction.user.id, instruction
         )
 
     @discord.ui.button(label="Ignore", style=discord.ButtonStyle.grey)

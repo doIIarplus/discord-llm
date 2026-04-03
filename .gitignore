@@ -6,3 +6,12 @@ venv/
 output.txt
 .env
 chroma_db/
+
+# State / runtime data
+*.db
+*.db-shm
+*.db-wal
+*.log
+bot_state.json
+tools/scheduler/tasks.json
+tools/scheduler/tasks.json.lock

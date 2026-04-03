@@ -368,7 +368,6 @@ class ClaudeCodeClient:
         instruction: str,
         model: str = "opus",
         timeout: float = 600.0,
-        log_context: str = "",
     ) -> Tuple[str, int]:
         """Run Claude Code CLI with file editing permissions, scoped to project dir.
 
@@ -397,13 +396,6 @@ class ClaudeCodeClient:
             "--allowedTools", "Read,Write,Edit,Glob,Grep",
         ]
 
-        log_section = ""
-        if log_context:
-            log_section = (
-                f"\n\nRECENT BOT LOGS (use these to diagnose the issue):\n"
-                f"```\n{log_context}\n```\n"
-            )
-
         full_prompt = (
             f"You are modifying a Discord bot project at {PROJECT_DIR}. "
             f"IMPORTANT RULES:\n"
@@ -415,8 +407,8 @@ class ClaudeCodeClient:
             f"- Any file I/O in generated code MUST use safe_path() from sandbox.py to validate paths. "
             f"Import it with: from sandbox import safe_path\n"
             f"- After making changes, briefly describe what you changed.\n"
-            f"{log_section}\n"
-            f"User request: {instruction}"
+            f"- If debugging, read bot.log in the project root for recent logs.\n"
+            f"\nUser request: {instruction}"
         )
 
         env = self._build_env(model)
@@ -506,7 +498,6 @@ class ClaudeCodeClient:
         instruction: str,
         model: str = "opus",
         timeout: float = 600.0,
-        log_context: str = "",
         existing_plugins: List[str] = None,
     ) -> Tuple[str, int]:
         """Run Claude Code CLI scoped to plugin files only.
@@ -542,13 +533,6 @@ class ClaudeCodeClient:
             f"  - plugins/{p}.py" for p in (existing_plugins or [])
         )
 
-        log_section = ""
-        if log_context:
-            log_section = (
-                f"\n\nRECENT BOT LOGS (use these to diagnose issues):\n"
-                f"```\n{log_context}\n```\n"
-            )
-
         full_prompt = (
             f"You are modifying a Discord bot's PLUGIN system at {PROJECT_DIR}.\n\n"
             f"PLUGIN SYSTEM RULES:\n"
@@ -562,10 +546,10 @@ class ClaudeCodeClient:
             f"- Any file I/O in generated code MUST use safe_path() from sandbox.py.\n"
             f"- After creating/modifying a plugin, it will be hot-reloaded (no restart needed).\n"
             f"- After making changes, briefly describe what you changed.\n"
+            f"- If debugging, read bot.log in the project root for recent logs.\n"
             f"\n"
             f"EXISTING PLUGINS:\n{plugin_list or '  (none yet)'}\n"
-            f"{log_section}\n"
-            f"User request: {instruction}"
+            f"\nUser request: {instruction}"
         )
 
         env = self._build_env(model)

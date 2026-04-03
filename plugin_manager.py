@@ -320,7 +320,7 @@ class PluginManager:
                 continue
             if hasattr(instance, "suppress_text"):
                 result = instance.suppress_text(message)
-                logger.info(f"[TTS-DEBUG] {name}.suppress_text() = {result} "
+                logger.debug(f"[TTS-DEBUG] {name}.suppress_text() = {result} "
                             f"for user {message.author.id}")
                 if result:
                     return True

@@ -66,6 +66,10 @@ asyncio.run(t())
 - **[wiki_parser.py](wiki_parser.py)** — Parses MediaWiki XML exports into chunks for indexing.
 - **[chroma_db/](chroma_db/)** — Persistent ChromaDB storage (collection: `maplestory_wiki`).
 
+### Memory System
+- **[chat_history.py](chat_history.py)** — Persistent chat history and memory. Records all Discord messages to `chat_history.db` (SQLite). Provides `get_memory_context()` which returns user profiles and recent server events for prompt injection.
+- **[tools/memory/summarize.py](tools/memory/summarize.py)** — Scheduled summarizer. Reads new messages from `chat_history.db`, calls Claude (Sonnet) to analyze them, and writes user profiles and server events back to the DB. Self-gates: only runs when there are new messages AND the server has been idle for 60+ minutes.
+
 ### Supporting
 - **[stable_diffusion_client.py](stable_diffusion_client.py)** — HTTP client for the Automatic1111 SD WebUI API (`/sdapi/v1/txt2img`).
 - **[utils.py](utils.py)** — Image-to-base64 helpers.
@@ -228,6 +232,14 @@ For recurring tasks. Optional dependency: `pip install croniter`
 
 Logs are written to `scheduler.log` in the project root. Check it for task execution results, failures, and one-shot task cleanup.
 
+### Memory (`tools/memory/`)
+
+| Tool | Description |
+|------|-------------|
+| `summarize.py --guild-id ID [--dry-run] [--force]` | Summarize new chat history into user profiles and events. Self-gates on idle time (60m) and new messages. Use --force to skip idle check. |
+
+The summarizer is registered as a scheduled task running every 5 minutes. Most invocations exit immediately (no new messages or server still active). When it does run, it calls Claude Sonnet to analyze messages and update `chat_history.db`.
+
 ## File I/O
 
 - Uploaded attachments temporarily saved to `multimodal_input/`, deleted after processing
@@ -235,3 +247,4 @@ Logs are written to `scheduler.log` in the project root. Check it for task execu
 - LaTeX renders saved to `latex_images/` (if latex rendering is re-enabled)
 - RAG vector DB: `chroma_db/`
 - Scheduler tasks: `tools/scheduler/tasks.json`
+- Chat history & memory: `chat_history.db` (messages, user profiles, server events, summarizer state)

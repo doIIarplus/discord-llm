@@ -63,6 +63,17 @@ VISION_MODEL_CTX = 32768  # Cap context window for vision models to avoid OOM (d
 # Discord Message Configuration
 MAX_DISCORD_MESSAGE_LENGTH = 1900
 
+# Memory / Chat History
+MEMORY_SUMMARIZE_BATCH_SIZE = 200   # Max messages per summarization batch
+MEMORY_MAX_PROFILE_EVENTS = 10      # Max recent events injected into prompt
+MEMORY_IDLE_MINUTES = 60            # Summarize only after this many minutes of inactivity
+# Channel allowlist for chat history recording. Empty list = record ALL channels.
+# Set via comma-separated channel IDs in .env: MEMORY_CHANNEL_ALLOWLIST=123,456,789
+_allowlist_raw = os.getenv("MEMORY_CHANNEL_ALLOWLIST", "")
+MEMORY_CHANNEL_ALLOWLIST: set = set(
+    cid.strip() for cid in _allowlist_raw.split(",") if cid.strip()
+)
+
 # Create output directories
 os.makedirs(OUTPUT_DIR_T2I, exist_ok=True)
 os.makedirs(OUTPUT_DIR_I2I, exist_ok=True)

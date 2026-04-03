@@ -205,7 +205,7 @@ class TTSPlugin(BasePlugin):
     def suppress_text(self, message) -> bool:
         """Tell the bot to skip text output when voice mode is on."""
         result = self._get_voice_mode(message.author.id)
-        self.logger.info(f"[TTS-DEBUG] suppress_text check: user={message.author.id}, "
+        self.logger.debug(f"[TTS-DEBUG] suppress_text check: user={message.author.id}, "
                          f"voice_mode={result}, prefs={self._user_prefs.get(message.author.id)}")
         return result
 
@@ -310,7 +310,7 @@ class TTSPlugin(BasePlugin):
             self._set_pref(message.author.id, voice_mode=True)
             voice = self._get_user_voice(message.author.id)
 
-            self.logger.info(f"[TTS-DEBUG] Voice mode ON for user={message.author.id}, "
+            self.logger.debug(f"[TTS-DEBUG] Voice mode ON for user={message.author.id}, "
                              f"voice={voice}, prefs={self._user_prefs[message.author.id]}")
             await message.channel.send(f"voice mode on (voice: {voice})")
             return True
@@ -318,7 +318,7 @@ class TTSPlugin(BasePlugin):
         if sub == "off":
             self._set_pref(message.author.id, voice_mode=False)
 
-            self.logger.info(f"[TTS-DEBUG] Voice mode OFF for user={message.author.id}, "
+            self.logger.debug(f"[TTS-DEBUG] Voice mode OFF for user={message.author.id}, "
                              f"prefs={self._user_prefs[message.author.id]}")
             await message.channel.send("voice mode off")
             return True
@@ -397,15 +397,15 @@ class TTSPlugin(BasePlugin):
 
     async def _on_post_query(self, message, response_text, **kwargs):
         voice_mode = self._get_voice_mode(message.author.id)
-        self.logger.info(f"[TTS-DEBUG] _on_post_query: user={message.author.id}, "
+        self.logger.debug(f"[TTS-DEBUG] _on_post_query: user={message.author.id}, "
                          f"voice_mode={voice_mode}, text_len={len(response_text)}")
         if not voice_mode:
             return None
         # Strip ---MSG--- markers and other non-speech artifacts
         clean_text = response_text.replace("---MSG---", " ").strip()
         clean_text = " ".join(clean_text.split())  # collapse whitespace
-        self.logger.info(f"[TTS-DEBUG] Generating voice message, clean_text={clean_text[:80]!r}...")
+        self.logger.debug(f"[TTS-DEBUG] Generating voice message, clean_text={clean_text[:80]!r}...")
         await self._generate_voice_message(
             message.channel.id, clean_text, message.author.id,
         )
-        self.logger.info(f"[TTS-DEBUG] Voice message sent successfully")
+        self.logger.debug(f"[TTS-DEBUG] Voice message sent successfully")

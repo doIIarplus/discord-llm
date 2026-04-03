@@ -1,0 +1,14 @@
+[
+  {
+    "task_id": "example123",
+    "name": "Example task",
+    "description": "This is a placeholder. Copy to tasks.json and modify.",
+    "schedule": "0 9 * * *",
+    "command": "echo 'hello'",
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "last_run": null,
+    "next_run": null,
+    "enabled": false,
+    "once": false
+  }
+]
