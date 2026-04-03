@@ -72,13 +72,10 @@ def main():
     except BlockingIOError:
         _logger.warning("Another instance is already running, skipping")
         lock_fd.close()
-        output({"executed": [], "message": "Locked by another instance"})
         return
 
     if not os.path.exists(TASKS_FILE):
-        _logger.debug("No tasks file found")
         lock_fd.close()
-        output({"executed": [], "message": "No tasks file"})
         return
 
     with open(TASKS_FILE) as f:
@@ -183,7 +180,8 @@ def main():
             json.dump(tasks, f, indent=2, default=str)
 
     lock_fd.close()
-    output({"executed": executed})
+    if executed:
+        output({"executed": executed})
 
 
 if __name__ == "__main__":

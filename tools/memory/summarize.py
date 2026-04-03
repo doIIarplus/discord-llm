@@ -91,10 +91,7 @@ def _build_summarization_prompt(messages: list, existing_profiles: list, existin
             profile_lines.append({
                 "user_id": p["user_id"],
                 "user_name": p["user_name"],
-                "profile_summary": p["profile_summary"],
-                "likes": p["likes"],
-                "dislikes": p["dislikes"],
-                "personality_traits": p["personality_traits"],
+                "profile": p["profile"],
             })
         profiles_section = json.dumps(profile_lines, indent=2)
 
@@ -107,7 +104,6 @@ def _build_summarization_prompt(messages: list, existing_profiles: list, existin
                 "channel_id": c["channel_id"],
                 "channel_name": c["channel_name"],
                 "summary": c["summary"],
-                "active_topics": c["active_topics"],
             })
         channels_section = json.dumps(channel_lines, indent=2)
 
@@ -131,7 +127,7 @@ def _build_summarization_prompt(messages: list, existing_profiles: list, existin
         msg_parts.extend(lines)
     messages_section = "\n".join(msg_parts)
 
-    return f"""You are analyzing Discord chat history to maintain persistent memory across three dimensions: per-user profiles, per-channel summaries, and notable server events.
+    return f"""You are analyzing Discord chat history to build rich, detailed persistent memory. This memory will be injected into a 1M-context LLM prompt, so do NOT compress or abbreviate — be thorough and specific.
 
 ## Existing User Profiles
 {profiles_section}
@@ -143,44 +139,62 @@ def _build_summarization_prompt(messages: list, existing_profiles: list, existin
 {messages_section}
 
 ## Instructions
-1. UPDATE each user's profile based on new evidence. Merge with existing data — do not discard prior observations unless contradicted. For new users, create a profile.
-2. UPDATE each channel's summary based on new messages in that channel. Describe what the channel is typically used for, its tone, and current active topics. For new channels, create a summary.
-3. Identify any notable EVENTS (group decisions, arguments, celebrations, inside jokes, plans, interesting discussions). Do NOT create events for mundane conversation.
-4. Keep everything concise but informative.
-5. Do NOT include the bot's own profile.
-6. For channel_name, use a descriptive name if you can infer it from context, otherwise use the channel_id.
 
-Output ONLY valid JSON in this exact format (no markdown, no explanation):
+### User Profiles
+Write a detailed, multi-paragraph profile for each user. Merge new observations with existing profiles — preserve everything that isn't contradicted. Cover:
+- **Identity & role**: Who they are in the server, how active they are, when they're usually around
+- **Personality & communication style**: How they talk, their humor, their tone (sarcastic? earnest? terse?), typical message length, emoji/slang usage
+- **Interests & opinions**: What they care about, specific preferences (not just "likes anime" but "loves chainsaw man, thinks jjk ending was mid, refuses to watch dubbed")
+- **Relationships & dynamics**: How they interact with specific other users, recurring bits or inside jokes between them, who they agree/disagree with
+- **Behavioral patterns**: Do they start debates? Lurk and then drop hot takes? Always respond to certain topics? Ask the bot for specific things?
+- **Notable history**: Key things they've said or done that reveal character
+
+Do NOT include the bot's own profile.
+
+### Channel Summaries
+Write a detailed summary for each channel covering:
+- **Purpose & typical content**: What the channel is used for
+- **Tone & culture**: Formal? Chaotic? Memey? Supportive?
+- **Active topics**: What's being discussed recently (be specific — names, titles, details)
+- **Regular participants**: Who's most active here and what role they play in the channel's dynamic
+- **Recurring patterns**: Regular activities, running jokes, typical conversation flows
+
+### Server Events
+Identify notable events — things worth remembering long-term:
+- Group decisions, plans, commitments
+- Arguments or debates with clear positions taken
+- Celebrations, milestones, announcements
+- Inside jokes being born or referenced
+- Anything that would help the bot understand "what happened" if someone asks later
+
+Do NOT log mundane conversation (greetings, "lol", routine bot commands).
+
+Output ONLY valid JSON (no markdown fences, no explanation):
 {{
   "user_profiles": [
     {{
       "user_id": "123",
       "user_name": "display_name",
-      "profile_summary": "Brief personality and behavior summary",
-      "likes": "things they enjoy, comma-separated",
-      "dislikes": "things they dislike, comma-separated",
-      "personality_traits": "key traits, comma-separated"
+      "profile": "Detailed multi-paragraph profile text..."
     }}
   ],
   "channel_summaries": [
     {{
       "channel_id": "456",
       "channel_name": "general",
-      "summary": "What this channel is used for and its general vibe",
-      "active_topics": "current/recent discussion topics, comma-separated"
+      "summary": "Detailed multi-paragraph channel summary..."
     }}
   ],
   "events": [
     {{
-      "event_summary": "What happened",
+      "event_summary": "Detailed description of what happened and why it matters",
       "participants": ["user_id1", "user_id2"],
-      "occurred_at": "ISO timestamp of when it happened",
+      "occurred_at": "ISO timestamp",
       "source_message_ids": ["msg_id1", "msg_id2"]
     }}
   ]
 }}
 
-If there are no notable events, return an empty events array.
 Include ALL users and channels that appeared in the messages."""
 
 
@@ -309,10 +323,7 @@ async def _run_summarization(guild_id: str, dry_run: bool = False):
             guild_id=guild_id,
             user_id=profile["user_id"],
             user_name=profile["user_name"],
-            profile_summary=profile.get("profile_summary", ""),
-            likes=profile.get("likes", ""),
-            dislikes=profile.get("dislikes", ""),
-            personality_traits=profile.get("personality_traits", ""),
+            profile=profile.get("profile", ""),
         )
         profiles_updated += 1
 
@@ -324,7 +335,6 @@ async def _run_summarization(guild_id: str, dry_run: bool = False):
             channel_id=ch["channel_id"],
             channel_name=ch.get("channel_name", ch["channel_id"]),
             summary=ch.get("summary", ""),
-            active_topics=ch.get("active_topics", ""),
         )
         channels_updated += 1
 

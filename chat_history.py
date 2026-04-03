@@ -23,7 +23,7 @@ def _get_conn() -> sqlite3.Connection:
     """Get or create the module-level DB connection."""
     global _conn
     if _conn is None:
-        _conn = sqlite3.connect(DB_PATH)
+        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=NORMAL")
@@ -59,10 +59,7 @@ def _init_schema(conn: sqlite3.Connection):
             guild_id TEXT NOT NULL,
             user_id TEXT NOT NULL,
             user_name TEXT NOT NULL,
-            profile_summary TEXT NOT NULL DEFAULT '',
-            likes TEXT NOT NULL DEFAULT '',
-            dislikes TEXT NOT NULL DEFAULT '',
-            personality_traits TEXT NOT NULL DEFAULT '',
+            profile TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL,
             UNIQUE(guild_id, user_id)
         );
@@ -87,8 +84,6 @@ def _init_schema(conn: sqlite3.Connection):
             channel_id TEXT NOT NULL,
             channel_name TEXT NOT NULL DEFAULT '',
             summary TEXT NOT NULL DEFAULT '',
-            active_topics TEXT NOT NULL DEFAULT '',
-            typical_participants TEXT,
             updated_at TEXT NOT NULL,
             UNIQUE(guild_id, channel_id)
         );
@@ -340,26 +335,20 @@ def upsert_user_profile(
     guild_id: str,
     user_id: str,
     user_name: str,
-    profile_summary: str,
-    likes: str = "",
-    dislikes: str = "",
-    personality_traits: str = "",
+    profile: str,
 ):
     """Insert or update a user profile."""
     conn = _get_conn()
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """INSERT INTO user_profiles
-               (guild_id, user_id, user_name, profile_summary, likes, dislikes, personality_traits, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               (guild_id, user_id, user_name, profile, updated_at)
+           VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(guild_id, user_id) DO UPDATE SET
                user_name = excluded.user_name,
-               profile_summary = excluded.profile_summary,
-               likes = excluded.likes,
-               dislikes = excluded.dislikes,
-               personality_traits = excluded.personality_traits,
+               profile = excluded.profile,
                updated_at = excluded.updated_at""",
-        (guild_id, user_id, user_name, profile_summary, likes, dislikes, personality_traits, now),
+        (guild_id, user_id, user_name, profile, now),
     )
     conn.commit()
 
@@ -425,27 +414,19 @@ def upsert_channel_summary(
     channel_id: str,
     channel_name: str,
     summary: str,
-    active_topics: str = "",
-    typical_participants: Optional[List[str]] = None,
 ):
     """Insert or update a channel summary."""
     conn = _get_conn()
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """INSERT INTO channel_summaries
-               (guild_id, channel_id, channel_name, summary, active_topics, typical_participants, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+               (guild_id, channel_id, channel_name, summary, updated_at)
+           VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(guild_id, channel_id) DO UPDATE SET
                channel_name = excluded.channel_name,
                summary = excluded.summary,
-               active_topics = excluded.active_topics,
-               typical_participants = excluded.typical_participants,
                updated_at = excluded.updated_at""",
-        (
-            guild_id, channel_id, channel_name, summary, active_topics,
-            json.dumps(typical_participants) if typical_participants else None,
-            now,
-        ),
+        (guild_id, channel_id, channel_name, summary, now),
     )
     conn.commit()
 
@@ -473,24 +454,16 @@ def get_memory_context(guild_id: str, channel_id: str = None, max_events: int = 
     if profiles:
         lines = ["[Memory — User Profiles]"]
         for p in profiles:
-            line = f"- {p['user_name']} (id={p['user_id']}): {p['profile_summary']}"
-            if p.get("likes"):
-                line += f" Likes: {p['likes']}."
-            if p.get("dislikes"):
-                line += f" Dislikes: {p['dislikes']}."
-            if p.get("personality_traits"):
-                line += f" Traits: {p['personality_traits']}."
-            lines.append(line)
+            lines.append(f"\n### {p['user_name']} (id={p['user_id']})")
+            lines.append(p["profile"])
         parts.append("\n".join(lines))
 
     if channels:
         lines = ["[Memory — Channel Summaries]"]
         for c in channels:
-            prefix = "(current) " if channel_id and c["channel_id"] == channel_id else ""
-            line = f"- #{c['channel_name']} {prefix}: {c['summary']}"
-            if c.get("active_topics"):
-                line += f" Topics: {c['active_topics']}."
-            lines.append(line)
+            current = " (CURRENT CHANNEL)" if channel_id and c["channel_id"] == channel_id else ""
+            lines.append(f"\n### #{c['channel_name']}{current}")
+            lines.append(c["summary"])
         parts.append("\n".join(lines))
 
     if events:
