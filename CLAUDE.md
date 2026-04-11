@@ -176,6 +176,7 @@ Requires SD WebUI running at `SD_API_URL`.
 | Tool | Description |
 |------|-------------|
 | `generate.py --prompt TEXT [--negative-prompt TEXT] [--width N] [--height N] [--cfg-scale F] [--steps N] [--seed N]` | Generate image, returns file path |
+| `start_server.py [--sd-url URL] [--chromaforge-dir PATH]` | Start the ChromaForge/SD WebUI server if not already running |
 
 ### nhentai (`tools/nhentai/`)
 
