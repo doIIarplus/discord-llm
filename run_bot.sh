@@ -57,6 +57,7 @@ run_bot() {
         --dev /dev
         --proc /proc
         --tmpfs /tmp
+        --bind /tmp/tmux-$(id -u) /tmp/tmux-$(id -u)
         --bind "$SCRIPT_DIR" "$SCRIPT_DIR"
         --bind "$HOME_DIR/.claude" "$HOME_DIR/.claude"
         --bind "$HOME_DIR/.local/share/claude" "$HOME_DIR/.local/share/claude"
@@ -89,6 +90,19 @@ run_bot() {
     bwrap "${BWRAP_ARGS[@]}" -- python bot.py 2>&1 | tee -a "$LOG_FILE"
     return "${PIPESTATUS[0]}"
 }
+
+# Start Claude Code PTY session outside the sandbox (if enabled)
+if grep -qiE '^CLAUDE_USE_PTY=(1|true|yes)' "$SCRIPT_DIR/.env" 2>/dev/null; then
+    if ! tmux has-session -t claude_bot 2>/dev/null; then
+        echo "[pty] Starting Claude Code tmux session..."
+        tmux new-session -d -s claude_bot -x 200 -y 50 \
+            "$HOME/.local/bin/claude --dangerously-skip-permissions --model opus"
+        sleep 8  # Wait for Claude Code to initialize
+        echo "[pty] Session started — attach with: tmux attach -t claude_bot -r"
+    else
+        echo "[pty] Reusing existing Claude Code tmux session"
+    fi
+fi
 
 while true; do
     echo "[$(date)] Starting bot..."

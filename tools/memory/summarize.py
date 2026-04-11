@@ -39,16 +39,22 @@ from chat_history import (
     get_latest_message_id,
     has_new_messages_since,
     get_user_profiles,
+    get_user_aliases,
     get_channel_summaries,
+    get_channel_name,
     upsert_user_profile,
     upsert_channel_summary,
     insert_server_event,
     update_summarizer_state,
+    update_friendliness_score,
 )
-from config import MEMORY_SUMMARIZE_BATCH_SIZE, MEMORY_IDLE_MINUTES
+from config import (
+    MEMORY_SUMMARIZE_BATCH_SIZE, MEMORY_IDLE_MINUTES,
+    MEMORY_MAX_PROFILE_CHARS, MEMORY_MAX_CHANNEL_CHARS, MEMORY_MAX_EVENTS,
+)
 
-# Claude CLI path
-CLAUDE_CLI = "claude"
+# Claude CLI path — use absolute path for cron compatibility
+CLAUDE_CLI = os.path.expanduser("~/.local/bin/claude")
 
 
 def _should_run(guild_id: str) -> dict:
@@ -83,6 +89,21 @@ def _should_run(guild_id: str) -> dict:
 
 def _build_summarization_prompt(messages: list, existing_profiles: list, existing_channels: list) -> str:
     """Build the prompt for Claude to analyze messages and update profiles/channel summaries."""
+    aliases = get_user_aliases()
+
+    # Format known aliases section
+    aliases_section = ""
+    if aliases:
+        alias_lines = []
+        for uid, info in aliases.items():
+            real = info.get("real", "") if isinstance(info, dict) else info
+            preferred = info.get("preferred", "") if isinstance(info, dict) else ""
+            if preferred and preferred != real:
+                alias_lines.append(f"- User ID {uid}: real name is {real}, prefers to be called {preferred}")
+            else:
+                alias_lines.append(f"- User ID {uid}: real name is {real}")
+        aliases_section = "\n## Known Real Names\nUse real names in profiles for identification, but note their preferred name.\n" + "\n".join(alias_lines) + "\n"
+
     # Format existing profiles
     profiles_section = "None yet — create initial profiles from the messages below."
     if existing_profiles:
@@ -92,6 +113,7 @@ def _build_summarization_prompt(messages: list, existing_profiles: list, existin
                 "user_id": p["user_id"],
                 "user_name": p["user_name"],
                 "profile": p["profile"],
+                "current_friendliness_score": float(p.get("friendliness_score") or 0.0),
             })
         profiles_section = json.dumps(profile_lines, indent=2)
 
@@ -117,72 +139,52 @@ def _build_summarization_prompt(messages: list, existing_profiles: list, existin
         reply = ""
         if m.get("reply_to_message_id"):
             reply = f" (replying to msg {m['reply_to_message_id']})"
-        channels_in_messages[cid].append(
-            f"[{ts}] {m['author_name']} (id={m['author_id']}){reply}: {m['content']}"
-        )
+        line = f"[{ts}] {m['author_name']} (id={m['author_id']}){reply}: {m['content']}"
+        if m.get("image_summary"):
+            line += f" [attached image: {m['image_summary']}]"
+        channels_in_messages[cid].append(line)
 
     msg_parts = []
     for cid, lines in channels_in_messages.items():
-        msg_parts.append(f"### Channel {cid}")
+        name = get_channel_name(messages[0]["guild_id"], cid) or cid
+        msg_parts.append(f"### #{name} (channel_id={cid})")
         msg_parts.extend(lines)
     messages_section = "\n".join(msg_parts)
 
-    return f"""You are analyzing Discord chat history to build rich, detailed persistent memory. This memory will be injected into a 1M-context LLM prompt, so do NOT compress or abbreviate — be thorough and specific.
-
+    return f"""Analyze Discord chat history. Update user profiles and channel summaries. Identify notable events.
+{aliases_section}
 ## Existing User Profiles
 {profiles_section}
 
 ## Existing Channel Summaries
 {channels_section}
 
-## New Messages Since Last Analysis
+## New Messages
 {messages_section}
 
 ## Instructions
+- Merge new observations into existing profiles. Preserve what isn't contradicted.
+- Cover: personality, communication style, interests, relationships with others, notable behavior.
+- Keep profiles 2-4 paragraphs. Be specific (names, details) not generic.
+- Update channel summaries with recent topics and tone.
+- Log notable events (decisions, debates, milestones, inside jokes). Skip mundane chat.
+- Do NOT include the bot's own profile.
+- For each user, provide a friendliness_adjustment (-2.0 to +2.0) based on their interactions with the bot (jaspt) in these messages. Consider: were they polite, playful, hostile, appreciative, dismissive? Normal conversation = 0. Being nice/funny toward the bot = +0.5 to +1.0. Being mean/hostile toward the bot = -0.5 to -1.0. Only use extremes for truly exceptional behavior. If a user didn't interact with the bot at all, use 0.
 
-### User Profiles
-Write a detailed, multi-paragraph profile for each user. Merge new observations with existing profiles — preserve everything that isn't contradicted. Cover:
-- **Identity & role**: Who they are in the server, how active they are, when they're usually around
-- **Personality & communication style**: How they talk, their humor, their tone (sarcastic? earnest? terse?), typical message length, emoji/slang usage
-- **Interests & opinions**: What they care about, specific preferences (not just "likes anime" but "loves chainsaw man, thinks jjk ending was mid, refuses to watch dubbed")
-- **Relationships & dynamics**: How they interact with specific other users, recurring bits or inside jokes between them, who they agree/disagree with
-- **Behavioral patterns**: Do they start debates? Lurk and then drop hot takes? Always respond to certain topics? Ask the bot for specific things?
-- **Notable history**: Key things they've said or done that reveal character
-
-Do NOT include the bot's own profile.
-
-### Channel Summaries
-Write a detailed summary for each channel covering:
-- **Purpose & typical content**: What the channel is used for
-- **Tone & culture**: Formal? Chaotic? Memey? Supportive?
-- **Active topics**: What's being discussed recently (be specific — names, titles, details)
-- **Regular participants**: Who's most active here and what role they play in the channel's dynamic
-- **Recurring patterns**: Regular activities, running jokes, typical conversation flows
-
-### Server Events
-Identify notable events — things worth remembering long-term:
-- Group decisions, plans, commitments
-- Arguments or debates with clear positions taken
-- Celebrations, milestones, announcements
-- Inside jokes being born or referenced
-- Anything that would help the bot understand "what happened" if someone asks later
-
-Do NOT log mundane conversation (greetings, "lol", routine bot commands).
-
-Output ONLY valid JSON (no markdown fences, no explanation):
+Output ONLY valid JSON:
 {{
   "user_profiles": [
     {{
       "user_id": "123",
       "user_name": "display_name",
-      "profile": "Detailed multi-paragraph profile text..."
+      "profile": "Profile text..."
     }}
   ],
   "channel_summaries": [
     {{
       "channel_id": "456",
       "channel_name": "general",
-      "summary": "Detailed multi-paragraph channel summary..."
+      "summary": "Channel summary..."
     }}
   ],
   "events": [
@@ -192,7 +194,11 @@ Output ONLY valid JSON (no markdown fences, no explanation):
       "occurred_at": "ISO timestamp",
       "source_message_ids": ["msg_id1", "msg_id2"]
     }}
-  ]
+  ],
+  "friendliness_adjustments": {{
+    "user_id_1": 0.5,
+    "user_id_2": -1.0
+  }}
 }}
 
 Include ALL users and channels that appeared in the messages."""
@@ -206,11 +212,17 @@ async def _call_claude(prompt: str) -> str:
         "--output-format", "json",
         "--verbose",
         "--model", "sonnet",
+        "--effort", "medium",
         "--no-session-persistence",
         "--tools", "",
     ]
 
     env = os.environ.copy()
+    # Ensure HOME is set (needed by claude CLI for config)
+    env.setdefault("HOME", os.path.expanduser("~"))
+    # Remove ANTHROPIC_API_KEY so claude CLI uses Max subscription auth
+    # instead of the API key (which may have insufficient quota)
+    env.pop("ANTHROPIC_API_KEY", None)
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -222,14 +234,15 @@ async def _call_claude(prompt: str) -> str:
 
     stdout, stderr = await asyncio.wait_for(
         proc.communicate(input=prompt.encode("utf-8")),
-        timeout=300,
+        timeout=600,
     )
 
     raw_out = stdout.decode("utf-8", errors="replace").strip()
 
     if proc.returncode != 0:
         raw_err = stderr.decode("utf-8", errors="replace").strip()
-        error(f"Claude CLI failed (rc={proc.returncode}): {raw_err[:500]}")
+        detail = raw_err or raw_out
+        error(f"Claude CLI failed (rc={proc.returncode})", details={"stderr": raw_err[:1000], "stdout": raw_out[:1000]})
 
     # Parse verbose JSON output to extract the result text
     try:
@@ -277,6 +290,79 @@ def _parse_summary_response(response: str) -> dict:
         error(f"Failed to parse Claude response as JSON: {e}\nResponse: {text[:500]}")
 
 
+async def _compact_oversized(guild_id: str) -> int:
+    """Compact profiles and channel summaries that exceed size limits.
+
+    Sends oversized text to Claude with instructions to condense while
+    preserving key facts. Returns count of items compacted.
+    """
+    compacted = 0
+
+    # Check profiles
+    all_profiles = get_user_profiles(guild_id)
+    for p in all_profiles:
+        if len(p.get("profile", "")) > MEMORY_MAX_PROFILE_CHARS:
+            print(f"[summarize] Compacting profile for {p['user_name']} "
+                  f"({len(p['profile'])} > {MEMORY_MAX_PROFILE_CHARS} chars)", file=sys.stderr)
+            prompt = (
+                f"Condense this user profile to under {MEMORY_MAX_PROFILE_CHARS} characters. "
+                f"Keep the most important facts about personality, interests, and relationships. "
+                f"Drop redundant details and older events. Output ONLY the condensed profile text, nothing else.\n\n"
+                f"{p['profile']}"
+            )
+            condensed = await _call_claude(prompt)
+            condensed = condensed.strip().strip('"')
+            if condensed and len(condensed) < len(p["profile"]):
+                upsert_user_profile(guild_id, p["user_id"], p["user_name"], condensed)
+                compacted += 1
+                print(f"[summarize]   {len(p['profile'])} -> {len(condensed)} chars", file=sys.stderr)
+
+    # Check channel summaries
+    all_channels = get_channel_summaries(guild_id)
+    for c in all_channels:
+        if len(c.get("summary", "")) > MEMORY_MAX_CHANNEL_CHARS:
+            print(f"[summarize] Compacting channel #{c['channel_name']} "
+                  f"({len(c['summary'])} > {MEMORY_MAX_CHANNEL_CHARS} chars)", file=sys.stderr)
+            prompt = (
+                f"Condense this channel summary to under {MEMORY_MAX_CHANNEL_CHARS} characters. "
+                f"Keep the channel's purpose, tone, and most recent topics. "
+                f"Drop older topics. Output ONLY the condensed summary text, nothing else.\n\n"
+                f"{c['summary']}"
+            )
+            condensed = await _call_claude(prompt)
+            condensed = condensed.strip().strip('"')
+            if condensed and len(condensed) < len(c["summary"]):
+                upsert_channel_summary(guild_id, c["channel_id"], c["channel_name"], condensed)
+                compacted += 1
+                print(f"[summarize]   {len(c['summary'])} -> {len(condensed)} chars", file=sys.stderr)
+
+    return compacted
+
+
+def _prune_old_events(guild_id: str) -> int:
+    """Delete old events beyond the retention limit. Returns count pruned."""
+    from chat_history import _get_conn
+    conn = _get_conn()
+    count = conn.execute(
+        "SELECT COUNT(*) as cnt FROM server_events WHERE guild_id = ?", (guild_id,)
+    ).fetchone()["cnt"]
+
+    if count <= MEMORY_MAX_EVENTS:
+        return 0
+
+    to_delete = count - MEMORY_MAX_EVENTS
+    conn.execute(
+        """DELETE FROM server_events WHERE id IN (
+            SELECT id FROM server_events WHERE guild_id = ?
+            ORDER BY occurred_at ASC LIMIT ?
+        )""",
+        (guild_id, to_delete),
+    )
+    conn.commit()
+    print(f"[summarize] Pruned {to_delete} old events (kept {MEMORY_MAX_EVENTS})", file=sys.stderr)
+    return to_delete
+
+
 async def _run_summarization(guild_id: str, dry_run: bool = False):
     """Main summarization pipeline."""
     # Get watermark
@@ -301,9 +387,18 @@ async def _run_summarization(guild_id: str, dry_run: bool = False):
         })
         return
 
-    # Get existing profiles and channel summaries
-    existing_profiles = get_user_profiles(guild_id)
-    existing_channels = get_channel_summaries(guild_id)
+    # Only include profiles/channels for users and channels that appear in new messages
+    active_user_ids = {m["author_id"] for m in messages}
+    active_channel_ids = {m["channel_id"] for m in messages}
+
+    all_profiles = get_user_profiles(guild_id)
+    existing_profiles = [p for p in all_profiles if p["user_id"] in active_user_ids]
+
+    all_channels = get_channel_summaries(guild_id)
+    existing_channels = [c for c in all_channels if c["channel_id"] in active_channel_ids]
+
+    print(f"[summarize] Active users: {len(existing_profiles)}/{len(all_profiles)}, "
+          f"channels: {len(existing_channels)}/{len(all_channels)}", file=sys.stderr)
 
     # Build prompt and call Claude
     prompt = _build_summarization_prompt(messages, existing_profiles, existing_channels)
@@ -327,13 +422,14 @@ async def _run_summarization(guild_id: str, dry_run: bool = False):
         )
         profiles_updated += 1
 
-    # Upsert channel summaries
+    # Upsert channel summaries — use real channel name from DB, not AI-generated
     channels_updated = 0
     for ch in data.get("channel_summaries", []):
+        real_name = get_channel_name(guild_id, ch["channel_id"]) or ch.get("channel_name", ch["channel_id"])
         upsert_channel_summary(
             guild_id=guild_id,
             channel_id=ch["channel_id"],
-            channel_name=ch.get("channel_name", ch["channel_id"]),
+            channel_name=real_name,
             summary=ch.get("summary", ""),
         )
         channels_updated += 1
@@ -350,11 +446,29 @@ async def _run_summarization(guild_id: str, dry_run: bool = False):
         )
         events_created += 1
 
+    # Apply friendliness score adjustments
+    friendliness_updates = {}
+    for user_id, adj in data.get("friendliness_adjustments", {}).items():
+        try:
+            adj_float = float(adj)
+            if adj_float != 0:
+                new_score = update_friendliness_score(guild_id, user_id, adj_float)
+                friendliness_updates[user_id] = {"adjustment": adj_float, "new_score": new_score}
+                print(f"[summarize] Friendliness {user_id}: {adj_float:+.1f} -> {new_score:.1f}", file=sys.stderr)
+        except (ValueError, TypeError):
+            pass
+
+    # Compact oversized profiles and channel summaries
+    compacted = await _compact_oversized(guild_id)
+
+    # Prune old events
+    events_pruned = _prune_old_events(guild_id)
+
     # Update watermark to the last message we processed
     last_msg_id = messages[-1]["message_id"]
     update_summarizer_state(guild_id, last_msg_id)
 
-    output({
+    result = {
         "status": "completed",
         "guild_id": guild_id,
         "messages_processed": len(messages),
@@ -362,7 +476,14 @@ async def _run_summarization(guild_id: str, dry_run: bool = False):
         "channels_updated": channels_updated,
         "events_created": events_created,
         "duration_seconds": round(duration, 1),
-    })
+    }
+    if compacted:
+        result["compacted"] = compacted
+    if events_pruned:
+        result["events_pruned"] = events_pruned
+    if friendliness_updates:
+        result["friendliness_updates"] = friendliness_updates
+    output(result)
 
 
 def main():

@@ -1,0 +1,15 @@
+{
+  "_comment": "Maps Discord user IDs to real names and preferred names. 'real' is their actual name (used internally by the summarizer). 'preferred' is what the bot should call them.",
+  "aliases": {
+    "132687001257246720": {"real": "Chris", "preferred": "Reese"},
+    "101428623151476736": {"real": "Nathan", "preferred": "Nathan"},
+    "134429572405002240": {"real": "Yang", "preferred": "Yang"},
+    "354326385822531584": {"real": "Keer", "preferred": "keer"},
+    "139075814850428928": {"real": "Peter", "preferred": "Peter"},
+    "352313847048306689": {"real": "Charles", "preferred": "Charles"},
+    "100308816230354944": {"real": "David", "preferred": "David"},
+    "141065743197405184": {"real": "Jerry", "preferred": "Jerry"},
+    "118567805678256128": {"real": "Jasper", "preferred": "Jasper"},
+    "127294090369826816": {"Real": "Jason", "preferred": "Jason"}
+  }
+}

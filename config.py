@@ -66,7 +66,10 @@ MAX_DISCORD_MESSAGE_LENGTH = 1900
 # Memory / Chat History
 MEMORY_SUMMARIZE_BATCH_SIZE = 200   # Max messages per summarization batch
 MEMORY_MAX_PROFILE_EVENTS = 10      # Max recent events injected into prompt
-MEMORY_IDLE_MINUTES = 60            # Summarize only after this many minutes of inactivity
+MEMORY_IDLE_MINUTES = 10            # Summarize only after this many minutes of inactivity
+MEMORY_MAX_PROFILE_CHARS = 2000     # Compact user profiles beyond this length
+MEMORY_MAX_CHANNEL_CHARS = 1500     # Compact channel summaries beyond this length
+MEMORY_MAX_EVENTS = 50              # Keep only the most recent N events per guild
 # Channel allowlist for chat history recording. Empty list = record ALL channels.
 # Set via comma-separated channel IDs in .env: MEMORY_CHANNEL_ALLOWLIST=123,456,789
 _allowlist_raw = os.getenv("MEMORY_CHANNEL_ALLOWLIST", "")

@@ -33,6 +33,7 @@ from image_generation import ImageGenerator
 from ollama_client import OllamaClient
 from claude_client import ClaudeClient
 from claude_code_client import ClaudeCodeClient, RateLimitError
+from claude_code_client_pty import ClaudeCodeClientPTY
 from models import is_claude_code_model, is_anthropic_model
 from utils import encode_images_to_base64
 from rag_system import RAGSystem
@@ -85,7 +86,14 @@ class OllamaBot(discord.Client):
         # Initialize clients
         self.ollama_client = OllamaClient()
         self.claude_client = ClaudeClient()
-        self.claude_code_client = ClaudeCodeClient()
+        # Use PTY client (persistent tmux session) if enabled, otherwise one-shot CLI
+        use_pty = os.getenv("CLAUDE_USE_PTY", "").lower() in ("1", "true", "yes")
+        if use_pty:
+            self.claude_code_client = ClaudeCodeClientPTY(session_name="claude_bot")
+            print("[bot] Using Claude Code PTY client (tmux session)")
+        else:
+            self.claude_code_client = ClaudeCodeClient()
+            print("[bot] Using Claude Code CLI client (one-shot)")
         self.image_gen = ImageGenerator()
         self._last_search_sources: List[dict] = []
 
@@ -103,7 +111,7 @@ class OllamaBot(discord.Client):
 
         # System prompts
         self.original_system_prompt = (
-            "Your responses should be akin to that of a typical millenial texter: short, to the point, and mostly without punctuation. Do not offer any kind of assistance without being prompted. use slang *sparingly*. \n\n"
+            "You are jaspt, a Discord bot. Your responses should be akin to that of a typical millenial texter: short, to the point, and mostly without punctuation. Do not offer any kind of assistance without being prompted. use slang *sparingly*. \n\n"
             "CONVERSATION FORMAT:\n"
             "The conversation history uses numbered [Turn N] tags. Each turn is a REAL message from a REAL user or your previous response. "
             "ONLY respond to the LAST turn. Do NOT invent, fabricate, or continue with additional user messages. "
@@ -154,7 +162,12 @@ class OllamaBot(discord.Client):
             "Use the channel_id from [Current context] unless the user specifies a different channel. "
             "Example: create_task --name 'reminder' --schedule '0 9 30 3 *' --once "
             "--command 'python tools/discord/send_message.py --channel-id CHAN --content \"<@USER> reminder text\"'\n"
-            "Always use these tools when the user's request matches their capabilities instead of making up answers."
+            "Always use these tools when the user's request matches their capabilities instead of making up answers.\n\n"
+            "RELATIONSHIPS:\n"
+            "You have a relationship score with each user (-10 to 10) shown in [Memory]. "
+            "Adjust your warmth, effort, and willingness to help based on this score. "
+            "For negative scores, be shorter and less enthusiastic. For positive scores, be warmer and go the extra mile. "
+            "For hostile users (below -8), be extremely dismissive and refuse to engage."
         )
         self.system_prompt = self.original_system_prompt
 
@@ -223,6 +236,14 @@ class OllamaBot(discord.Client):
         print(f"Logged in as {self.user}")
         if not self._claude_code_max_reminder.is_running():
             self._claude_code_max_reminder.start()
+
+        # Start PTY session eagerly so it's ready for the first message
+        if hasattr(self.claude_code_client, 'ensure_session'):
+            try:
+                await self.claude_code_client.ensure_session()
+                print("[bot] Claude Code PTY session started")
+            except Exception as e:
+                print(f"[bot] Failed to start PTY session: {e}")
         notify = self._state.pop("restart_notify", None)
         if notify:
             self._save_state()  # Clear the notification from disk
@@ -304,9 +325,9 @@ class OllamaBot(discord.Client):
         server = message.guild.id
         channel = message.channel.id
 
-        logger.info(f"[MSG-DEBUG] on_message: msg_id={message.id} author={message.author.display_name}"
-                     f"({message.author.id}) channel={channel} server={server} "
-                     f"content={message.content[:80]!r}")
+        # logger.info(f"[MSG-DEBUG] on_message: msg_id={message.id} author={message.author.display_name}"
+        #              f"({message.author.id}) channel={channel} server={server} "
+        #              f"content={message.content[:80]!r}")
 
         # Let plugins handle the message first (hot-swappable).
         # Plugins use LLM-based intent classification and return False for
@@ -407,7 +428,7 @@ class OllamaBot(discord.Client):
                         ctx.pop(0)
 
             fetched_sources = await self.build_context(message, server, False, image_files, document_files)
-            logger.info(f"[MSG-DEBUG] Calling _send_response: msg_id={message.id} channel={channel}")
+            # logger.info(f"[MSG-DEBUG] Calling _send_response: msg_id={message.id} channel={channel}")
             await self._send_response(message, server, channel, fetched_sources)
 
         except Exception as e:
@@ -1011,49 +1032,89 @@ class OllamaBot(discord.Client):
 
         self._last_search_sources = search_sources
 
-        # Regular text query
-        prompt = self.format_prompt(messages)
+        # Extract active user IDs from conversation context for memory filtering
+        active_user_ids = list({
+            str(m.get("discord_user_id", ""))
+            for m in messages if m.get("discord_user_id")
+        })
 
-        # Add search summary if available
-        if search_summary:
-            prompt = f"Search Results Summary:\n{search_summary}\n\n{prompt}"
+        # Build prompt — PTY sessions keep their own history, so only send
+        # the new message + fresh context. One-shot CLI needs the full history.
+        is_pty = isinstance(self.claude_code_client, ClaudeCodeClientPTY)
 
-        # Add RAG context if enabled
-        if self.rag_enabled:
-            # Extract the user's question from messages
-            user_question = ""
-            for msg in messages:
-                if msg.get("role") == "user":
-                    user_question = msg.get("content", "")
+        if is_pty and using_claude_code:
+            # PTY mode: send only the latest user message with metadata
+            last_msg = messages[-1]
+            name = last_msg.get("name", "Unknown")
+            uid = last_msg.get("discord_user_id", "")
 
-            if user_question:
-                wiki_context = self.rag_system.get_context_for_query(user_question)
+            # Check for per-user personality override (e.g. TTS voice mode)
+            personality_note = ""
+            if uid:
+                override = self.plugin_manager.get_system_prompt_override(int(uid))
+                if override:
+                    personality_note = f"\n[Personality override for this user: {override}]\n"
+
+            prompt = f"{personality_note}[{name} (discord_id={uid})] {user_content}"
+
+            # Attach fresh per-message context
+            if search_summary:
+                prompt = f"Search Results Summary:\n{search_summary}\n\n{prompt}"
+
+            memory_context = chat_history.get_memory_context(str(server), channel_id=str(channel), active_user_ids=active_user_ids)
+            if memory_context:
+                prompt = f"{prompt}\n\n{memory_context}"
+
+            # Include channel name for context isolation
+            guild = self.get_guild(server)
+            channel_obj = guild.get_channel(channel) if guild else None
+            channel_name = channel_obj.name if channel_obj else str(channel)
+            prompt += f"\n\n[Current context: #{channel_name}, guild_id={server}, channel_id={channel}]"
+
+            mention_context = extract_mention_context(user_content, guild)
+            if mention_context:
+                prompt = f"{prompt}\n\n{mention_context}"
+
+            if self.rag_enabled:
+                wiki_context = self.rag_system.get_context_for_query(user_content)
                 if wiki_context:
                     prompt = f"Wiki Context:\n{wiki_context}\n\n{prompt}"
+        else:
+            # One-shot CLI / Ollama: send full conversation history
+            prompt = self.format_prompt(messages)
 
-        # Check for per-user personality override (e.g. TTS voice mode)
-        last_user_id = messages[-1].get("discord_user_id")
-        system_prompt = self.system_prompt
-        if last_user_id:
-            override = self.plugin_manager.get_system_prompt_override(last_user_id)
-            if override:
-                system_prompt = override
-                logger.debug(f"[TTS-DEBUG] Using personality override for user {last_user_id}")
-        prompt = f"System: {system_prompt}\n" + prompt
+            if search_summary:
+                prompt = f"Search Results Summary:\n{search_summary}\n\n{prompt}"
 
-        # Inject persistent memory (user profiles + recent server events)
-        memory_context = chat_history.get_memory_context(str(server), channel_id=str(channel))
-        if memory_context:
-            prompt = f"{prompt}\n\n{memory_context}"
+            if self.rag_enabled:
+                user_question = ""
+                for msg in messages:
+                    if msg.get("role") == "user":
+                        user_question = msg.get("content", "")
+                if user_question:
+                    wiki_context = self.rag_system.get_context_for_query(user_question)
+                    if wiki_context:
+                        prompt = f"Wiki Context:\n{wiki_context}\n\n{prompt}"
 
-        # Inject current channel/guild context so tools (reminders, etc.) default to here
-        prompt += f"\n\n[Current context: guild_id={server}, channel_id={channel}]"
+            last_user_id = messages[-1].get("discord_user_id")
+            system_prompt = self.system_prompt
+            if last_user_id:
+                override = self.plugin_manager.get_system_prompt_override(last_user_id)
+                if override:
+                    system_prompt = override
+                    logger.debug(f"[TTS-DEBUG] Using personality override for user {last_user_id}")
+            prompt = f"System: {system_prompt}\n" + prompt
 
-        # Extract Discord mentions (users, channels, roles) from the last message
-        guild = self.get_guild(server)
-        mention_context = extract_mention_context(user_content, guild)
-        if mention_context:
-            prompt = f"{prompt}\n\n{mention_context}"
+            memory_context = chat_history.get_memory_context(str(server), channel_id=str(channel), active_user_ids=active_user_ids)
+            if memory_context:
+                prompt = f"{prompt}\n\n{memory_context}"
+
+            prompt += f"\n\n[Current context: guild_id={server}, channel_id={channel}]"
+
+            guild = self.get_guild(server)
+            mention_context = extract_mention_context(user_content, guild)
+            if mention_context:
+                prompt = f"{prompt}\n\n{mention_context}"
 
         if images:
             print("Sending image")
@@ -1064,6 +1125,10 @@ class OllamaBot(discord.Client):
 
             if using_claude_code:
                 try:
+                    # PTY client: inject system prompt on first use
+                    if is_pty and hasattr(self.claude_code_client, 'set_system_prompt'):
+                        await self.claude_code_client.set_system_prompt(self.system_prompt)
+
                     raw_response, _ = await self.claude_code_client.generate_with_tools(
                         prompt, model, images
                     )
@@ -1125,6 +1190,8 @@ class OllamaBot(discord.Client):
 
     async def close(self):
         """Close the bot"""
+        if hasattr(self.claude_code_client, 'shutdown'):
+            await self.claude_code_client.shutdown()
         await js_renderer.stop()
         await super().close()
 

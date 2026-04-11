@@ -15,3 +15,4 @@ chroma_db/
 bot_state.json
 tools/scheduler/tasks.json
 tools/scheduler/tasks.json.lock
+scheduler_task_logs/

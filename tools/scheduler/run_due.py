@@ -25,6 +25,7 @@ from _common import output
 TASKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks.json")
 PROJECT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 LOG_FILE = os.path.join(PROJECT_DIR, "scheduler.log")
+TASK_LOGS_DIR = os.path.join(PROJECT_DIR, "scheduler_task_logs")
 
 # File logger — always appends, with timestamps
 _logger = logging.getLogger("scheduler")
@@ -112,6 +113,11 @@ def main():
 
         _logger.info(f"RUNNING: {task_label} — {command}")
 
+        # Write full output to a per-execution log file
+        os.makedirs(TASK_LOGS_DIR, exist_ok=True)
+        ts_slug = now.strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(TASK_LOGS_DIR, f"{task['task_id']}_{ts_slug}.log")
+
         # Execute the command
         try:
             result = subprocess.run(
@@ -119,34 +125,43 @@ def main():
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=600,
                 cwd=PROJECT_DIR,
             )
             success = result.returncode == 0
+
+            # Write full output to log file
+            with open(log_path, "w") as lf:
+                lf.write(f"Task: {task['name']} ({task['task_id']})\n")
+                lf.write(f"Command: {command}\n")
+                lf.write(f"Exit code: {result.returncode}\n")
+                lf.write(f"Timestamp: {now.isoformat()}\n")
+                lf.write(f"\n--- stdout ---\n{result.stdout}\n")
+                lf.write(f"\n--- stderr ---\n{result.stderr}\n")
+
             if success:
-                _logger.info(f"SUCCESS: {task_label} (exit 0)")
-                if result.stdout.strip():
-                    _logger.debug(f"  stdout: {result.stdout.strip()[:500]}")
+                _logger.info(f"SUCCESS: {task_label} (exit 0) — log: {log_path}")
             else:
-                _logger.error(f"FAILED: {task_label} (exit {result.returncode})")
-                if result.stdout.strip():
-                    _logger.error(f"  stdout: {result.stdout.strip()[:500]}")
-                if result.stderr.strip():
-                    _logger.error(f"  stderr: {result.stderr.strip()[:500]}")
+                _logger.error(f"FAILED: {task_label} (exit {result.returncode}) — log: {log_path}")
+
             executed.append({
                 "task_id": task["task_id"],
                 "name": task["name"],
                 "success": success,
-                "stdout": result.stdout[:500] if result.stdout else "",
-                "stderr": result.stderr[:500] if result.stderr else "",
+                "log": log_path,
             })
         except subprocess.TimeoutExpired:
-            _logger.error(f"TIMEOUT: {task_label} (120s limit)")
+            _logger.error(f"TIMEOUT: {task_label} (600s limit)")
+            with open(log_path, "w") as lf:
+                lf.write(f"Task: {task['name']} ({task['task_id']})\n")
+                lf.write(f"Command: {command}\n")
+                lf.write(f"TIMED OUT after 600s\n")
             executed.append({
                 "task_id": task["task_id"],
                 "name": task["name"],
                 "success": False,
-                "error": "Command timed out (120s)",
+                "error": "Command timed out (600s)",
+                "log": log_path,
             })
         except Exception as e:
             _logger.error(f"EXCEPTION: {task_label} — {e}")

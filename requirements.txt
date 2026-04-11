@@ -11,6 +11,8 @@ pypdf
 trafilatura
 tavily-python
 anthropic
+pexpect
+websockets
 chatterbox-tts
 torchaudio
 soundfile
