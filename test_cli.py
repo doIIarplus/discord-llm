@@ -283,11 +283,18 @@ class TestCLI:
             is_img_task = await img_gen.is_image_generation_task(classify_input)
 
             if is_img_task:
+                from image_generation import (
+                    choose_dimensions,
+                    choose_followup_dimensions,
+                    choose_source_dimensions,
+                )
                 # Determine if this is a modification or a fresh request
                 is_modification = has_recent_image_gen and not _IMAGE_GEN_KEYWORDS.search(user_content)
                 prev_seed = -1
                 prev_prompt = None
                 prev_image_path = None
+                prev_width = 1024
+                prev_height = 1024
 
                 if is_modification:
                     for msg in reversed(messages[-4:]):
@@ -295,11 +302,15 @@ class TestCLI:
                         if msg.get("role") == "assistant" and "[Generated an image" in content:
                             prompt_match = re.search(r'\[Generated an image with the following prompt: (.+?)\]', content, re.DOTALL)
                             seed_match = re.search(r'seed: (\d+)', content)
+                            size_match = re.search(r'size: (\d+)x(\d+)', content)
                             path_match = re.search(r'path: (.+?)\)', content)
                             if prompt_match:
                                 prev_prompt = prompt_match.group(1)
                             if seed_match:
                                 prev_seed = int(seed_match.group(1))
+                            if size_match:
+                                prev_width = int(size_match.group(1))
+                                prev_height = int(size_match.group(2))
                             if path_match:
                                 prev_image_path = path_match.group(1)
                             break
@@ -312,29 +323,39 @@ class TestCLI:
 
                 if attached_image_path and os.path.exists(attached_image_path):
                     # Case 2: User attached an image to edit (img2img)
-                    print(c(f"  [image edit: user-attached {attached_image_path}]", "yellow"))
+                    try:
+                        from PIL import Image
+                        with Image.open(attached_image_path) as src:
+                            src_w, src_h = src.size
+                    except Exception:
+                        src_w, src_h = 1024, 1024
+                    width, height = choose_source_dimensions(user_content, src_w, src_h)
+                    print(c(f"  [image edit: user-attached {attached_image_path} -> {width}x{height}]", "yellow"))
                     simulated_prompt = (await self.ollama_client.generate_image_prompt(user_content)).strip()
                     mode = "edit"
                     source_path = attached_image_path
                 elif is_modification and prev_image_path and os.path.exists(prev_image_path):
                     # Case 1: Follow-up edit of bot-generated image (img2img)
-                    print(c(f"  [image edit: modifying {prev_image_path}]", "yellow"))
+                    width, height = choose_followup_dimensions(user_content, prev_width, prev_height)
+                    print(c(f"  [image edit: modifying {prev_image_path} -> {width}x{height}]", "yellow"))
                     simulated_prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
                     print(c(f"  [modified prompt: {simulated_prompt[:120]}...]", "yellow"))
                     mode = "edit"
                     source_path = prev_image_path
                 elif is_modification and prev_prompt:
                     # Fallback: prior image file missing, re-generate with modified prompt
-                    print(c(f"  [image modification: prompt-only, seed {prev_seed}]", "yellow"))
+                    width, height = choose_followup_dimensions(user_content, prev_width, prev_height)
+                    print(c(f"  [image modification: prompt-only, seed {prev_seed}, {width}x{height}]", "yellow"))
                     simulated_prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
                     print(c(f"  [modified prompt: {simulated_prompt[:120]}...]", "yellow"))
                     mode = "txt2img"
                     source_path = None
                 else:
                     # Case 3: Brand new generation
-                    print(c("  [new image generation]", "yellow"))
                     prev_seed = -1
                     simulated_prompt = (await self.ollama_client.generate_image_prompt(user_content)).strip()
+                    width, height = choose_dimensions(f"{user_content} {simulated_prompt}")
+                    print(c(f"  [new image generation: {width}x{height}]", "yellow"))
                     print(c(f"  [flux prompt: {simulated_prompt[:120]}...]", "yellow"))
                     mode = "txt2img"
                     source_path = None
@@ -347,13 +368,14 @@ class TestCLI:
                     "role": "assistant",
                     "content": (
                         f"[Generated an image with the following prompt: {simulated_prompt}] "
-                        f"(seed: {seed_display}, size: 1024x1024, path: {fake_path})"
+                        f"(seed: {seed_display}, size: {width}x{height}, path: {fake_path})"
                     ),
                     "timestamp": time.time(),
                 })
                 return [
                     f"[Image would be generated | mode: {mode} | "
-                    f"source: {source_path} | seed: {seed_display} | prompt: {simulated_prompt}]"
+                    f"source: {source_path} | seed: {seed_display} | "
+                    f"size: {width}x{height} | prompt: {simulated_prompt}]"
                 ]
 
         # Determine which backend we're using

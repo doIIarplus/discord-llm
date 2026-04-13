@@ -6,12 +6,30 @@ from dotenv import load_dotenv
 
 from models import Txt2TxtModel
 
-# Set up logging configuration
+# Root logger: INFO by default. Our own modules (below) go to DEBUG so the
+# image-gen pipeline is fully traced. Third-party libraries stay quieter.
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+# Set our own loggers to DEBUG for really verbose tracing.
+for _name in ("Bot", "ollama", "flux", "imagegen"):
+    logging.getLogger(_name).setLevel(logging.DEBUG)
+
+# But route the debug output through a handler that doesn't filter it.
+# basicConfig's root handler has level INFO, so we need to lower it (or add
+# a dedicated handler). Simplest: drop the root handler level to DEBUG and
+# silence noisy third-party libraries explicitly.
+logging.getLogger().setLevel(logging.DEBUG)
+for _noisy in (
+    "discord", "discord.client", "discord.gateway", "discord.http",
+    "aiohttp", "aiohttp.access", "aiohttp.client", "aiohttp.internal",
+    "urllib3", "httpx", "httpcore", "chromadb", "sentence_transformers",
+    "PIL", "asyncio",
+):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # Create a logger for the config module
 logger = logging.getLogger("Config")
@@ -39,7 +57,7 @@ SEARCH_SUMMARIZATION_MODEL = Txt2TxtModel.QWEN3_VL.value
 TEXT_TO_IMAGE_MODEL = "..."
 TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL = os.getenv(
     "TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL",
-    "hf.co/mlabonne/gemma-3-27b-it-abliterated-GGUF:Q8_0",
+    "gemma3:27b",
 )
 logger.info("Model configurations loaded")
 

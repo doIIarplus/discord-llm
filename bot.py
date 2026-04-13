@@ -17,6 +17,7 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import tasks
+from PIL import Image
 
 from commands import CommandHandlers
 from config import (
@@ -27,9 +28,15 @@ from config import (
     IMAGE_RECOGNITION_MODEL,
     CHAT_MODEL,
     MAX_DISCORD_MESSAGE_LENGTH,
+    OUTPUT_DIR_T2I,
     VISION_MODEL_CTX,
 )
-from image_generation import ImageGenerator
+from image_generation import (
+    ImageGenerator,
+    choose_dimensions,
+    choose_followup_dimensions,
+    choose_source_dimensions,
+)
 from ollama_client import OllamaClient
 from claude_client import ClaudeClient
 from claude_code_client import ClaudeCodeClient, RateLimitError
@@ -218,6 +225,45 @@ class OllamaBot(discord.Client):
         except FileNotFoundError:
             return ""
 
+    async def _preload_image_pipeline(self):
+        """Preload Flux + Ollama models used by the image-gen pipeline.
+
+        Runs once at startup as a fire-and-forget background task. Cold-loading
+        Flux on the first user request costs 4-5 minutes; warming it here at
+        startup shifts that cost out of the user-facing critical path.
+        """
+        logger.info("[preload] starting image pipeline warmup (background)")
+        t0 = time.perf_counter()
+        try:
+            # Flux is the biggest: ~33GB on disk, ~4-5 min to cold-load
+            logger.info("[preload] warming Flux2 Klein pipeline...")
+            t_flux = time.perf_counter()
+            await self.image_gen.flux_client.warmup()
+            logger.info("[preload] flux warm in %.1fs", time.perf_counter() - t_flux)
+
+            # Classifier / rewriter text model
+            logger.info("[preload] warming %s classifier...", CHAT_MODEL)
+            t_cls = time.perf_counter()
+            await self.image_gen.is_image_generation_task("generate a cat")
+            logger.info("[preload] gemma warm in %.1fs", time.perf_counter() - t_cls)
+
+            # NSFW / vision model (small NSFW classifier call does the warmup)
+            logger.info("[preload] warming vision model...")
+            t_vl = time.perf_counter()
+            from utils import encode_image_downsized_to_base64
+            sample = os.path.join(OUTPUT_DIR_T2I, "icon.png")
+            if os.path.exists(sample):
+                b64 = encode_image_downsized_to_base64(sample, max_side=256)
+                await self.image_gen.ollama_client.classify_nsfw([b64])
+                logger.info("[preload] vision model warm in %.1fs", time.perf_counter() - t_vl)
+            else:
+                logger.info("[preload] skipped vision warmup: no sample image at %s", sample)
+
+            logger.info("[preload] image pipeline ready in %.1fs", time.perf_counter() - t0)
+        except Exception as e:
+            logger.exception("[preload] failed after %.1fs: %s",
+                             time.perf_counter() - t0, e)
+
     @tasks.loop(hours=24)
     async def _claude_code_max_reminder(self):
         """Send a daily DM reminder to purchase Claude Code Max."""
@@ -244,6 +290,12 @@ class OllamaBot(discord.Client):
                 print("[bot] Claude Code PTY session started")
             except Exception as e:
                 print(f"[bot] Failed to start PTY session: {e}")
+
+        # Preload image-generation pipeline in the background so the first
+        # user image request isn't hit with 3-5 minutes of cold-load latency.
+        # This runs concurrently with normal bot operation — chat replies
+        # still work while Flux is warming up.
+        asyncio.create_task(self._preload_image_pipeline())
         notify = self._state.pop("restart_notify", None)
         if notify:
             self._save_state()  # Clear the notification from disk
@@ -910,83 +962,167 @@ class OllamaBot(discord.Client):
         user_content = messages[-1]['content']
         images = messages[-1].get("images", [])
 
-        # Check if this is an image generation task (fast heuristic first)
-        # Also check if this could be a follow-up to a recent image generation
+        # Check if this is an image generation / edit task.
+        # Three entry conditions:
+        #   1. Direct keyword match ("generate/create/draw/... image/picture/...")
+        #   2. Follow-up to a previously-generated bot image in context
+        #   3. Fresh user-attached image (could be an edit request like
+        #      "make her hair green" or just a visual question)
         has_recent_image_gen = any(
             msg.get("role") == "assistant" and "[Generated an image" in msg.get("content", "")
             for msg in messages[-4:]
         )
-        if _IMAGE_GEN_KEYWORDS.search(user_content) or has_recent_image_gen:
-            # For follow-ups, give the classifier context about the recent image
+        keyword_match = bool(_IMAGE_GEN_KEYWORDS.search(user_content))
+        has_attached_image = bool(messages[-1].get("image_files"))
+        logger.info(
+            "[img] detection user_content_len=%d keyword_match=%s has_recent_image_gen=%s has_attached_image=%s",
+            len(user_content), keyword_match, has_recent_image_gen, has_attached_image,
+        )
+        if keyword_match or has_recent_image_gen or has_attached_image:
+            # Give the classifier enough context to disambiguate chat-about-image
+            # from edit-this-image. Prefix based on what triggered us.
             classify_input = user_content
-            if has_recent_image_gen and not _IMAGE_GEN_KEYWORDS.search(user_content):
+            if has_recent_image_gen and not keyword_match:
                 for msg in reversed(messages[-4:]):
                     if msg.get("role") == "assistant" and "[Generated an image" in msg.get("content", ""):
                         classify_input = f"[Previous: {msg['content']}]\nUser: {user_content}"
+                        logger.info("[img] follow-up classify_input includes prev marker")
                         break
+            elif has_attached_image and not keyword_match:
+                classify_input = f"[User attached an image]\nUser: {user_content}"
+                logger.info("[img] attached-image classify_input includes attachment marker")
+            logger.info("[img] calling image-gen classifier")
             is_img_task = await self.image_gen.is_image_generation_task(classify_input)
+            logger.info("[img] classifier verdict=%s", is_img_task)
 
             if is_img_task:
+                img_pipeline_start = time.perf_counter()
                 # Determine if this is a modification of a previous image or a fresh request
-                is_modification = has_recent_image_gen and not _IMAGE_GEN_KEYWORDS.search(user_content)
+                is_modification = has_recent_image_gen and not keyword_match
                 prev_seed = -1
                 prev_prompt = None
                 prev_image_path = None
+                prev_width = 1024
+                prev_height = 1024
 
                 if is_modification:
-                    # Extract previous prompt, seed, and file path from context
+                    # Extract previous prompt, seed, dims, and file path from context
                     for msg in reversed(messages[-4:]):
                         content = msg.get("content", "")
                         if msg.get("role") == "assistant" and "[Generated an image" in content:
                             prompt_match = re.search(r'\[Generated an image with the following prompt: (.+?)\]', content, re.DOTALL)
                             seed_match = re.search(r'seed: (\d+)', content)
+                            size_match = re.search(r'size: (\d+)x(\d+)', content)
                             path_match = re.search(r'path: (.+?)\)', content)
                             if prompt_match:
                                 prev_prompt = prompt_match.group(1)
                             if seed_match:
                                 prev_seed = int(seed_match.group(1))
+                            if size_match:
+                                prev_width = int(size_match.group(1))
+                                prev_height = int(size_match.group(2))
                             if path_match:
                                 prev_image_path = path_match.group(1)
                             break
+                    logger.info(
+                        "[img] modification=True extracted prev_seed=%s prev_width=%s prev_height=%s "
+                        "prev_image_path=%s prev_prompt_len=%s",
+                        prev_seed, prev_width, prev_height, prev_image_path,
+                        len(prev_prompt) if prev_prompt else None,
+                    )
+                else:
+                    logger.info("[img] modification=False (fresh generation)")
 
                 # Check for user-attached images for editing
                 attached_image_path = None
                 if images:
-                    # User sent an image attachment — use it as the source for editing
-                    # images list contains base64 strings; we need the file path instead
-                    # Check if there are image_files from the attachment handler
                     last_msg_images = messages[-1].get("image_files", [])
                     if last_msg_images:
                         attached_image_path = last_msg_images[0]
+                        logger.info("[img] user attached image: %s", attached_image_path)
 
-                if attached_image_path and os.path.exists(attached_image_path):
-                    # Case 2: User provided an image to edit
-                    print(f"  [image edit: user-attached image {attached_image_path}]")
-                    prompt = (await self.ollama_client.generate_image_prompt(user_content)).strip()
-                    file_path, image_info, is_nsfw = await self.image_gen.edit_image(
-                        prompt, attached_image_path, seed=prev_seed,
+                try:
+                    if attached_image_path and os.path.exists(attached_image_path):
+                        # Case 2: User provided an image to edit.
+                        # We don't have an original prompt, so ask the vision
+                        # model to look at the source and build an edit prompt.
+                        with Image.open(attached_image_path) as src:
+                            src_w, src_h = src.size
+                        width, height = choose_source_dimensions(user_content, src_w, src_h)
+                        logger.info(
+                            "[img] branch=attached-edit source_dims=%dx%d chosen=%dx%d",
+                            src_w, src_h, width, height,
+                        )
+                        from utils import encode_image_downsized_to_base64
+                        logger.info("[img] describing source via vision model for edit prompt")
+                        src_b64 = encode_image_downsized_to_base64(attached_image_path, max_side=512)
+                        prompt = (
+                            await self.ollama_client.describe_image_for_edit(src_b64, user_content)
+                        ).strip()
+                        logger.info("[img] edit prompt len=%d", len(prompt))
+                        file_path, image_info, is_nsfw = await self.image_gen.edit_image(
+                            prompt, attached_image_path, seed=prev_seed,
+                            width=width, height=height,
+                        )
+                    elif is_modification and prev_image_path and os.path.exists(prev_image_path):
+                        # Case 1: Follow-up edit of a bot-generated image (img2img)
+                        width, height = choose_followup_dimensions(user_content, prev_width, prev_height)
+                        logger.info(
+                            "[img] branch=followup-edit source=%s prev_dims=%dx%d chosen=%dx%d",
+                            prev_image_path, prev_width, prev_height, width, height,
+                        )
+                        logger.info("[img] rewriting prompt via modify_image_prompt")
+                        prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
+                        logger.info("[img] modified prompt len=%d", len(prompt))
+                        file_path, image_info, is_nsfw = await self.image_gen.edit_image(
+                            prompt, prev_image_path, seed=prev_seed,
+                            width=width, height=height,
+                        )
+                    elif is_modification and prev_prompt:
+                        # Fallback: no previous image file, re-generate with modified prompt
+                        width, height = choose_followup_dimensions(user_content, prev_width, prev_height)
+                        logger.info(
+                            "[img] branch=prompt-only-fallback seed=%s chosen=%dx%d",
+                            prev_seed, width, height,
+                        )
+                        logger.info("[img] rewriting prompt via modify_image_prompt")
+                        prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
+                        logger.info("[img] modified prompt len=%d", len(prompt))
+                        file_path, image_info, is_nsfw = await self.image_gen.generate_image(
+                            prompt, seed=prev_seed, width=width, height=height,
+                        )
+                    else:
+                        # Case 3: Brand new generation
+                        prev_seed = -1
+                        webpage_context, _ = await extract_webpage_context(user_content)
+                        if webpage_context:
+                            logger.info("[img] extracted webpage context len=%d", len(webpage_context))
+                            user_content = f"{user_content}\n\n{webpage_context}"
+                        logger.info("[img] rewriting prompt via generate_image_prompt")
+                        prompt = (await self.image_gen.generate_image_prompt(user_content)).strip()
+                        logger.info("[img] rewritten prompt len=%d", len(prompt))
+                        # Pick dims from the combined user query + rewritten prompt so
+                        # keywords in either (e.g. "cityscape" in the rewrite) count.
+                        width, height = choose_dimensions(f"{user_content} {prompt}")
+                        logger.info(
+                            "[img] branch=fresh chosen=%dx%d (from user + rewritten prompt)",
+                            width, height,
+                        )
+                        file_path, image_info, is_nsfw = await self.image_gen.generate_image(
+                            prompt, seed=prev_seed, width=width, height=height,
+                        )
+                    logger.info(
+                        "[img] pipeline complete in %.2fs file=%s nsfw=%s",
+                        time.perf_counter() - img_pipeline_start, file_path, is_nsfw,
                     )
-                elif is_modification and prev_image_path and os.path.exists(prev_image_path):
-                    # Case 1: Follow-up edit of a bot-generated image (img2img)
-                    print(f"  [image edit: modifying {prev_image_path}]")
-                    prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
-                    print(f"  [modified prompt: {prompt}]")
-                    file_path, image_info, is_nsfw = await self.image_gen.edit_image(
-                        prompt, prev_image_path, seed=prev_seed,
+                except Exception as img_err:
+                    logger.exception(
+                        "[img] pipeline failed after %.2fs",
+                        time.perf_counter() - img_pipeline_start,
                     )
-                elif is_modification and prev_prompt:
-                    # Fallback: no previous image file, re-generate with modified prompt
-                    print(f"  [image modification: prompt-only, seed {prev_seed}]")
-                    prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
-                    file_path, image_info, is_nsfw = await self.image_gen.generate_image(prompt, seed=prev_seed)
-                else:
-                    # Case 3: Brand new generation
-                    prev_seed = -1
-                    webpage_context, _ = await extract_webpage_context(user_content)
-                    if webpage_context:
-                        user_content = f"{user_content}\n\n{webpage_context}"
-                    prompt = (await self.image_gen.generate_image_prompt(user_content)).strip()
-                    file_path, image_info, is_nsfw = await self.image_gen.generate_image(prompt, seed=prev_seed)
+                    return [
+                        f"image generation failed: {type(img_err).__name__}: {img_err}"
+                    ]
 
                 # Store image generation context for follow-up continuity (include path for img2img)
                 if override_messages is None:
