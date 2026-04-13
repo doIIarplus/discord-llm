@@ -56,7 +56,6 @@ class ImageGenerator:
         prompt: str,
         image_path: str,
         seed: int = -1,
-        strength: float = 0.7,
         width: int = 1024,
         height: int = 1024,
         steps: int = 4,
@@ -64,11 +63,9 @@ class ImageGenerator:
     ) -> Tuple[str, ImageInfo, bool]:
         """Edit an existing image based on a text prompt.
 
-        Args:
-            prompt: What the edited image should look like.
-            image_path: Path to the source image.
-            seed: Random seed (-1 for random).
-            strength: How much to change (0.0 = no change, 1.0 = complete redraw).
+        Flux2 Klein uses the source image as a reference/condition rather
+        than a noisy init, so there is no strength knob — the pipeline
+        decides divergence based on the prompt.
 
         Returns (file_path, ImageInfo, is_nsfw).
         """
@@ -78,7 +75,6 @@ class ImageGenerator:
             prompt=prompt,
             image=source_image,
             seed=seed,
-            strength=strength,
             width=width,
             height=height,
             steps=steps,

@@ -106,28 +106,27 @@ class FluxClient:
         height: int = 1024,
         steps: int = FLUX_DEFAULT_STEPS,
         guidance_scale: float = FLUX_DEFAULT_GUIDANCE,
-        strength: float = 0.7,
     ) -> Tuple[str, ImageInfo]:
-        """Synchronous generation (called via asyncio.to_thread)."""
+        """Synchronous generation (called via asyncio.to_thread).
+
+        Flux2 Klein uses the `image` arg as a reference/condition, not a noisy
+        init, so there is no `strength` parameter — the pipeline decides how
+        much the output diverges from the reference based on the prompt alone.
+        """
         self._ensure_loaded()
 
-        # Clamp dimensions
         width = min(1536, max(256, width))
         height = min(1536, max(256, height))
-        # Round to nearest 64 (required by most diffusion models)
         width = (width // 64) * 64
         height = (height // 64) * 64
         steps = min(20, max(1, steps))
 
-        # Seed handling
-        generator = None
         if seed >= 0:
             generator = torch.Generator(device="cuda").manual_seed(seed)
         else:
             seed = torch.randint(0, 2**32, (1,)).item()
             generator = torch.Generator(device="cuda").manual_seed(seed)
 
-        # Build kwargs
         kwargs = {
             "prompt": prompt,
             "height": height,
@@ -137,11 +136,8 @@ class FluxClient:
             "generator": generator,
         }
 
-        # img2img: pass the reference image
         if image is not None:
-            # Resize to target dimensions
-            image = image.convert("RGB").resize((width, height), Image.LANCZOS)
-            kwargs["image"] = image
+            kwargs["image"] = image.convert("RGB").resize((width, height), Image.LANCZOS)
 
         print(f"[flux] Generating {'img2img' if image else 'txt2img'}: "
               f"{width}x{height}, {steps} steps, seed={seed}")
@@ -205,7 +201,6 @@ class FluxClient:
         prompt: str,
         image: Image.Image,
         seed: int = -1,
-        strength: float = 0.7,
         width: int = 1024,
         height: int = 1024,
         steps: int = FLUX_DEFAULT_STEPS,
@@ -221,5 +216,4 @@ class FluxClient:
             height=height,
             steps=steps,
             guidance_scale=guidance_scale,
-            strength=strength,
         )

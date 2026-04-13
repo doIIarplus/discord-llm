@@ -199,17 +199,29 @@ class TestCLI:
         """Build context from user input, same logic as bot.py."""
         prompt = text
 
-        # Process attached files
-        if self.pending_attachments:
+        # Split attachments into image files (for img2img) and documents
+        image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+        image_files: List[str] = []
+        doc_files: List[str] = []
+        for path in self.pending_attachments:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in image_exts:
+                image_files.append(path)
+            else:
+                doc_files.append(path)
+
+        # Process document attachments (PDFs, code, text)
+        if doc_files:
             doc_context = ""
-            for path in self.pending_attachments:
+            for path in doc_files:
                 content = FileParser.parse_file(path)
                 if content:
                     filename = os.path.basename(path)
                     doc_context += f"\n\n--- Content of {filename} ---\n{content}\n--------------------------\n"
             if doc_context:
                 prompt += f"\n\n[Attached Documents Context]{doc_context}"
-            self.pending_attachments = []
+
+        self.pending_attachments = []
 
         # Extract web page content from URLs
         webpage_context, fetched_sources = await extract_webpage_context(prompt)
@@ -222,6 +234,7 @@ class TestCLI:
             "content": prompt,
             "timestamp": time.time(),
             "images": [],
+            "image_files": image_files,
         })
 
         # Maintain context limit
@@ -274,6 +287,7 @@ class TestCLI:
                 is_modification = has_recent_image_gen and not _IMAGE_GEN_KEYWORDS.search(user_content)
                 prev_seed = -1
                 prev_prompt = None
+                prev_image_path = None
 
                 if is_modification:
                     for msg in reversed(messages[-4:]):
@@ -281,33 +295,66 @@ class TestCLI:
                         if msg.get("role") == "assistant" and "[Generated an image" in content:
                             prompt_match = re.search(r'\[Generated an image with the following prompt: (.+?)\]', content, re.DOTALL)
                             seed_match = re.search(r'seed: (\d+)', content)
+                            path_match = re.search(r'path: (.+?)\)', content)
                             if prompt_match:
                                 prev_prompt = prompt_match.group(1)
                             if seed_match:
                                 prev_seed = int(seed_match.group(1))
+                            if path_match:
+                                prev_image_path = path_match.group(1)
                             break
 
-                if is_modification and prev_prompt:
-                    print(c(f"  [image modification: reusing seed {prev_seed}]", "yellow"))
+                # Check for user-attached image file on the current message
+                attached_image_path = None
+                last_msg_files = messages[-1].get("image_files", [])
+                if last_msg_files:
+                    attached_image_path = last_msg_files[0]
+
+                if attached_image_path and os.path.exists(attached_image_path):
+                    # Case 2: User attached an image to edit (img2img)
+                    print(c(f"  [image edit: user-attached {attached_image_path}]", "yellow"))
+                    simulated_prompt = (await self.ollama_client.generate_image_prompt(user_content)).strip()
+                    mode = "edit"
+                    source_path = attached_image_path
+                elif is_modification and prev_image_path and os.path.exists(prev_image_path):
+                    # Case 1: Follow-up edit of bot-generated image (img2img)
+                    print(c(f"  [image edit: modifying {prev_image_path}]", "yellow"))
                     simulated_prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
                     print(c(f"  [modified prompt: {simulated_prompt[:120]}...]", "yellow"))
+                    mode = "edit"
+                    source_path = prev_image_path
+                elif is_modification and prev_prompt:
+                    # Fallback: prior image file missing, re-generate with modified prompt
+                    print(c(f"  [image modification: prompt-only, seed {prev_seed}]", "yellow"))
+                    simulated_prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
+                    print(c(f"  [modified prompt: {simulated_prompt[:120]}...]", "yellow"))
+                    mode = "txt2img"
+                    source_path = None
                 else:
+                    # Case 3: Brand new generation
                     print(c("  [new image generation]", "yellow"))
                     prev_seed = -1
                     simulated_prompt = (await self.ollama_client.generate_image_prompt(user_content)).strip()
-                    print(c(f"  [SD prompt: {simulated_prompt[:120]}...]", "yellow"))
+                    print(c(f"  [flux prompt: {simulated_prompt[:120]}...]", "yellow"))
+                    mode = "txt2img"
+                    source_path = None
 
-                # Store in context for follow-up continuity (same as bot.py)
+                # Store in context for follow-up continuity (same as bot.py).
+                # Use a fake path so subsequent follow-ups can exercise the modification branch.
                 seed_display = prev_seed if prev_seed != -1 else "random"
+                fake_path = f"/tmp/test_cli_sim_{int(time.time()*1000)}.png"
                 self.context.append({
                     "role": "assistant",
                     "content": (
                         f"[Generated an image with the following prompt: {simulated_prompt}] "
-                        f"(seed: {seed_display}, size: 864x1280)"
+                        f"(seed: {seed_display}, size: 1024x1024, path: {fake_path})"
                     ),
                     "timestamp": time.time(),
                 })
-                return [f"[Image would be generated | seed: {seed_display} | prompt: {simulated_prompt}]"]
+                return [
+                    f"[Image would be generated | mode: {mode} | "
+                    f"source: {source_path} | seed: {seed_display} | prompt: {simulated_prompt}]"
+                ]
 
         # Determine which backend we're using
         model = self.active_model

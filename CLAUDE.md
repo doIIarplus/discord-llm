@@ -1,6 +1,6 @@
 # Discord LLM Bot
 
-A Discord bot that integrates with locally-hosted LLMs via Ollama and Stable Diffusion for image generation. Responds to mentions/replies, supports multimodal input, web extraction, and optional RAG from a wiki dump.
+A Discord bot that integrates with locally-hosted LLMs via Ollama and Flux2 Klein 9B (via `diffusers`) for image generation. Responds to mentions/replies, supports multimodal input, web extraction, and optional RAG from a wiki dump.
 
 ## Running the Bot
 
@@ -9,7 +9,7 @@ source venv/bin/activate
 python bot.py
 ```
 
-Requires a `.env` file with `DISCORD_BOT_TOKEN`. Ollama must be running at `http://localhost:11434` and Stable Diffusion at `http://127.0.0.1:7860`.
+Requires a `.env` file with `DISCORD_BOT_TOKEN`. Ollama must be running at `http://localhost:11434`. Flux2 Klein 9B is loaded in-process on first image request and auto-unloads after 5 minutes of inactivity (see [flux_client.py](flux_client.py)).
 
 After changing slash commands, run `/sync_commands` once from Discord to push updates to Discord's API.
 
@@ -52,7 +52,8 @@ asyncio.run(t())
 - **[models.py](models.py)** — Enums for `Txt2TxtModel` and `Txt2ImgModel`, plus `ImageInfo` dataclass.
 - **[ollama_client.py](ollama_client.py)** — `OllamaClient`: async HTTP client for the Ollama API. Handles generation, image task classification, and NSFW classification.
 - **[commands.py](commands.py)** — All Discord slash commands (registered via `app_commands`).
-- **[image_generation.py](image_generation.py)** — `ImageGenerator`: wraps `StableDiffusionClient` and `OllamaClient` for text-to-image. NSFW is detected post-generation and images are spoilered if flagged.
+- **[image_generation.py](image_generation.py)** — `ImageGenerator`: wraps `FluxClient` and `OllamaClient`. Provides `generate_image` (txt2img) and `edit_image` (img2img). NSFW is detected post-generation and images are spoilered if flagged.
+- **[flux_client.py](flux_client.py)** — `FluxClient`: wraps `Flux2KleinPipeline` from `diffusers`. Lazy-loads the model on first use and auto-unloads after 5 minutes of idle to free VRAM.
 
 ### Context & Response
 - **[response_splitter.py](response_splitter.py)** — Splits responses on `---MSG---` markers and handles Discord's 2000-char message limit. Bot uses this to send multi-part messages with calculated typing delays.
@@ -71,7 +72,6 @@ asyncio.run(t())
 - **[tools/memory/summarize.py](tools/memory/summarize.py)** — Scheduled summarizer. Reads new messages from `chat_history.db`, calls Claude (Sonnet) to analyze them, and writes user profiles and server events back to the DB. Self-gates: only runs when there are new messages AND the server has been idle for 60+ minutes.
 
 ### Supporting
-- **[stable_diffusion_client.py](stable_diffusion_client.py)** — HTTP client for the Automatic1111 SD WebUI API (`/sdapi/v1/txt2img`).
 - **[utils.py](utils.py)** — Image-to-base64 helpers.
 
 ## Key Behaviors
@@ -86,7 +86,7 @@ asyncio.run(t())
 
 **Multi-message responses**: LLM can split its response with `---MSG---` markers; each part is sent as a separate Discord message with simulated typing delay.
 
-**File cleanup**: Uploaded attachments are deleted from `multimodal_input/` after being encoded/parsed. Generated images in `api_out/` are not auto-cleaned.
+**File cleanup**: Uploaded attachments in `multimodal_input/` are kept around so they can be reused as source images for img2img edits. Generated images in `api_out/` are not auto-cleaned.
 
 **System prompt personality**: Millennial texter style — short, casual, no unsolicited help. Changeable at runtime via `/set_system_prompt` and `/reset_system_prompt`.
 
@@ -99,7 +99,6 @@ asyncio.run(t())
 | `/set_system_prompt` | Override system prompt |
 | `/reset_system_prompt` | Restore default prompt |
 | `/get_system_prompt` | Show current prompt |
-| `/generate_image` | Generate image via Stable Diffusion |
 | `/enable_rag` / `/disable_rag` | Toggle RAG wiki context |
 | `/index_wiki` | Index a MediaWiki XML dump |
 | `/search_wiki` | Search indexed wiki content |
@@ -116,7 +115,7 @@ OLLAMA_API_URL=http://localhost:11434/api/generate     # optional
 OLLAMA_MODEL=qwen2.5vl:72b                            # fallback, not the active chat model
 IMAGE_RECOGNITION_MODEL=qwen3-vl:32b
 NSFW_CLASSIFICATION_MODEL=qwen3-vl:32b
-SD_API_URL=http://127.0.0.1:7860
+FLUX_MODEL_ID=black-forest-labs/FLUX.2-klein-9B      # optional, default shown
 FILE_INPUT_FOLDER=/home/dollarplus/projects/discord_llm_bot/multimodal_input/
 TAVILY_API_KEY=tvly-...                                # required for /search command
 ```
@@ -127,9 +126,7 @@ The active chat model (`CHAT_MODEL`) is hardcoded in [config.py](config.py) as `
 
 Install with: `pip install -r requirements.txt`
 
-Key packages: `discord.py`, `python-dotenv`, `aiohttp`, `trafilatura`, `tavily-python`, `chromadb`, `sentence-transformers`, `beautifulsoup4`, `pypdf`, `lxml`, `numpy`, `nltk`.
-
-Optional (better token counting in RAG): `transformers`, `torch`.
+Key packages: `discord.py`, `python-dotenv`, `aiohttp`, `trafilatura`, `tavily-python`, `chromadb`, `sentence-transformers`, `beautifulsoup4`, `pypdf`, `lxml`, `numpy`, `nltk`, `diffusers`, `transformers`, `torch`, `pillow`.
 
 ## CLI Tools
 
@@ -169,14 +166,6 @@ Requires `TAVILY_API_KEY` in environment.
 | Tool | Description |
 |------|-------------|
 | `search.py QUERY [--max-results N]` | Search the web, return raw results (no LLM summarization) |
-
-### Stable Diffusion (`tools/stable_diffusion/`)
-Requires SD WebUI running at `SD_API_URL`.
-
-| Tool | Description |
-|------|-------------|
-| `generate.py --prompt TEXT [--negative-prompt TEXT] [--width N] [--height N] [--cfg-scale F] [--steps N] [--seed N]` | Generate image, returns file path |
-| `start_server.py [--sd-url URL] [--chromaforge-dir PATH]` | Start the ChromaForge/SD WebUI server if not already running |
 
 ### nhentai (`tools/nhentai/`)
 

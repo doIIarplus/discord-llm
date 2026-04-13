@@ -16,10 +16,8 @@ websockets
 chatterbox-tts
 torchaudio
 soundfile
-chatterbox-tts
-torchaudio
-soundfile
 diffusers
 transformers
 torch
 pillow
+accelerate
