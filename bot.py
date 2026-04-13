@@ -248,15 +248,30 @@ class OllamaBot(discord.Client):
             await self.image_gen.is_image_generation_task("generate a cat")
             logger.info("[preload] gemma warm in %.1fs", time.perf_counter() - t_cls)
 
-            # NSFW / vision model (small NSFW classifier call does the warmup)
-            logger.info("[preload] warming vision model...")
-            t_vl = time.perf_counter()
+            # NSFW classifier (uses gemma3:27b — already warm above, this is
+            # cheap but exercises the full path)
             from utils import encode_image_downsized_to_base64
             sample = os.path.join(OUTPUT_DIR_T2I, "icon.png")
             if os.path.exists(sample):
+                logger.info("[preload] warming NSFW classifier path...")
+                t_ns = time.perf_counter()
                 b64 = encode_image_downsized_to_base64(sample, max_side=256)
                 await self.image_gen.ollama_client.classify_nsfw([b64])
-                logger.info("[preload] vision model warm in %.1fs", time.perf_counter() - t_vl)
+                logger.info("[preload] NSFW path warm in %.1fs", time.perf_counter() - t_ns)
+
+                # qwen3-vl is used by describe_image_for_edit for attached-image
+                # edits — cold load is ~30s so preload here removes it from
+                # the user-facing critical path.
+                logger.info("[preload] warming qwen3-vl (edit descriptor)...")
+                t_vl = time.perf_counter()
+                try:
+                    b64_edit = encode_image_downsized_to_base64(sample, max_side=256)
+                    await self.image_gen.ollama_client.describe_image_for_edit(
+                        b64_edit, "make it slightly brighter"
+                    )
+                    logger.info("[preload] qwen3-vl warm in %.1fs", time.perf_counter() - t_vl)
+                except Exception as e:
+                    logger.warning("[preload] qwen3-vl warmup failed: %s", e)
             else:
                 logger.info("[preload] skipped vision warmup: no sample image at %s", sample)
 
@@ -1045,11 +1060,11 @@ class OllamaBot(discord.Client):
                 try:
                     if attached_image_path and os.path.exists(attached_image_path):
                         # Case 2: User provided an image to edit.
-                        # Flux2 Klein's reference conditioning works better with
-                        # short, direct edit instructions than with verbose
-                        # VLM-generated descriptions (which tend to hallucinate
-                        # details and drift the character's identity). Pass
-                        # the cleaned-up raw user text straight to Flux.
+                        # Use qwen3-vl to produce a detailed edit prompt that
+                        # faithfully describes the source + applies the user's
+                        # change. qwen3-vl is slower than gemma3 but describes
+                        # sources much more accurately, which is what actually
+                        # determines edit quality with Flux2 Klein.
                         with Image.open(attached_image_path) as src:
                             src_w, src_h = src.size
                         width, height = choose_source_dimensions(user_content, src_w, src_h)
@@ -1057,10 +1072,21 @@ class OllamaBot(discord.Client):
                             "[img] branch=attached-edit source_dims=%dx%d chosen=%dx%d",
                             src_w, src_h, width, height,
                         )
-                        prompt = clean_edit_instruction(user_content)
+                        # Strip Discord mentions before handing to the VLM
+                        instruction = clean_edit_instruction(user_content) or "enhance"
+                        logger.info("[img] user instruction (cleaned): %r", instruction)
+                        from utils import encode_image_downsized_to_base64
+                        src_b64 = encode_image_downsized_to_base64(attached_image_path, max_side=512)
+                        prompt = (
+                            await self.ollama_client.describe_image_for_edit(src_b64, instruction)
+                        ).strip()
                         if not prompt:
-                            prompt = "enhance"  # extreme fallback
-                        logger.info("[img] edit prompt (raw): %r", prompt)
+                            logger.warning(
+                                "[img] describe_image_for_edit returned empty, "
+                                "falling back to raw user instruction"
+                            )
+                            prompt = instruction
+                        logger.info("[img] edit prompt len=%d", len(prompt))
                         file_path, image_info, is_nsfw = await self.image_gen.edit_image(
                             prompt, attached_image_path, seed=prev_seed,
                             width=width, height=height,

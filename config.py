@@ -50,13 +50,16 @@ logger.info(
 
 # Model Configuration
 IMAGE_RECOGNITION_MODEL = os.getenv("IMAGE_RECOGNITION_MODEL", "qwen3-vl:32b")
-# NSFW classifier and edit-prompt writer both use gemma3:27b instead of
-# qwen3-vl because qwen3-vl is a reasoning model — its hidden chain-of-
-# thought tokens consume the num_predict budget, leaving nothing for the
-# actual response. gemma3 is multimodal + non-reasoning so responses are
-# fast (~0.3s) and deterministic.
+# NSFW classification uses gemma3:27b — it's already loaded for the prompt
+# rewriter, is non-reasoning so responses are fast (~0.3s), and 6/6 test
+# cases classified correctly.
 NSFW_CLASSIFICATION_MODEL = os.getenv("NSFW_CLASSIFICATION_MODEL", "gemma3:27b")
-IMAGE_EDIT_DESCRIPTION_MODEL = os.getenv("IMAGE_EDIT_DESCRIPTION_MODEL", "gemma3:27b")
+# Edit-prompt description uses qwen3-vl:32b — it describes source images more
+# faithfully than gemma3:27b (which hallucinates details like "one blue one
+# pink eyes" that aren't in the source). qwen3-vl is a reasoning model so
+# we give it a generous num_predict budget (1500) to cover hidden
+# chain-of-thought tokens plus the actual output.
+IMAGE_EDIT_DESCRIPTION_MODEL = os.getenv("IMAGE_EDIT_DESCRIPTION_MODEL", "qwen3-vl:32b")
 CHAT_MODEL = Txt2TxtModel.GEMMA3_27B.value
 SEARCH_UTILITY_MODEL = Txt2TxtModel.GEMMA3_27B.value
 SEARCH_SUMMARIZATION_MODEL = Txt2TxtModel.QWEN3_VL.value

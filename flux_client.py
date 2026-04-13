@@ -6,6 +6,7 @@ auto-unloads after 5 minutes of inactivity to free VRAM.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -14,6 +15,7 @@ from typing import Optional, Tuple
 
 import torch
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
 from config import (
     PROJECT_DIR,
@@ -215,7 +217,34 @@ class FluxClient:
 
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, filename)
-        output_image.save(save_path)
+
+        # Embed generation metadata in PNG text chunks so the params can be
+        # recovered later via PIL / exiftool / a1111-compatible tooling.
+        meta = PngInfo()
+        sampler = type(self._pipe.scheduler).__name__
+        # Stable Diffusion WebUI / civitai-compatible "parameters" block
+        params_block = (
+            f"{prompt}\n"
+            f"Steps: {steps}, Sampler: {sampler}, CFG scale: {guidance_scale}, "
+            f"Seed: {seed}, Size: {width}x{height}, "
+            f"Model: {FLUX_MODEL_ID}"
+        )
+        meta.add_text("parameters", params_block)
+        # Explicit machine-readable keys
+        meta.add_text("flux_prompt", prompt)
+        meta.add_text("flux_seed", str(seed))
+        meta.add_text("flux_steps", str(steps))
+        meta.add_text("flux_guidance_scale", str(guidance_scale))
+        meta.add_text("flux_width", str(width))
+        meta.add_text("flux_height", str(height))
+        meta.add_text("flux_sampler", sampler)
+        meta.add_text("flux_model", FLUX_MODEL_ID)
+        meta.add_text("flux_mode", "img2img" if image is not None else "txt2img")
+        meta.add_text("flux_duration_s", f"{duration:.3f}")
+        if image is not None:
+            meta.add_text("flux_source_size", f"{src_w}x{src_h}")
+
+        output_image.save(save_path, pnginfo=meta)
         logger.info("saved %s", save_path)
 
         info = ImageInfo(
@@ -242,15 +271,43 @@ class FluxClient:
         guidance_scale: float = FLUX_DEFAULT_GUIDANCE,
     ) -> Tuple[str, ImageInfo]:
         """Generate a new image from text. Returns (file_path, ImageInfo)."""
-        return await asyncio.to_thread(
-            self._generate_sync,
-            prompt=prompt,
-            seed=seed,
-            width=width,
-            height=height,
-            steps=steps,
-            guidance_scale=guidance_scale,
-        )
+        import telemetry
+        t0 = time.perf_counter()
+        err = None
+        path = None
+        info = None
+        try:
+            path, info = await asyncio.to_thread(
+                self._generate_sync,
+                prompt=prompt,
+                seed=seed,
+                width=width,
+                height=height,
+                steps=steps,
+                guidance_scale=guidance_scale,
+            )
+            return path, info
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            raise
+        finally:
+            try:
+                await telemetry.record_image_generation(
+                    mode="txt2img",
+                    model=FLUX_MODEL_ID,
+                    prompt=prompt,
+                    width=info.width if info else width,
+                    height=info.height if info else height,
+                    steps=info.steps if info else steps,
+                    guidance_scale=info.cfg_scale if info else guidance_scale,
+                    seed=info.seed if info else seed,
+                    sampler=info.sampler_name if info else None,
+                    output_path=path,
+                    duration_s=time.perf_counter() - t0,
+                    error=err,
+                )
+            except Exception as tel_err:
+                logger.debug("telemetry record failed: %s", tel_err)
 
     async def edit(
         self,
@@ -263,13 +320,44 @@ class FluxClient:
         guidance_scale: float = FLUX_DEFAULT_GUIDANCE,
     ) -> Tuple[str, ImageInfo]:
         """Edit an existing image with a text prompt. Returns (file_path, ImageInfo)."""
-        return await asyncio.to_thread(
-            self._generate_sync,
-            prompt=prompt,
-            image=image,
-            seed=seed,
-            width=width,
-            height=height,
-            steps=steps,
-            guidance_scale=guidance_scale,
-        )
+        import telemetry
+        t0 = time.perf_counter()
+        src_w, src_h = image.size
+        err = None
+        path = None
+        info = None
+        try:
+            path, info = await asyncio.to_thread(
+                self._generate_sync,
+                prompt=prompt,
+                image=image,
+                seed=seed,
+                width=width,
+                height=height,
+                steps=steps,
+                guidance_scale=guidance_scale,
+            )
+            return path, info
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            raise
+        finally:
+            try:
+                await telemetry.record_image_generation(
+                    mode="img2img",
+                    model=FLUX_MODEL_ID,
+                    prompt=prompt,
+                    source_width=src_w,
+                    source_height=src_h,
+                    width=info.width if info else width,
+                    height=info.height if info else height,
+                    steps=info.steps if info else steps,
+                    guidance_scale=info.cfg_scale if info else guidance_scale,
+                    seed=info.seed if info else seed,
+                    sampler=info.sampler_name if info else None,
+                    output_path=path,
+                    duration_s=time.perf_counter() - t0,
+                    error=err,
+                )
+            except Exception as tel_err:
+                logger.debug("telemetry record failed: %s", tel_err)

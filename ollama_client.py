@@ -19,6 +19,7 @@ from config import (
     TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL,
     IMAGE_EDIT_DESCRIPTION_MODEL,
 )
+import telemetry
 
 logger = logging.getLogger("ollama")
 
@@ -132,6 +133,11 @@ class OllamaClient:
             self.api_url, model, len(prompt), n_images, keep_alive, num_ctx, num_predict, think,
         )
         logger.debug("prompt preview: %s", _truncate(prompt, 300))
+        start_time = time.perf_counter()
+        response = None
+        eval_count = None
+        prompt_eval_count = None
+        err_msg = None
         try:
             payload = {
                 "model": model,
@@ -155,35 +161,58 @@ class OllamaClient:
             if images:
                 payload["images"] = images
 
-            start_time = time.perf_counter()
             async with ClientSession(timeout=_OLLAMA_TIMEOUT) as session:
                 async with session.post(self.api_url, json=payload) as resp:
                     data = await resp.json()
                     if resp.status >= 400 or "error" in data:
                         err = data.get("error") or f"HTTP {resp.status}"
+                        err_msg = f"Ollama API error ({model}): {err}"
                         logger.error("api error model=%s status=%s error=%s",
                                      model, resp.status, err)
-                        raise RuntimeError(f"Ollama API error ({model}): {err}")
+                        raise RuntimeError(err_msg)
                     if "response" not in data:
+                        err_msg = f"Ollama returned no 'response' field for {model}: {data}"
                         logger.error("missing response field model=%s body=%s",
                                      model, _truncate(str(data), 300))
-                        raise RuntimeError(
-                            f"Ollama returned no 'response' field for {model}: {data}"
-                        )
+                        raise RuntimeError(err_msg)
                     response = data["response"]
+                    eval_count = data.get("eval_count")
+                    prompt_eval_count = data.get("prompt_eval_count")
 
             duration = time.perf_counter() - start_time
             logger.info(
                 "response model=%s took=%.2fs response_len=%d eval_count=%s prompt_eval_count=%s",
                 model, duration, len(response),
-                data.get("eval_count"), data.get("prompt_eval_count"),
+                eval_count, prompt_eval_count,
             )
             logger.debug("response preview: %s", _truncate(response, 300))
             return response
         except Exception as e:
+            err_msg = err_msg or f"{type(e).__name__}: {e}"
             logger.error("exception in generate model=%s: %s", model, e)
             logger.debug("traceback:\n%s", traceback.format_exc())
             raise
+        finally:
+            duration = time.perf_counter() - start_time
+            # Fire-and-forget telemetry record. Don't let logging errors
+            # mask the real exception from the caller.
+            try:
+                await telemetry.record_ollama_call(
+                    model=model,
+                    prompt=prompt,
+                    response=response,
+                    num_images=n_images,
+                    num_ctx=num_ctx,
+                    num_predict=num_predict,
+                    keep_alive=keep_alive,
+                    think=think,
+                    eval_count=eval_count,
+                    prompt_eval_count=prompt_eval_count,
+                    duration_s=duration,
+                    error=err_msg,
+                )
+            except Exception as tel_err:
+                logger.debug("telemetry record failed: %s", tel_err)
 
     async def classify_image_task(self, prompt: str) -> bool:
         """Check if a prompt is requesting image generation OR an edit of
@@ -290,53 +319,51 @@ class OllamaClient:
     async def describe_image_for_edit(
         self, image_base64: str, user_instruction: str
     ) -> str:
-        """Use the vision model to look at an attached image and build a concise
-        edit prompt combining a short description of the source with the user's
-        instruction.
+        """Use the vision model to look at an attached image and build a
+        detailed edit prompt that faithfully describes the source plus the
+        user's requested change.
 
-        Used when the user uploads a fresh image and asks for a visual change
-        ("make her hair green") — we don't have an original diffusion prompt to
-        modify, so we synthesize one via the VLM.
+        Model note: this path uses qwen3-vl:32b by default. qwen3-vl is a
+        reasoning model so it burns a lot of hidden chain-of-thought tokens
+        before producing output — we give it num_predict=1500 to cover
+        that budget (typical total eval_count is ~500). gemma3:27b is
+        faster but hallucinates source details, so we accept qwen3-vl's
+        latency cost in exchange for identity fidelity.
         """
         system_prompt = (
-            "You write image-editing prompts for a diffusion model doing "
-            "reference-based edits. The output is a single prompt describing "
-            "what the edited image should look like — NOT a summary of the "
-            "source.\n\n"
-            "CRITICAL rules for preserving identity:\n"
-            "- Describe the SPECIFIC features of the subject you see: hair style, "
-            "eye shape and color, face shape, expression, age, art style, "
+            "You are a tool that writes image editing prompts. You will see "
+            "a source image and a user's edit instruction. Output ONLY a "
+            "detailed prompt describing what the EDITED image should look "
+            "like.\n\n"
+            "STRICT OUTPUT RULES — the response must:\n"
+            "- Be a single natural-language paragraph, no line breaks\n"
+            "- Contain NO markdown, headings, bullet points, numbered lists\n"
+            "- Contain NO preamble, commentary, options, or follow-up questions\n"
+            "- Never say 'here is the prompt', 'based on the image', etc.\n\n"
+            "How to build the prompt:\n"
+            "1. Describe the subject and composition of the source image "
+            "faithfully — include the specific details you actually see: "
+            "hair style, eye shape and color, face shape, age, expression, "
             "clothing, accessories, pose, hand position, framing, crop, "
-            "background — all the details that make this specific image "
-            "recognizable.\n"
-            "- Then integrate the user's edit into that description. The edit "
-            "should change ONLY what the user asked to change.\n"
-            "- When describing the eyes, expression, and face, be literal and "
-            "specific. If one eye is winking say 'one eye winking'. If the "
-            "smile is open-mouthed and happy say 'open-mouthed happy smile'. "
-            "If the character looks young/chibi say so.\n"
-            "- Preserve the framing and crop exactly: 'tight head-and-shoulders "
-            "portrait', 'full body', 'close-up', etc.\n\n"
-            "Format rules:\n"
-            "- Output 2-4 sentences, no more than 80 words total\n"
-            "- No line breaks, no markdown, no bullets, no options\n"
-            "- No preamble ('here is', 'based on', 'the edited image shows')\n"
-            "- Just the prompt itself"
+            "background, art style. Be literal. If one eye is winking, say "
+            "'one eye winking'. If the mouth is open in a happy smile, say "
+            "that. If the character looks young/chibi, say so.\n"
+            "2. Apply the user's edit to the relevant parts\n"
+            "3. Keep everything else (pose, composition, style, lighting, "
+            "framing, outfit) identical to the source image\n"
+            "4. Output as a single detailed description of the edited result"
         )
         user_prompt = (
-            f"User's requested edit: {user_instruction}\n\n"
-            f"Write the edit prompt now. Be specific about preserving the "
-            f"source character's identity while applying only the requested change:"
+            f"User's edit instruction: {user_instruction}\n\n"
+            f"Write the edit prompt describing the final image:"
         )
         full_prompt = f"System: {system_prompt}\nUser: {user_prompt}\nAssistant:"
         raw = await self.generate(
             full_prompt,
-            # Deliberately not qwen3-vl: its thinking mode swallows num_predict
-            # and returns empty. gemma3:27b is multimodal and non-reasoning.
             model=IMAGE_EDIT_DESCRIPTION_MODEL,
             images=[image_base64],
             num_ctx=4096,
-            num_predict=220,  # ~80 words of output + headroom
+            num_predict=1500,  # headroom for qwen3-vl's thinking + output
             keep_alive=-1,
         )
         return _sanitize_prompt_output(raw)
