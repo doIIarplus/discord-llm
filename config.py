@@ -51,6 +51,10 @@ logger.info(
 # Model Configuration
 IMAGE_RECOGNITION_MODEL = os.getenv("IMAGE_RECOGNITION_MODEL", "qwen3-vl:32b")
 NSFW_CLASSIFICATION_MODEL = os.getenv("NSFW_CLASSIFICATION_MODEL", "qwen3-vl:32b")
+# For building edit prompts on user-attached images. We intentionally use
+# a non-reasoning multimodal model here (gemma3:27b) because qwen3-vl's
+# thinking mode eats the num_predict budget and produces empty responses.
+IMAGE_EDIT_DESCRIPTION_MODEL = os.getenv("IMAGE_EDIT_DESCRIPTION_MODEL", "gemma3:27b")
 CHAT_MODEL = Txt2TxtModel.GEMMA3_27B.value
 SEARCH_UTILITY_MODEL = Txt2TxtModel.GEMMA3_27B.value
 SEARCH_SUMMARIZATION_MODEL = Txt2TxtModel.QWEN3_VL.value

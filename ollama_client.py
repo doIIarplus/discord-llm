@@ -16,7 +16,8 @@ from config import (
     SEARCH_UTILITY_MODEL,
     SEARCH_SUMMARIZATION_MODEL,
     NSFW_CLASSIFICATION_MODEL,
-    TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL
+    TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL,
+    IMAGE_EDIT_DESCRIPTION_MODEL,
 )
 
 logger = logging.getLogger("ollama")
@@ -107,6 +108,7 @@ class OllamaClient:
         keep_alive: Optional[int] = None,
         num_ctx: Optional[int] = None,
         num_predict: Optional[int] = None,
+        think: Optional[bool] = None,
     ) -> str:
         """Generate a response from Ollama.
 
@@ -119,11 +121,15 @@ class OllamaClient:
             num_predict: Hard cap on output tokens. Use for concise responses
                          (classifier, edit prompt rewriter) where model may
                          over-generate despite system prompt constraints.
+            think: Enable/disable thinking mode for reasoning models (qwen3,
+                   qwen3-vl). Set to False when you want fast, direct output
+                   without hidden chain-of-thought tokens eating num_predict
+                   budget.
         """
         n_images = len(images) if images else 0
         logger.info(
-            "POST %s model=%s prompt_len=%d images=%d keep_alive=%s num_ctx=%s num_predict=%s",
-            self.api_url, model, len(prompt), n_images, keep_alive, num_ctx, num_predict,
+            "POST %s model=%s prompt_len=%d images=%d keep_alive=%s num_ctx=%s num_predict=%s think=%s",
+            self.api_url, model, len(prompt), n_images, keep_alive, num_ctx, num_predict, think,
         )
         logger.debug("prompt preview: %s", _truncate(prompt, 300))
         try:
@@ -135,6 +141,8 @@ class OllamaClient:
 
             if keep_alive is not None:
                 payload["keep_alive"] = keep_alive
+            if think is not None:
+                payload["think"] = think
 
             options = {}
             if num_ctx is not None:
@@ -215,7 +223,7 @@ class OllamaClient:
 
         full_prompt = f"System: {system_prompt}\nUser: {prompt}\nAssistant: "
         response = await self.generate(
-            full_prompt, model=CHAT_MODEL, keep_alive=-1, num_ctx=4096,
+            full_prompt, model=CHAT_MODEL, keep_alive=-1, num_ctx=4096, think=False,
         )
 
         return "yes" in response.lower()
@@ -245,7 +253,7 @@ class OllamaClient:
         full_prompt = f"System: {system_prompt}\nUser: {prompt}\nAssistant:"
         raw = await self.generate(
             full_prompt, model=TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL,
-            keep_alive=-1, num_ctx=4096,
+            keep_alive=-1, num_ctx=4096, think=False,
         )
         return _sanitize_prompt_output(raw)
 
@@ -275,7 +283,7 @@ class OllamaClient:
         )
         raw = await self.generate(
             full_prompt, model=TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL,
-            keep_alive=-1, num_ctx=4096,
+            keep_alive=-1, num_ctx=4096, think=False,
         )
         return _sanitize_prompt_output(raw)
 
@@ -306,10 +314,12 @@ class OllamaClient:
         full_prompt = f"System: {system_prompt}\nUser: {user_prompt}\nAssistant:"
         raw = await self.generate(
             full_prompt,
-            model=NSFW_CLASSIFICATION_MODEL,  # vision-capable (qwen3-vl)
+            # Deliberately not qwen3-vl: its thinking mode swallows num_predict
+            # and returns empty. gemma3:27b is multimodal and non-reasoning.
+            model=IMAGE_EDIT_DESCRIPTION_MODEL,
             images=[image_base64],
             num_ctx=4096,
-            num_predict=100,  # hard cap — model otherwise over-generates
+            num_predict=150,
             keep_alive=-1,
         )
         return _sanitize_prompt_output(raw)
@@ -388,6 +398,8 @@ class OllamaClient:
             model=NSFW_CLASSIFICATION_MODEL,
             images=images,
             num_ctx=4096,
+            num_predict=16,  # "NSFW"/"SFW" is 1-2 tokens
             keep_alive=-1,
+            think=False,
         )
         return "nsfw" in response.lower()

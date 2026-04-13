@@ -1059,6 +1059,15 @@ class OllamaBot(discord.Client):
                         prompt = (
                             await self.ollama_client.describe_image_for_edit(src_b64, user_content)
                         ).strip()
+                        if not prompt:
+                            # Fallback: describe call returned empty. Use the
+                            # user's raw instruction so Flux at least has
+                            # something to steer on.
+                            logger.warning(
+                                "[img] describe_image_for_edit returned empty, "
+                                "falling back to raw user instruction"
+                            )
+                            prompt = user_content
                         logger.info("[img] edit prompt len=%d", len(prompt))
                         file_path, image_info, is_nsfw = await self.image_gen.edit_image(
                             prompt, attached_image_path, seed=prev_seed,
@@ -1073,6 +1082,9 @@ class OllamaBot(discord.Client):
                         )
                         logger.info("[img] rewriting prompt via modify_image_prompt")
                         prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
+                        if not prompt:
+                            logger.warning("[img] modify_image_prompt returned empty, falling back to original+user text")
+                            prompt = f"{prev_prompt}, {user_content}"
                         logger.info("[img] modified prompt len=%d", len(prompt))
                         file_path, image_info, is_nsfw = await self.image_gen.edit_image(
                             prompt, prev_image_path, seed=prev_seed,
@@ -1087,6 +1099,9 @@ class OllamaBot(discord.Client):
                         )
                         logger.info("[img] rewriting prompt via modify_image_prompt")
                         prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
+                        if not prompt:
+                            logger.warning("[img] modify_image_prompt returned empty, falling back to original+user text")
+                            prompt = f"{prev_prompt}, {user_content}"
                         logger.info("[img] modified prompt len=%d", len(prompt))
                         file_path, image_info, is_nsfw = await self.image_gen.generate_image(
                             prompt, seed=prev_seed, width=width, height=height,
@@ -1100,6 +1115,9 @@ class OllamaBot(discord.Client):
                             user_content = f"{user_content}\n\n{webpage_context}"
                         logger.info("[img] rewriting prompt via generate_image_prompt")
                         prompt = (await self.image_gen.generate_image_prompt(user_content)).strip()
+                        if not prompt:
+                            logger.warning("[img] generate_image_prompt returned empty, falling back to raw user text")
+                            prompt = user_content
                         logger.info("[img] rewritten prompt len=%d", len(prompt))
                         # Pick dims from the combined user query + rewritten prompt so
                         # keywords in either (e.g. "cityscape" in the rewrite) count.
