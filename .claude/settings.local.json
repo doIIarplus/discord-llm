@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source:*)",
+      "Bash(python -c:*)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:github.com)",
+      "Bash(pip install:*)",
+      "Bash(python test_cli.py:*)",
+      "Bash(python3:*)",
+      "Bash(python tools/:*)"
+    ]
+  }
+}

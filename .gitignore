@@ -16,3 +16,6 @@ bot_state.json
 tools/scheduler/tasks.json
 tools/scheduler/tasks.json.lock
 scheduler_task_logs/
+
+# WSL artifacts
+*:Zone.Identifier
