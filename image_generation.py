@@ -18,6 +18,26 @@ from utils import encode_image_downsized_to_base64
 logger = logging.getLogger("imagegen")
 
 
+_MENTION_RE = re.compile(r'<@!?\d+>|<#\d+>|<@&\d+>')
+_URL_RE = re.compile(r'https?://\S+')
+
+
+def clean_edit_instruction(user_text: str) -> str:
+    """Strip Discord mentions, URLs, and excess whitespace from a user's
+    raw message so it can be passed directly to Flux as an edit prompt.
+
+    Flux2 Klein uses the source image as a reference/condition, so the
+    edit prompt should describe ONLY what to change — not re-describe
+    what's already in the image. Passing the user's cleaned-up text
+    directly preserves identity better than VLM-generated descriptions
+    that tend to hallucinate details.
+    """
+    s = _MENTION_RE.sub('', user_text)
+    s = _URL_RE.sub('', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
 _HQ_RE = re.compile(
     r'\b(hq|hi[-\s]?res|hi[-\s]?quality|high[-\s]?res(?:olution)?|'
     r'high[-\s]?quality|ultra[-\s]?hd|4k|8k|ultra[-\s]?detail(?:ed)?|'
@@ -96,12 +116,35 @@ def choose_followup_dimensions(
 def choose_source_dimensions(
     text: str, source_width: int, source_height: int
 ) -> Tuple[int, int]:
-    """For user-attached img2img: match the source's aspect ratio / HQ status,
-    with user-text keywords as overrides."""
-    source_orientation, source_hq = classify_dimensions(source_width, source_height)
-    orientation = _detect_orientation(text) or source_orientation
-    hq = bool(_HQ_RE.search(text)) or source_hq
-    return DIMENSION_PRESETS[(orientation, hq)]
+    """For user-attached img2img: stay close to the source's dimensions.
+
+    Preserves the source's aspect ratio and (by default) size. Only scales
+    up to an HQ preset if the user explicitly asks for higher resolution —
+    because every pixel of upscale forces Flux to hallucinate content and
+    drift from the source identity.
+    """
+    hq_requested = bool(_HQ_RE.search(text))
+    if hq_requested:
+        # Explicit HQ ask: upscale to the matching preset
+        source_orientation, _ = classify_dimensions(source_width, source_height)
+        orientation = _detect_orientation(text) or source_orientation
+        return DIMENSION_PRESETS[(orientation, True)]
+
+    # Default: keep source size, snapped to multiples of 64 and clamped
+    # into Flux's valid range [256, 1536]. Flux produces weak results
+    # below ~512 on the shortest side, so bump up if the source is tiny.
+    aspect = source_width / source_height if source_height else 1.0
+    shortest = min(source_width, source_height)
+    if shortest < 512:
+        scale = 512 / shortest
+        target_w = int(round(source_width * scale))
+        target_h = int(round(source_height * scale))
+    else:
+        target_w, target_h = source_width, source_height
+
+    target_w = (min(1536, max(256, target_w)) // 64) * 64
+    target_h = (min(1536, max(256, target_h)) // 64) * 64
+    return target_w, target_h
 
 
 class ImageGenerator:

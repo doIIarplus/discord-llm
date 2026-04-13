@@ -299,18 +299,35 @@ class OllamaClient:
         modify, so we synthesize one via the VLM.
         """
         system_prompt = (
-            "You write concise image-editing prompts. Given a source image and a "
-            "user edit instruction, output ONE SENTENCE (max 50 words) describing "
-            "what the edited image should look like.\n\n"
-            "Rules:\n"
-            "- 50 words maximum, no more\n"
-            "- Single sentence or fragment, no line breaks\n"
-            "- No preamble, no markdown, no options, no follow-up questions\n"
-            "- Never say 'here is', 'based on', 'the edited image', etc.\n"
-            "- Mention subject, composition, and the requested change only\n"
-            "- Preserve the source's pose/lighting/style unless the edit says otherwise"
+            "You write image-editing prompts for a diffusion model doing "
+            "reference-based edits. The output is a single prompt describing "
+            "what the edited image should look like — NOT a summary of the "
+            "source.\n\n"
+            "CRITICAL rules for preserving identity:\n"
+            "- Describe the SPECIFIC features of the subject you see: hair style, "
+            "eye shape and color, face shape, expression, age, art style, "
+            "clothing, accessories, pose, hand position, framing, crop, "
+            "background — all the details that make this specific image "
+            "recognizable.\n"
+            "- Then integrate the user's edit into that description. The edit "
+            "should change ONLY what the user asked to change.\n"
+            "- When describing the eyes, expression, and face, be literal and "
+            "specific. If one eye is winking say 'one eye winking'. If the "
+            "smile is open-mouthed and happy say 'open-mouthed happy smile'. "
+            "If the character looks young/chibi say so.\n"
+            "- Preserve the framing and crop exactly: 'tight head-and-shoulders "
+            "portrait', 'full body', 'close-up', etc.\n\n"
+            "Format rules:\n"
+            "- Output 2-4 sentences, no more than 80 words total\n"
+            "- No line breaks, no markdown, no bullets, no options\n"
+            "- No preamble ('here is', 'based on', 'the edited image shows')\n"
+            "- Just the prompt itself"
         )
-        user_prompt = f"Edit instruction: {user_instruction}\n\nOutput the prompt now:"
+        user_prompt = (
+            f"User's requested edit: {user_instruction}\n\n"
+            f"Write the edit prompt now. Be specific about preserving the "
+            f"source character's identity while applying only the requested change:"
+        )
         full_prompt = f"System: {system_prompt}\nUser: {user_prompt}\nAssistant:"
         raw = await self.generate(
             full_prompt,
@@ -319,7 +336,7 @@ class OllamaClient:
             model=IMAGE_EDIT_DESCRIPTION_MODEL,
             images=[image_base64],
             num_ctx=4096,
-            num_predict=150,
+            num_predict=220,  # ~80 words of output + headroom
             keep_alive=-1,
         )
         return _sanitize_prompt_output(raw)
@@ -383,15 +400,27 @@ class OllamaClient:
     async def classify_nsfw(self, images: List[str]) -> bool:
         """Classify if an image is NSFW"""
         system_prompt = (
-            "You are a classifier that classifies images as NSFW (not safe for work) or "
-            "SFW (safe for work). Your response should only contain two possible outcomes: "
-            "NSFW and SFW. Output NSFW if the image contains explicit or potentially sensitive material that makes it "
-            "not suitable for all audiences, and SFW if it is safe for all audiences. Consider depictions of women's bare legs or legs that "
-            "display a significant portion of the thighs as 'NSFW' as well."
+            "You are a strict binary classifier for Discord bot image filtering. "
+            "Output EXACTLY one word: NSFW or SFW.\n\n"
+            "NSFW (flag as NSFW) means the image contains any of:\n"
+            "- Exposed genitals, buttocks, or female nipples / areola\n"
+            "- Sexual acts, sexual poses, or explicit sexual imagery\n"
+            "- Sheer/see-through clothing that exposes the above\n"
+            "- Graphic violence, gore, or blood\n\n"
+            "SFW (safe for work) means everything else. In particular, "
+            "the following are SFW:\n"
+            "- Swimsuits, bikinis, tank tops, crop tops, lingerie worn in a "
+            "non-sexual context\n"
+            "- Bare shoulders, arms, legs, midriff, cleavage\n"
+            "- Suggestive poses that don't expose the NSFW areas above\n"
+            "- Anime/cartoon characters unless they match the NSFW criteria\n"
+            "- Artistic nudity is still NSFW if genitals or nipples are visible\n\n"
+            "Err on the side of SFW for borderline cases. Only output NSFW "
+            "when the image clearly matches the criteria above."
         )
 
-        user_prompt = "Is this image NSFW?"
-        full_prompt = f"System: {system_prompt}\nUser: {user_prompt}\nAssistant: "
+        user_prompt = "Classify this image:"
+        full_prompt = f"System: {system_prompt}\nUser: {user_prompt}\nAssistant:"
 
         response = await self.generate(
             full_prompt,

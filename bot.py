@@ -36,6 +36,7 @@ from image_generation import (
     choose_dimensions,
     choose_followup_dimensions,
     choose_source_dimensions,
+    clean_edit_instruction,
 )
 from ollama_client import OllamaClient
 from claude_client import ClaudeClient
@@ -1044,8 +1045,11 @@ class OllamaBot(discord.Client):
                 try:
                     if attached_image_path and os.path.exists(attached_image_path):
                         # Case 2: User provided an image to edit.
-                        # We don't have an original prompt, so ask the vision
-                        # model to look at the source and build an edit prompt.
+                        # Flux2 Klein's reference conditioning works better with
+                        # short, direct edit instructions than with verbose
+                        # VLM-generated descriptions (which tend to hallucinate
+                        # details and drift the character's identity). Pass
+                        # the cleaned-up raw user text straight to Flux.
                         with Image.open(attached_image_path) as src:
                             src_w, src_h = src.size
                         width, height = choose_source_dimensions(user_content, src_w, src_h)
@@ -1053,22 +1057,10 @@ class OllamaBot(discord.Client):
                             "[img] branch=attached-edit source_dims=%dx%d chosen=%dx%d",
                             src_w, src_h, width, height,
                         )
-                        from utils import encode_image_downsized_to_base64
-                        logger.info("[img] describing source via vision model for edit prompt")
-                        src_b64 = encode_image_downsized_to_base64(attached_image_path, max_side=512)
-                        prompt = (
-                            await self.ollama_client.describe_image_for_edit(src_b64, user_content)
-                        ).strip()
+                        prompt = clean_edit_instruction(user_content)
                         if not prompt:
-                            # Fallback: describe call returned empty. Use the
-                            # user's raw instruction so Flux at least has
-                            # something to steer on.
-                            logger.warning(
-                                "[img] describe_image_for_edit returned empty, "
-                                "falling back to raw user instruction"
-                            )
-                            prompt = user_content
-                        logger.info("[img] edit prompt len=%d", len(prompt))
+                            prompt = "enhance"  # extreme fallback
+                        logger.info("[img] edit prompt (raw): %r", prompt)
                         file_path, image_info, is_nsfw = await self.image_gen.edit_image(
                             prompt, attached_image_path, seed=prev_seed,
                             width=width, height=height,
