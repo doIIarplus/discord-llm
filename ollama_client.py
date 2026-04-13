@@ -398,8 +398,7 @@ class OllamaClient:
             model=NSFW_CLASSIFICATION_MODEL,
             images=images,
             num_ctx=4096,
-            num_predict=16,  # "NSFW"/"SFW" is 1-2 tokens
+            num_predict=32,  # "NSFW"/"SFW" is 1-2 tokens; 32 gives headroom
             keep_alive=-1,
-            think=False,
         )
         return "nsfw" in response.lower()
