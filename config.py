@@ -76,6 +76,7 @@ logger.info("Model configurations loaded")
 FLUX_MODEL_ID = os.getenv("FLUX_MODEL_ID", "black-forest-labs/FLUX.2-klein-9B")
 FLUX_DEFAULT_STEPS = 4
 FLUX_DEFAULT_GUIDANCE = 1.0
+FLUX_IMG2IMG_GUIDANCE = 5.0
 
 # Project root (used to anchor all file paths)
 PROJECT_DIR = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
