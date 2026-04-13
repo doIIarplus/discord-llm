@@ -43,9 +43,13 @@ TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL = os.getenv(
 )
 logger.info("Model configurations loaded")
 
-# Stable Diffusion Configuration
+# Stable Diffusion Configuration (legacy, kept for backward compat)
 SD_API_URL = os.getenv("SD_API_URL", "http://127.0.0.1:7860")
-logger.info(f"Stable Diffusion configuration loaded. API URL: {SD_API_URL}")
+
+# Flux2 Klein 9B Configuration
+FLUX_MODEL_ID = os.getenv("FLUX_MODEL_ID", "black-forest-labs/FLUX.2-klein-9B")
+FLUX_DEFAULT_STEPS = 4
+FLUX_DEFAULT_GUIDANCE = 3.0
 
 # Project root (used to anchor all file paths)
 PROJECT_DIR = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))

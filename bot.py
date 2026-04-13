@@ -488,15 +488,10 @@ class OllamaBot(discord.Client):
         if webpage_context:
             prompt = f"{prompt}\n\n{webpage_context}"
 
-        # Encode images and clean up files
+        # Encode images (keep files for potential img2img editing)
         images = []
         if image_files:
             images = encode_images_to_base64(image_files)
-            for img_path in image_files:
-                try:
-                    os.remove(img_path)
-                except OSError:
-                    pass
 
         self.context[server][channel].append({
             "role": "user",
@@ -505,6 +500,7 @@ class OllamaBot(discord.Client):
             "content": prompt,
             "timestamp": time.time(),
             "images": images,
+            "image_files": list(image_files),  # Keep paths for img2img editing
         })
 
         # Maintain context limit
@@ -935,44 +931,72 @@ class OllamaBot(discord.Client):
                 is_modification = has_recent_image_gen and not _IMAGE_GEN_KEYWORDS.search(user_content)
                 prev_seed = -1
                 prev_prompt = None
+                prev_image_path = None
 
                 if is_modification:
-                    # Extract previous prompt and seed from context
+                    # Extract previous prompt, seed, and file path from context
                     for msg in reversed(messages[-4:]):
                         content = msg.get("content", "")
                         if msg.get("role") == "assistant" and "[Generated an image" in content:
                             prompt_match = re.search(r'\[Generated an image with the following prompt: (.+?)\]', content, re.DOTALL)
                             seed_match = re.search(r'seed: (\d+)', content)
+                            path_match = re.search(r'path: (.+?)\)', content)
                             if prompt_match:
                                 prev_prompt = prompt_match.group(1)
                             if seed_match:
                                 prev_seed = int(seed_match.group(1))
+                            if path_match:
+                                prev_image_path = path_match.group(1)
                             break
 
-                if is_modification and prev_prompt:
-                    # Modification: minimally edit the previous prompt, reuse seed
-                    print(f"  [image modification: reusing seed {prev_seed}, modifying prompt]")
+                # Check for user-attached images for editing
+                attached_image_path = None
+                if images:
+                    # User sent an image attachment — use it as the source for editing
+                    # images list contains base64 strings; we need the file path instead
+                    # Check if there are image_files from the attachment handler
+                    last_msg_images = messages[-1].get("image_files", [])
+                    if last_msg_images:
+                        attached_image_path = last_msg_images[0]
+
+                if attached_image_path and os.path.exists(attached_image_path):
+                    # Case 2: User provided an image to edit
+                    print(f"  [image edit: user-attached image {attached_image_path}]")
+                    prompt = (await self.ollama_client.generate_image_prompt(user_content)).strip()
+                    file_path, image_info, is_nsfw = await self.image_gen.edit_image(
+                        prompt, attached_image_path, seed=prev_seed,
+                    )
+                elif is_modification and prev_image_path and os.path.exists(prev_image_path):
+                    # Case 1: Follow-up edit of a bot-generated image (img2img)
+                    print(f"  [image edit: modifying {prev_image_path}]")
                     prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
                     print(f"  [modified prompt: {prompt}]")
+                    file_path, image_info, is_nsfw = await self.image_gen.edit_image(
+                        prompt, prev_image_path, seed=prev_seed,
+                    )
+                elif is_modification and prev_prompt:
+                    # Fallback: no previous image file, re-generate with modified prompt
+                    print(f"  [image modification: prompt-only, seed {prev_seed}]")
+                    prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
+                    file_path, image_info, is_nsfw = await self.image_gen.generate_image(prompt, seed=prev_seed)
                 else:
-                    # New generation: fresh prompt, random seed
+                    # Case 3: Brand new generation
                     prev_seed = -1
-                    # Extract web page content if URLs are present
                     webpage_context, _ = await extract_webpage_context(user_content)
                     if webpage_context:
                         user_content = f"{user_content}\n\n{webpage_context}"
                     prompt = (await self.image_gen.generate_image_prompt(user_content)).strip()
+                    file_path, image_info, is_nsfw = await self.image_gen.generate_image(prompt, seed=prev_seed)
 
-                file_path, image_info, is_nsfw = await self.image_gen.generate_image(prompt, '', seed=prev_seed)
-
-                # Store image generation context for follow-up continuity
+                # Store image generation context for follow-up continuity (include path for img2img)
                 if override_messages is None:
                     self.context[server][channel].append({
                         "role": "assistant",
                         "content": (
                             f"[Generated an image with the following prompt: {prompt}] "
                             f"(seed: {image_info.seed}, "
-                            f"size: {image_info.width}x{image_info.height})"
+                            f"size: {image_info.width}x{image_info.height}, "
+                            f"path: {file_path})"
                         ),
                         "timestamp": time.time(),
                     })
