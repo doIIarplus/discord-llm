@@ -1088,7 +1088,7 @@ class OllamaBot(discord.Client):
                             prompt = instruction
                         logger.info("[img] edit prompt len=%d", len(prompt))
                         file_path, image_info, is_nsfw = await self.image_gen.edit_image(
-                            prompt, attached_image_path, seed=prev_seed,
+                            prompt, attached_image_path, seed=-1,
                             width=width, height=height,
                         )
                     elif is_modification and prev_image_path and os.path.exists(prev_image_path):
@@ -1105,7 +1105,7 @@ class OllamaBot(discord.Client):
                             prompt = f"{prev_prompt}, {user_content}"
                         logger.info("[img] modified prompt len=%d", len(prompt))
                         file_path, image_info, is_nsfw = await self.image_gen.edit_image(
-                            prompt, prev_image_path, seed=prev_seed,
+                            prompt, prev_image_path, seed=-1,
                             width=width, height=height,
                         )
                     elif is_modification and prev_prompt:
