@@ -342,6 +342,83 @@ class OllamaClient:
         )
         return _sanitize_prompt_output(raw)
 
+    async def normalize_edit_instruction(self, user_text: str) -> str:
+        """Rewrite a messy user message into a short BFL-style edit
+        instruction that FLUX.2 Klein expects.
+
+        Klein is reference-conditioned: the source image already provides
+        all visual details, so the prompt should describe ONLY what to
+        change. This normalizer takes natural-language user input and
+        distills it into one of BFL's documented patterns:
+
+            - Replace [X] with [Y]
+            - Reskin this into [style]
+            - Add [X] [where]
+            - Remove [X]
+            - Change the [attribute] to [value]
+            - Change the color of [X] to [color]
+
+        Examples (from BFL's prompting guide):
+            "Replace the bike with a rearing black horse"
+            "Add small goblins climbing the right wall"
+            "Change the season to winter"
+            "Reskin this into a realistic mountain vista"
+        """
+        system_prompt = (
+            "You normalize user image-edit requests into the format that "
+            "FLUX.2 Klein expects. Output ONLY the normalized instruction — "
+            "no preamble, no markdown, no quotes, no explanation, no "
+            "follow-up questions. One short sentence.\n\n"
+            "Klein is a reference-conditioned image editor. The source "
+            "image already provides all visual details. Your job is to "
+            "produce a SHORT, DIRECT instruction that tells the model only "
+            "what to CHANGE — not what the result should look like in full.\n\n"
+            "Use one of these patterns when possible:\n"
+            "  - Replace [X] with [Y]\n"
+            "  - Reskin this into [style]\n"
+            "  - Add [X] [where]\n"
+            "  - Remove [X]\n"
+            "  - Change the [attribute] to [value]\n"
+            "  - Change the color of [X] to [color]\n"
+            "  - Change the [season/time/weather] to [Y]\n\n"
+            "Strip out: Discord mentions (@user), conversational filler "
+            "('lol', 'plz', 'idk'), greetings, hedges, and any text about "
+            "things other than the edit itself.\n\n"
+            "Examples:\n"
+            "  Input: '@jaspt nice, but I want her hair to be green instead'\n"
+            "  Output: Change the hair color to green\n\n"
+            "  Input: 'lol can u like turn the cats into dogs please'\n"
+            "  Output: Replace the cats with dogs\n\n"
+            "  Input: 'add a cowboy hat'\n"
+            "  Output: Add a cowboy hat to the head\n\n"
+            "  Input: 'make it cyberpunk'\n"
+            "  Output: Reskin this into a cyberpunk style\n\n"
+            "  Input: 'change to nighttime'\n"
+            "  Output: Change the time to nighttime\n\n"
+            "  Input: 'remove the background'\n"
+            "  Output: Remove the background\n\n"
+            "  Input: 'make her smile'\n"
+            "  Output: Change the expression to a smile\n\n"
+            "  Input: 'idk fix it' (no clear instruction)\n"
+            "  Output: Enhance the image quality\n\n"
+            "If the input is empty or makes no sense as an edit, output "
+            "exactly: Enhance the image quality"
+        )
+        full_prompt = (
+            f"System: {system_prompt}\n\n"
+            f"Input: {user_text}\n\n"
+            f"Output:"
+        )
+        raw = await self.generate(
+            full_prompt,
+            model=CHAT_MODEL,
+            keep_alive=-1,
+            num_ctx=4096,
+            num_predict=80,
+        )
+        cleaned = _sanitize_prompt_output(raw)
+        return cleaned or "Enhance the image quality"
+
     async def describe_image_for_edit(
         self, image_base64: str, user_instruction: str
     ) -> str:
