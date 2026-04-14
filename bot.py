@@ -1060,11 +1060,17 @@ class OllamaBot(discord.Client):
                 try:
                     if attached_image_path and os.path.exists(attached_image_path):
                         # Case 2: User provided an image to edit.
-                        # Use qwen3-vl to produce a detailed edit prompt that
-                        # faithfully describes the source + applies the user's
-                        # change. qwen3-vl is slower than gemma3 but describes
-                        # sources much more accurately, which is what actually
-                        # determines edit quality with Flux2 Klein.
+                        #
+                        # Per BFL's FLUX.2 Klein prompting guide:
+                        #   "Reference images carry visual details. Your prompt
+                        #    describes what should change or how elements should
+                        #    combine — not what they look like."
+                        #
+                        # Pass the cleaned user instruction directly. Klein's
+                        # reference conditioning extracts the visual content
+                        # from the source image itself — re-describing it
+                        # via a VLM only competes with that signal and causes
+                        # identity drift.
                         with Image.open(attached_image_path) as src:
                             src_w, src_h = src.size
                         width, height = choose_source_dimensions(user_content, src_w, src_h)
@@ -1072,38 +1078,26 @@ class OllamaBot(discord.Client):
                             "[img] branch=attached-edit source_dims=%dx%d chosen=%dx%d",
                             src_w, src_h, width, height,
                         )
-                        # Strip Discord mentions before handing to the VLM
-                        instruction = clean_edit_instruction(user_content) or "enhance"
-                        logger.info("[img] user instruction (cleaned): %r", instruction)
-                        from utils import encode_image_downsized_to_base64
-                        src_b64 = encode_image_downsized_to_base64(attached_image_path, max_side=512)
-                        prompt = (
-                            await self.ollama_client.describe_image_for_edit(src_b64, instruction)
-                        ).strip()
-                        if not prompt:
-                            logger.warning(
-                                "[img] describe_image_for_edit returned empty, "
-                                "falling back to raw user instruction"
-                            )
-                            prompt = instruction
-                        logger.info("[img] edit prompt len=%d", len(prompt))
+                        prompt = clean_edit_instruction(user_content) or "enhance"
+                        logger.info("[img] edit instruction: %r", prompt)
                         file_path, image_info, is_nsfw = await self.image_gen.edit_image(
                             prompt, attached_image_path, seed=-1,
                             width=width, height=height,
                         )
                     elif is_modification and prev_image_path and os.path.exists(prev_image_path):
-                        # Case 1: Follow-up edit of a bot-generated image (img2img)
+                        # Case 1: Follow-up edit of a bot-generated image.
+                        # Same BFL guidance as Case 2: pass the user's edit
+                        # instruction directly, do not rewrite it into a full
+                        # target description (that fights the reference
+                        # conditioning and produces the "still cats" failure
+                        # mode where the source visual signal beats the text).
                         width, height = choose_followup_dimensions(user_content, prev_width, prev_height)
                         logger.info(
                             "[img] branch=followup-edit source=%s prev_dims=%dx%d chosen=%dx%d",
                             prev_image_path, prev_width, prev_height, width, height,
                         )
-                        logger.info("[img] rewriting prompt via modify_image_prompt")
-                        prompt = (await self.ollama_client.modify_image_prompt(prev_prompt, user_content)).strip()
-                        if not prompt:
-                            logger.warning("[img] modify_image_prompt returned empty, falling back to original+user text")
-                            prompt = f"{prev_prompt}, {user_content}"
-                        logger.info("[img] modified prompt len=%d", len(prompt))
+                        prompt = clean_edit_instruction(user_content) or "enhance"
+                        logger.info("[img] edit instruction: %r", prompt)
                         file_path, image_info, is_nsfw = await self.image_gen.edit_image(
                             prompt, prev_image_path, seed=-1,
                             width=width, height=height,
