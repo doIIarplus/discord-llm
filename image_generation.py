@@ -205,7 +205,7 @@ class ImageGenerator:
         width: int = 1024,
         height: int = 1024,
         steps: int = 4,
-        cfg_scale: float = 5.0,
+        cfg_scale: float = 1.0,
     ) -> Tuple[str, ImageInfo, bool]:
         """Edit an existing image based on a text prompt.
 

@@ -287,28 +287,54 @@ class OllamaClient:
         return _sanitize_prompt_output(raw)
 
     async def modify_image_prompt(self, original_prompt: str, modification: str) -> str:
-        """Modify an existing image generation prompt based on user instructions"""
+        """Rewrite an existing image generation prompt to apply a user's edit.
+
+        Critically, this is NOT a literal token swap — when the user changes
+        the SUBJECT, dependent descriptors must change too. e.g. 'cat -> dog'
+        also means dropping cat-specific terms like 'calico', 'whiskers',
+        'purring' and replacing them with appropriate dog descriptors.
+        """
         system_prompt = (
-            "You are a tool that edits an existing image generation prompt based on a user's "
-            "change request. Output ONLY the modified prompt text.\n\n"
-            "STRICT OUTPUT RULES — the response must:\n"
-            "- Be a single natural-language paragraph, no line breaks\n"
-            "- Contain NO markdown, headings, bullet points, numbered lists, or code blocks\n"
-            "- Contain NO quotation marks around the prompt\n"
-            "- Contain NO preamble, commentary, or explanation\n"
-            "- Contain NO follow-up questions\n"
-            "- Never offer multiple options or variations\n"
-            "- Silently commit to one interpretation of any ambiguity\n\n"
-            "Preserve as much of the original prompt as possible. Only change the parts the "
-            "user's modification explicitly affects. Keep all style, quality, lighting, and "
-            "detail descriptors from the original unless the user asks to change them."
+            "You rewrite image generation prompts to apply a user's edit "
+            "request. Output ONLY the new prompt — no preamble, no markdown, "
+            "no options, no commentary, no quotation marks, no line breaks.\n\n"
+            "CRITICAL: This is not a literal find-and-replace. When the user "
+            "changes the subject or a major attribute, you MUST also update "
+            "every detail that depends on it. The new prompt must be "
+            "semantically and grammatically coherent — no dangling references "
+            "to the old subject.\n\n"
+            "What to KEEP from the original (unless the user explicitly "
+            "changes them):\n"
+            "  - Setting: location, background, framing, composition, crop\n"
+            "  - Atmosphere: lighting, time of day, mood, color palette\n"
+            "  - Style: art style, medium, artist references, quality tags\n"
+            "  - Camera: angle, focal length, depth of field\n\n"
+            "What to UPDATE based on the user's change:\n"
+            "  - The subject itself\n"
+            "  - Anything whose meaning depends on the subject (e.g. coat "
+            "patterns, anatomy, clothing, breed names, gendered language, "
+            "expressions, body proportions)\n"
+            "  - Adjectives that no longer apply to the new subject\n\n"
+            "Examples:\n"
+            "  Original: 'a fluffy calico cat with whiskers lounging on a "
+            "velvet armchair, golden hour light'\n"
+            "  Edit: 'turn the cat into a dog'\n"
+            "  New:  'a fluffy golden retriever lounging on a velvet "
+            "armchair, golden hour light'\n\n"
+            "  Original: 'a young woman in a red sundress at the beach'\n"
+            "  Edit: 'make her a man'\n"
+            "  New:  'a young man in red swim trunks at the beach'\n\n"
+            "  Original: 'a sunny park scene with children playing'\n"
+            "  Edit: 'make it nighttime'\n"
+            "  New:  'a moonlit park scene at night with children playing "
+            "under lamp posts, dark sky with stars'"
         )
 
         full_prompt = (
-            f"System: {system_prompt}\n"
-            f"Original prompt: {original_prompt}\n"
-            f"User modification: {modification}\n"
-            f"Assistant:"
+            f"System: {system_prompt}\n\n"
+            f"Original prompt: {original_prompt}\n\n"
+            f"User edit: {modification}\n\n"
+            f"New prompt:"
         )
         raw = await self.generate(
             full_prompt, model=TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL,

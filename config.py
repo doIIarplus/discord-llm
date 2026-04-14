@@ -73,10 +73,13 @@ logger.info("Model configurations loaded")
 # Flux2 Klein 9B Configuration
 # Klein is a distilled/fast variant. The HF model card uses guidance_scale=1.0
 # and num_inference_steps=4; those are the recommended defaults.
+# Note: Klein is a step-wise distilled model and IGNORES guidance_scale at
+# inference (diffusers prints "Guidance scale X is ignored for step-wise
+# distilled models" if you pass anything other than 1.0). There is no img2img
+# guidance knob on Klein — if you need stronger guidance, use Flux2 Dev.
 FLUX_MODEL_ID = os.getenv("FLUX_MODEL_ID", "black-forest-labs/FLUX.2-klein-9B")
 FLUX_DEFAULT_STEPS = 4
 FLUX_DEFAULT_GUIDANCE = 1.0
-FLUX_IMG2IMG_GUIDANCE = 5.0
 
 # Project root (used to anchor all file paths)
 PROJECT_DIR = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
