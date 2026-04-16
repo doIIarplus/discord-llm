@@ -138,7 +138,12 @@ class TestCLI:
             "Use the channel_id from [Current context] unless the user specifies a different channel. "
             "Example: create_task --name 'reminder' --schedule '0 9 30 3 *' --once "
             "--command 'python tools/discord/send_message.py --channel-id CHAN --content \"<@USER> reminder text\"'\n"
-            "Always use these tools when the user's request matches their capabilities instead of making up answers."
+            "Always use these tools when the user's request matches their capabilities instead of making up answers.\n\n"
+            "LONG-RUNNING / MONITORING TASKS:\n"
+            "When asked to monitor, watch, wait, observe, or tail something, NEVER run a blocking "
+            "`tail -f` or unbounded `sleep` — the Bash tool will time out with no output. Use capped "
+            "windows: `timeout 60 tail -n 500 -f bot.log` or `sleep 45 && tail -n 300 bot.log`, and "
+            "summarize what you saw. Pick a window (30s–120s) based on what the user asked for."
         )
         self.original_system_prompt = self.system_prompt
         self.current_user = "TestUser"
@@ -451,8 +456,6 @@ class TestCLI:
         if using_claude_code:
             try:
                 raw_response, _ = await self.claude_code_client.generate_with_tools(prompt, model)
-                if raw_response == "No response from Claude Code.":
-                    return ["No response from Claude Code."]
             except RateLimitError as rl_err:
                 reset = self.claude_code_client.rate_limit_resets_at or "unknown"
                 print(c(f"  [Claude Code rate limited, resets at {reset}, falling back to local]", "red"))

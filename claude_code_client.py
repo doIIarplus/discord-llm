@@ -21,6 +21,26 @@ CLAUDE_CLI = "claude"
 # Ollama configuration for Claude Code integration
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
+# Subprocess timeouts (seconds). Override via env vars for long-running work
+# like log monitoring, long bash chains, or heavy code edits. These are the
+# outer "kill the subprocess" timeouts — set them high; the CLI will usually
+# finish well before. 0 or negative → no timeout (wait forever).
+def _env_timeout(name: str, default: float) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        return default
+    return None if val <= 0 else val
+
+# Default 30 min for generation / code edits (was 10 min) — monitoring tasks
+# can legitimately run this long. Set CLAUDE_CODE_TIMEOUT=0 to disable.
+CLAUDE_CODE_TIMEOUT = _env_timeout("CLAUDE_CODE_TIMEOUT", 1800.0)
+# Test validation stays shorter but raised from 2 min → 5 min.
+CLAUDE_CODE_TEST_TIMEOUT = _env_timeout("CLAUDE_CODE_TEST_TIMEOUT", 300.0)
+
 # Claude model aliases — anything not in this set is treated as an Ollama model
 _CLAUDE_ALIASES = {"sonnet", "opus", "haiku", "claude-code", "claude-code-opus"}
 
@@ -183,6 +203,59 @@ def _parse_verbose_output(raw_out: str) -> dict:
 
 # Initialize the database on import
 _init_db()
+
+
+# Words in a user prompt that suggest a monitoring / tail / wait-and-observe task.
+# Used to tailor diagnostic hints when the CLI returns empty.
+_MONITORING_HINTS = (
+    "monitor", "watch", "tail", "follow", "observe", "wait", "for a bit",
+    "few minutes", "a couple of minutes", "check back",
+)
+
+
+def _empty_result_diagnostic(
+    duration: float,
+    exit_code: int,
+    raw_err: str,
+    raw_out: str,
+    result_data,
+    prompt: str,
+) -> str:
+    """Build a diagnostic message when claude CLI returns no result_text.
+
+    The old fallback was the bare string "No response from Claude Code." which
+    gave zero debuggability. This surfaces duration, exit code, any error flag
+    in the result entry, and a stderr snippet. For monitoring-style prompts it
+    adds a hint about the real root cause (Bash tool timeouts on blocking
+    commands like `tail -f`).
+    """
+    parts = [f"[claude cli returned no text after {duration:.1f}s, exit={exit_code}]"]
+
+    if isinstance(result_data, dict):
+        if result_data.get("is_error"):
+            res_text = (result_data.get("result") or "").strip()
+            if res_text:
+                parts.append(f"result.is_error=true: {res_text[:400]}")
+            else:
+                parts.append("result.is_error=true (no message)")
+        stop_reason = result_data.get("stop_reason")
+        if stop_reason:
+            parts.append(f"stop_reason={stop_reason}")
+
+    if raw_err:
+        parts.append(f"stderr: {raw_err[:400]}")
+    elif not raw_out.strip():
+        parts.append("no stdout from cli — possible auth/session issue")
+
+    low = prompt.lower()
+    if any(kw in low for kw in _MONITORING_HINTS):
+        parts.append(
+            "hint: monitoring tasks in -p mode should use a capped bash window "
+            "(e.g. `timeout 120 tail -n 500 -f bot.log` or `sleep 60 && tail -n 200 bot.log`) "
+            "rather than an open-ended tail, which blocks until the tool timeout."
+        )
+
+    return "\n".join(parts)
 
 # Keywords in error messages that indicate rate limiting
 _RATE_LIMIT_KEYWORDS = ["rate limit", "rate_limit", "usage limit", "capacity", "overloaded", "too many"]
@@ -367,13 +440,15 @@ class ClaudeCodeClient:
         self,
         instruction: str,
         model: str = "opus",
-        timeout: float = 600.0,
+        timeout: Optional[float] = None,
     ) -> Tuple[str, int]:
         """Run Claude Code CLI with file editing permissions, scoped to project dir.
 
         Returns:
             (response_text, exit_code)
         """
+        if timeout is None:
+            timeout = CLAUDE_CODE_TIMEOUT
         if self.is_rate_limited:
             reset = self.rate_limit_resets_at
             raise RateLimitError(
@@ -497,7 +572,7 @@ class ClaudeCodeClient:
         self,
         instruction: str,
         model: str = "opus",
-        timeout: float = 600.0,
+        timeout: Optional[float] = None,
         existing_plugins: List[str] = None,
     ) -> Tuple[str, int]:
         """Run Claude Code CLI scoped to plugin files only.
@@ -508,6 +583,8 @@ class ClaudeCodeClient:
         Returns:
             (response_text, exit_code)
         """
+        if timeout is None:
+            timeout = CLAUDE_CODE_TIMEOUT
         if self.is_rate_limited:
             reset = self.rate_limit_resets_at
             raise RateLimitError(
@@ -638,7 +715,7 @@ class ClaudeCodeClient:
         change_type: str = "core",
         plugin_names: List[str] = None,
         model: str = "sonnet",
-        timeout: float = 120.0,
+        timeout: Optional[float] = None,
     ) -> TestResult:
         """Run validation tests on pending code changes.
 
@@ -648,6 +725,8 @@ class ClaudeCodeClient:
         Returns:
             TestResult with pass/fail status and reports.
         """
+        if timeout is None:
+            timeout = CLAUDE_CODE_TEST_TIMEOUT
         PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
         # ── Tier 1: Import checks ──────────────────────────────────────
@@ -867,10 +946,12 @@ class ClaudeCodeClient:
         model: str,
         enable_search: bool = False,
         enable_tools: bool = False,
-        timeout: float = 600.0,
+        timeout: Optional[float] = None,
         method: str = "generate",
     ) -> str:
         """Run the claude CLI and return the response text."""
+        if timeout is None:
+            timeout = CLAUDE_CODE_TIMEOUT
         # Check if we're currently rate limited
         if self.is_rate_limited:
             reset = self.rate_limit_resets_at
@@ -979,7 +1060,18 @@ class ClaudeCodeClient:
             if parsed["result_text"]:
                 return parsed["result_text"]
 
-            return "No response from Claude Code."
+            # Empty result from a successful run — build a diagnostic so the
+            # user / logs can actually see WHY. Most common cause: Claude tried
+            # a blocking Bash command (tail -f, sleep loop) and hit the CLI's
+            # internal tool timeout, then exited with no message.
+            return _empty_result_diagnostic(
+                duration=duration,
+                exit_code=proc.returncode,
+                raw_err=raw_err,
+                raw_out=raw_out,
+                result_data=result_data,
+                prompt=prompt,
+            )
 
         except asyncio.TimeoutError:
             print(f"Claude Code CLI timed out after {timeout}s")

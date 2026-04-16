@@ -181,6 +181,16 @@ class OllamaBot(discord.Client):
             "Example: create_task --name 'reminder' --schedule '0 9 30 3 *' --once "
             "--command 'python tools/discord/send_message.py --channel-id CHAN --content \"<@USER> reminder text\"'\n"
             "Always use these tools when the user's request matches their capabilities instead of making up answers.\n\n"
+            "LONG-RUNNING / MONITORING TASKS:\n"
+            "When a user asks you to monitor, watch, wait, observe, or tail something over time, "
+            "NEVER run an open-ended blocking command like `tail -f file` or an unbounded `sleep` in Bash. "
+            "The Bash tool has an internal timeout and will kill blocking commands, returning no output. "
+            "Instead, use capped windows and polling:\n"
+            "- `timeout 60 tail -n 500 -f bot.log` — bounded follow\n"
+            "- `sleep 45 && tail -n 300 bot.log` — wait then snapshot\n"
+            "- Multiple short tail snapshots with `sleep` between them if you need several samples\n"
+            "Pick a window (30s–120s) based on how long the user said to wait, and report back what you observed. "
+            "If the user asks you to 'check back in a few minutes', do one capped wait+read and summarize.\n\n"
             "RELATIONSHIPS:\n"
             "You have a relationship score with each user (-10 to 10) shown in [Memory]. "
             "Adjust your warmth, effort, and willingness to help based on this score. "
@@ -1361,9 +1371,6 @@ class OllamaBot(discord.Client):
                     raw_response, _ = await self.claude_code_client.generate_with_tools(
                         prompt, model, images
                     )
-                    if raw_response == "No response from Claude Code.":
-                        print("No response from Claude Code")
-                        return ["No response from Claude Code."]
                 except RateLimitError:
                     reset = self.claude_code_client.rate_limit_resets_at or "unknown"
                     print(f"  [Claude Code rate limited, resets at {reset}, falling back to local model]")

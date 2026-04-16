@@ -25,6 +25,28 @@ READY_PROMPT = "❯"
 RESPONSE_MARKER = "●"  # Claude's response starts with this bullet
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        return default
+    return val
+
+
+# Outer timeout for `send_prompt`. 30 min default — long enough for log
+# monitoring / heavy tool chains; override with CLAUDE_PTY_TIMEOUT.
+_DEFAULT_PTY_TIMEOUT = _env_float("CLAUDE_PTY_TIMEOUT", 1800.0)
+
+# Quiescence fallback: if we've captured some response content and the
+# tmux pane hasn't changed for this many seconds, treat the response as
+# complete. Was 5s — too aggressive for responses with long thinking /
+# tool-use pauses. Override with CLAUDE_PTY_QUIESCENCE.
+_QUIESCENCE_SECONDS = _env_float("CLAUDE_PTY_QUIESCENCE", 20.0)
+
+
 @dataclass
 class ClaudeTmuxSession:
     """Manages a single Claude Code interactive session inside tmux."""
@@ -67,16 +89,24 @@ class ClaudeTmuxSession:
         self._alive = True
         print(f"[claude_pty] Session '{self.session_name}' started")
 
-    async def send_prompt(self, prompt: str, timeout: float = 600) -> str:
+    async def send_prompt(self, prompt: str, timeout: Optional[float] = None) -> str:
         """Send a prompt and return the response text.
 
         Args:
             prompt: The prompt to send.
-            timeout: Max seconds to wait for a response.
+            timeout: Max seconds to wait for a response. Defaults to
+                CLAUDE_PTY_TIMEOUT (env) or 1800s. Set to 0 or a negative
+                value to wait forever.
 
         Returns:
             The response text (cleaned).
         """
+        if timeout is None:
+            timeout = _DEFAULT_PTY_TIMEOUT
+        # Treat non-positive as "no timeout" — use a very large value so
+        # _wait_for_response's loop doesn't trip the timeout fallback.
+        if timeout <= 0:
+            timeout = 10**9
         async with self._lock:
             if not self._alive:
                 await self.start()
@@ -197,8 +227,11 @@ class ClaudeTmuxSession:
             if found_ready_after and response:
                 return response
 
-            # Quiescence fallback: if screen hasn't changed for 5s and we have content
-            if response and (time.time() - last_change_time > 5):
+            # Quiescence fallback: if we have response content and the pane
+            # hasn't changed for _QUIESCENCE_SECONDS, assume Claude is done.
+            # Must be long enough to absorb thinking / tool-use pauses mid
+            # response, otherwise we truncate.
+            if response and (time.time() - last_change_time > _QUIESCENCE_SECONDS):
                 return response
 
             await asyncio.sleep(0.5)
