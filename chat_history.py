@@ -69,6 +69,7 @@ def _init_schema(conn: sqlite3.Connection):
             has_attachments INTEGER DEFAULT 0,
             attachment_info TEXT,
             image_summary TEXT,
+            edit_history TEXT,
             created_at TEXT NOT NULL,
             recorded_at TEXT NOT NULL
         );
@@ -131,6 +132,13 @@ def _init_schema(conn: sqlite3.Connection):
         );
     """)
     conn.commit()
+
+    # Migrations for existing databases
+    cursor = conn.execute("PRAGMA table_info(messages)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "edit_history" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN edit_history TEXT")
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +303,49 @@ async def record_bot_response(
     )
 
 
+def _update_message_content_sync(message_id: str, new_content: str):
+    """Update a message's content, preserving the old content in edit_history.
+
+    edit_history is a JSON array of {"content": "...", "edited_at": "..."} entries,
+    oldest first.
+    """
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT content, edit_history FROM messages WHERE message_id = ?",
+        (message_id,),
+    ).fetchone()
+    if not row:
+        print(f"[chat_history] Cannot update message {message_id} — not found in DB")
+        return
+
+    old_content = row["content"]
+    if old_content == new_content:
+        return  # No actual change
+
+    # Build edit history
+    history = json.loads(row["edit_history"]) if row["edit_history"] else []
+    history.append({
+        "content": old_content,
+        "edited_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    conn.execute(
+        "UPDATE messages SET content = ?, edit_history = ? WHERE message_id = ?",
+        (new_content, json.dumps(history), message_id),
+    )
+    conn.commit()
+    print(f"[chat_history] Updated message {message_id} (edit #{len(history)})")
+
+
+async def update_message_content(message_id: int, new_content: str) -> None:
+    """Record a message edit — saves old content to edit_history and updates content."""
+    await asyncio.to_thread(
+        _update_message_content_sync,
+        message_id=str(message_id),
+        new_content=new_content,
+    )
+
+
 async def _summarize_images(message_id: str, attachments) -> None:
     """Download image attachments and summarize them via the vision model.
 
@@ -340,6 +391,37 @@ async def _summarize_images(message_id: str, attachments) -> None:
 
     except Exception as e:
         print(f"[chat_history] Image summarization failed for {message_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Querying (channel context for prompt building)
+# ---------------------------------------------------------------------------
+
+def get_recent_channel_messages(
+    guild_id: str,
+    channel_id: str,
+    limit: int = 20,
+) -> List[dict]:
+    """Get the most recent messages in a channel, in chronological order.
+
+    Returns dicts with: message_id, author_id, author_name, content,
+    reply_to_message_id, has_attachments, attachment_info, image_summary,
+    edit_history, created_at.
+    """
+    conn = _get_conn()
+    cursor = conn.execute(
+        """SELECT message_id, author_id, author_name, content,
+                  reply_to_message_id, has_attachments, attachment_info,
+                  image_summary, edit_history, created_at
+           FROM messages
+           WHERE guild_id = ? AND channel_id = ?
+           ORDER BY id DESC
+           LIMIT ?""",
+        (guild_id, channel_id, limit),
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    rows.reverse()  # chronological order
+    return rows
 
 
 # ---------------------------------------------------------------------------

@@ -159,12 +159,21 @@ class OllamaBot(discord.Client):
             "- tools/scheduler/ — create_task (--once for one-shot reminders), list_tasks, delete_task\n"
             "- tools/web_search/search.py — search the web\n"
             "- tools/discord/send_message.py — send a message as the bot to any channel\n"
+            "- tools/discord/edit_message.py — edit a bot-sent message\n"
+            "- tools/discord/delete_message.py — delete a message\n"
             "- tools/discord/get_channel_history.py — fetch recent messages from a channel\n"
             "- tools/discord/search_messages.py — search messages in the server\n"
+            "- tools/discord/get_user.py — get user/member info (add --guild-id for nickname, roles, join date)\n"
             "- tools/discord/add_role.py / remove_role.py — manage user roles\n"
             "- tools/discord/list_roles.py — list server roles\n"
+            "- tools/discord/set_nickname.py — set or clear a member's nickname\n"
+            "- tools/discord/timeout_user.py — timeout a member (e.g. 10m, 1h, 7d)\n"
             "- tools/discord/react.py — add a reaction to a message\n"
             "- tools/discord/pin_message.py — pin/unpin a message\n"
+            "- tools/discord/create_thread.py — create a thread (from message or standalone)\n"
+            "- tools/discord/list_channels.py — list guild channels\n"
+            "- tools/discord/create_channel.py — create a text, voice, or category channel\n"
+            "- tools/discord/delete_channel.py — delete a channel\n"
             "- tools/discord/send_webhook.py — send Discord messages via webhook\n"
             "For reminders: use tools/scheduler/create_task.py --once with a command that calls tools/discord/send_message.py. "
             "Use the channel_id from [Current context] unless the user specifies a different channel. "
@@ -377,6 +386,16 @@ class OllamaBot(discord.Client):
             return IMAGE_RECOGNITION_MODEL
         return self.active_model
 
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        """Handle message edits — update chat_history.db with the new content."""
+        if after.author.bot:
+            return
+        if after.guild is None:
+            return
+        if before.content == after.content:
+            return  # Embed-only update (link preview etc.), not a real edit
+        await chat_history.update_message_content(after.id, after.content or "")
+
     async def on_message(self, message: discord.Message):
         """Handle incoming messages"""
         # Ignore bot messages (including self)
@@ -444,57 +463,6 @@ class OllamaBot(discord.Client):
         try:
             user_text = re.sub(r'<@!?\d+>', '', message.content).strip()
 
-            # If replying to a message, inject the referenced message into context
-            if message.reference and ref_msg and ref_msg.author.id != self.user.id:
-                if server not in self.context:
-                    self.context[server] = {}
-                if channel not in self.context[server]:
-                    self.context[server][channel] = []
-                ctx = self.context[server][channel]
-                ref_content = ref_msg.clean_content
-
-                # Download and encode any attachments from the referenced message
-                ref_images = []
-                ref_doc_context = ""
-                for att in ref_msg.attachments:
-                    safe_filename = os.path.basename(att.filename)
-                    file_path = safe_path(os.path.join(FILE_INPUT_FOLDER, f"ref_{safe_filename}"))
-                    try:
-                        await att.save(file_path)
-                        ext = os.path.splitext(file_path)[1].lower()
-                        if ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']:
-                            ref_images.extend(encode_images_to_base64([file_path]))
-                        else:
-                            content = FileParser.parse_file(file_path)
-                            if content:
-                                ref_doc_context += f"\n\n--- Content of {att.filename} ---\n{content}\n--------------------------\n"
-                    except Exception as e:
-                        print(f"Error processing ref attachment {att.filename}: {e}")
-                    finally:
-                        try:
-                            os.remove(file_path)
-                        except OSError:
-                            pass
-
-                if ref_doc_context:
-                    ref_content += f"\n\n[Attached Documents Context]{ref_doc_context}"
-
-                # Only add if not already the last entry in context
-                already_in_ctx = (
-                    ctx and ctx[-1]["role"] == "user"
-                    and ctx[-1]["content"] == ref_content
-                )
-                if not already_in_ctx and (ref_content or ref_images):
-                    ctx.append({
-                        "role": "user",
-                        "name": ref_msg.author.display_name,
-                        "content": ref_content or "(attachment)",
-                        "timestamp": ref_msg.created_at.timestamp(),
-                        "images": ref_images,
-                    })
-                    if len(ctx) > CONTEXT_LIMIT:
-                        ctx.pop(0)
-
             fetched_sources = await self.build_context(message, server, False, image_files, document_files)
             # logger.info(f"[MSG-DEBUG] Calling _send_response: msg_id={message.id} channel={channel}")
             await self._send_response(message, server, channel, fetched_sources)
@@ -515,20 +483,65 @@ class OllamaBot(discord.Client):
         image_files: List[str] = None,
         document_files: List[str] = None
     ):
-        """Build conversation context"""
+        """Build conversation context from persistent chat history.
+
+        Fetches the last CONTEXT_LIMIT messages from chat_history.db for this
+        channel, so the bot sees all recent conversation — not just direct
+        interactions. The current message's attachments (images/docs) and web
+        extractions are still processed and attached to the final entry.
+        """
         if image_files is None:
             image_files = []
         if document_files is None:
             document_files = []
 
         channel = message.channel.id
+        bot_user_id = str(self.user.id)
 
-        if server not in self.context:
-            self.context[server] = {}
+        # Fetch recent messages from persistent DB (includes all users + bot)
+        # We fetch CONTEXT_LIMIT - 1 because the current message will be appended
+        db_messages = await asyncio.to_thread(
+            chat_history.get_recent_channel_messages,
+            guild_id=str(server),
+            channel_id=str(channel),
+            limit=CONTEXT_LIMIT - 1,
+        )
 
-        if channel not in self.context[server]:
-            self.context[server][channel] = []
+        # Convert DB rows into the context format used by format_prompt/query_ollama
+        ctx = []
+        for row in db_messages:
+            # Skip the current message if it was already recorded to DB
+            if row["message_id"] == str(message.id):
+                continue
 
+            is_bot = row["author_id"] == bot_user_id
+            entry = {
+                "role": "assistant" if is_bot else "user",
+                "content": row["content"] or "",
+                "timestamp": row["created_at"],
+            }
+
+            if not is_bot:
+                entry["name"] = row["author_name"]
+                entry["discord_user_id"] = int(row["author_id"])
+
+            # Include image summaries from the DB as context
+            if row.get("image_summary"):
+                entry["content"] += f"\n[Attached image: {row['image_summary']}]"
+
+            # Include edit history so the bot knows about message edits
+            if row.get("edit_history"):
+                try:
+                    edits = json.loads(row["edit_history"])
+                    if edits:
+                        original = edits[0]["content"]
+                        entry["content"] += f"\n[This message was edited. Original: \"{original}\"]"
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            ctx.append(entry)
+
+        # Build the current message's prompt with attachments and web context
         prompt = (
             message.content
             if not strip_mention
@@ -561,7 +574,8 @@ class OllamaBot(discord.Client):
         if image_files:
             images = encode_images_to_base64(image_files)
 
-        self.context[server][channel].append({
+        # Append the current message
+        ctx.append({
             "role": "user",
             "name": message.author.display_name,
             "discord_user_id": message.author.id,
@@ -571,9 +585,10 @@ class OllamaBot(discord.Client):
             "image_files": list(image_files),  # Keep paths for img2img editing
         })
 
-        # Maintain context limit
-        if len(self.context[server][channel]) > CONTEXT_LIMIT:
-            self.context[server][channel].pop(0)
+        # Store as the active context for query_ollama / pick_model
+        if server not in self.context:
+            self.context[server] = {}
+        self.context[server][channel] = ctx
 
         return fetched_sources
 
@@ -603,7 +618,24 @@ class OllamaBot(discord.Client):
 
         # Handle image generation responses (tuple with embed + file)
         if isinstance(response_data, tuple):
-            await message.channel.send(embed=response_data[0], file=response_data[1])
+            sent_msg = await message.channel.send(embed=response_data[0], file=response_data[1])
+            # Record the image gen marker to chat history so it persists across context rebuilds
+            img_ctx = self.context.get(server, {}).get(channel, [])
+            img_marker = next(
+                (m["content"] for m in reversed(img_ctx)
+                 if m.get("role") == "assistant" and "[Generated an image" in m.get("content", "")),
+                None,
+            )
+            if img_marker:
+                await chat_history.record_bot_response(
+                    guild_id=server,
+                    channel_id=channel,
+                    bot_user_id=self.user.id,
+                    bot_name=self.user.display_name,
+                    content=img_marker,
+                    message_id=sent_msg.id,
+                    reply_to_message_id=message.id,
+                )
             return
 
         # Check for [EDIT_CODE] tags in the response — LLM decided a code change is needed
@@ -1352,14 +1384,6 @@ class OllamaBot(discord.Client):
                 if raw_response == "No response from Ollama.":
                     print("No response from Ollama")
                     return ["No response from Ollama."]
-
-            # Add response to context
-            if override_messages is None:
-                self.context[server][channel].append({
-                    "role": "assistant",
-                    "content": raw_response,
-                    "timestamp": time.time(),
-                })
 
             print(f"Response: {raw_response}")
             return self.process_response(raw_response)

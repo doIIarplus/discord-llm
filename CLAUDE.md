@@ -78,7 +78,7 @@ asyncio.run(t())
 
 **Response triggers**: Bot only responds when directly `@mentioned` or when someone replies to one of its messages.
 
-**Context**: Per-server, per-channel message history capped at `CONTEXT_LIMIT = 10` messages. Stored in memory only (lost on restart).
+**Context**: When the bot is triggered, it fetches the last `CONTEXT_LIMIT = 20` messages from `chat_history.db` for that channel. This means the bot sees **all** recent conversation (not just direct interactions), so users don't need to repeat context. The context is rebuilt from the DB on every trigger — nothing is lost on restart.
 
 **Model selection**: If the last message has images attached, switches to `IMAGE_RECOGNITION_MODEL` (`qwen3-vl:32b`); otherwise uses `CHAT_MODEL` (`gemma-3-27b-it-abliterated`).
 
@@ -135,6 +135,8 @@ Standalone Python scripts in `tools/` that Claude can call via Bash. Each tool u
 **Calling convention:** `python tools/<integration>/<tool>.py [args]`
 **Discovery:** `python tools/<integration>/<tool>.py --help` for usage.
 
+**IMPORTANT — keeping prompts in sync:** When adding, removing, or renaming CLI tools, also update the tool lists in the system prompts in [bot.py](bot.py) (`self.original_system_prompt`, "CLI TOOLS" section) and [test_cli.py](test_cli.py) (`self.system_prompt`, "CLI TOOLS" section). The LLM can only use tools it knows about from its prompt.
+
 ### Confirmation policy
 - **Read-only tools** (list, get, search, stats): Execute immediately, report results.
 - **Mutating tools** (create, delete, generate, schedule): Describe the action and wait for user confirmation before executing.
@@ -167,25 +169,28 @@ Requires `TAVILY_API_KEY` in environment.
 |------|-------------|
 | `search.py QUERY [--max-results N]` | Search the web, return raw results (no LLM summarization) |
 
-### nhentai (`tools/nhentai/`)
-
-| Tool | Description |
-|------|-------------|
-| `fetch_preview.py CODE [--output-dir DIR]` | Fetch preview image for 6-digit code |
-
 ### Discord (`tools/discord/`)
 Requires `DISCORD_BOT_TOKEN` in env. Webhook tools also need `DISCORD_WEBHOOK_<NAME>` URLs.
 
 | Tool | Description |
 |------|-------------|
 | `send_message.py --channel-id ID --content TEXT [--reply-to MSG_ID]` | Send message as the bot to any channel. Supports mentions. |
+| `edit_message.py --channel-id ID --message-id ID --content TEXT` | Edit a bot-sent message |
+| `delete_message.py --channel-id ID --message-id ID` | Delete a message (own or others with Manage Messages) |
 | `get_channel_history.py --channel-id ID [--limit N] [--before MSG_ID] [--after MSG_ID] [--user-id ID]` | Fetch recent messages (max 100, default 10) |
 | `search_messages.py --guild-id ID --query TEXT [--channel-id ID] [--author-id ID] [--max-results N]` | Search messages across the server |
+| `get_user.py --user-id ID [--guild-id ID]` | Get user info (add guild-id for nickname, roles, join date) |
 | `add_role.py --guild-id ID --user-id ID --role-id ID` | Add a role to a user |
 | `remove_role.py --guild-id ID --user-id ID --role-id ID` | Remove a role from a user |
 | `list_roles.py --guild-id ID` | List all server roles with IDs |
+| `set_nickname.py --guild-id ID --user-id ID --nickname TEXT [--clear]` | Set or clear a member's nickname |
+| `timeout_user.py --guild-id ID --user-id ID --duration DURATION [--remove]` | Timeout a member (e.g. 10m, 1h, 7d). Max 28d |
 | `react.py --channel-id ID --message-id ID --emoji EMOJI` | Add reaction (Unicode or custom name:id) |
 | `pin_message.py --channel-id ID --message-id ID [--unpin]` | Pin or unpin a message |
+| `create_thread.py --channel-id ID --name TEXT [--message-id ID] [--content TEXT] [--auto-archive N]` | Create a thread (from message or standalone) |
+| `list_channels.py --guild-id ID [--type N]` | List channels (0=text, 2=voice, 4=category) |
+| `create_channel.py --guild-id ID --name TEXT [--type N] [--parent-id ID] [--topic TEXT]` | Create a text, voice, or category channel |
+| `delete_channel.py --channel-id ID` | Delete a channel (irreversible) |
 | `send_webhook.py --webhook NAME --content TEXT [--username NAME]` | Send message via webhook (different identity). Supports `<@USER_ID>` mentions. |
 
 **Reminder workflow:** Combine scheduler `--once` with `send_message.py`:

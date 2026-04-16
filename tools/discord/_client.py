@@ -55,6 +55,13 @@ class DiscordClient:
         req = urllib.request.Request(url, headers=self._headers(), data=body, method="PUT")
         return self._do(req, endpoint)
 
+    def patch(self, endpoint, data=None):
+        """PATCH JSON to Discord API. Returns parsed JSON."""
+        url = f"{BASE_URL}{endpoint}"
+        body = json.dumps(data or {}).encode("utf-8")
+        req = urllib.request.Request(url, headers=self._headers(), data=body, method="PATCH")
+        return self._do(req, endpoint)
+
     def delete(self, endpoint):
         """DELETE request to Discord API."""
         url = f"{BASE_URL}{endpoint}"

@@ -112,12 +112,21 @@ class TestCLI:
             "- tools/scheduler/ — create_task (--once for one-shot reminders), list_tasks, delete_task\n"
             "- tools/web_search/search.py — search the web\n"
             "- tools/discord/send_message.py — send a message as the bot to any channel\n"
+            "- tools/discord/edit_message.py — edit a bot-sent message\n"
+            "- tools/discord/delete_message.py — delete a message\n"
             "- tools/discord/get_channel_history.py — fetch recent messages from a channel\n"
             "- tools/discord/search_messages.py — search messages in the server\n"
+            "- tools/discord/get_user.py — get user/member info (add --guild-id for nickname, roles, join date)\n"
             "- tools/discord/add_role.py / remove_role.py — manage user roles\n"
             "- tools/discord/list_roles.py — list server roles\n"
+            "- tools/discord/set_nickname.py — set or clear a member's nickname\n"
+            "- tools/discord/timeout_user.py — timeout a member (e.g. 10m, 1h, 7d)\n"
             "- tools/discord/react.py — add a reaction to a message\n"
             "- tools/discord/pin_message.py — pin/unpin a message\n"
+            "- tools/discord/create_thread.py — create a thread (from message or standalone)\n"
+            "- tools/discord/list_channels.py — list guild channels\n"
+            "- tools/discord/create_channel.py — create a text, voice, or category channel\n"
+            "- tools/discord/delete_channel.py — delete a channel\n"
             "- tools/discord/send_webhook.py — send Discord messages via webhook\n"
             "For reminders: use tools/scheduler/create_task.py --once with a command that calls tools/discord/send_message.py. "
             "Use the channel_id from [Current context] unless the user specifies a different channel. "
@@ -847,15 +856,6 @@ class TestCLI:
                             print(c(f"  Plugin '{arg}' not found or not loaded", "red"))
                 else:
                     print(c(f"  Unknown command: {cmd}", "red"))
-                continue
-
-            # --- 6-digit nhentai code ---
-            if re.fullmatch(r'\d{6}', text):
-                link = f"https://nhentai.net/g/{text}/"
-                preview_page = f"https://nhentai.net/g/{text}/3"
-                print(c(f"  {link}", "green"))
-                print(c(f"  (preview image fetched from page 3 and embedded)", "cyan"))
-                print()
                 continue
 
             # --- Regular message ---
