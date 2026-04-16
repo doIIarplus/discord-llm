@@ -91,7 +91,11 @@ OUTPUT_DIR_T2I = os.path.join(OUTPUT_DIR, "txt2img")
 OUTPUT_DIR_I2I = os.path.join(OUTPUT_DIR, "img2img")
 
 # Context Configuration
-CONTEXT_LIMIT = 20
+# Channel context is sized by cumulative character count of message contents,
+# not by a fixed message count. CONTEXT_MAX_MESSAGES is a hard upper bound to
+# avoid runaway DB reads when messages are very short.
+CONTEXT_CHAR_LIMIT = 8000
+CONTEXT_MAX_MESSAGES = 200
 VISION_MODEL_CTX = 32768  # Cap context window for vision models to avoid OOM (default 256K is way too much)
 
 # Discord Message Configuration

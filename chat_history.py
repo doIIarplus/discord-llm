@@ -13,7 +13,15 @@ import os
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Tuple
 
-from config import PROJECT_DIR, MEMORY_CHANNEL_ALLOWLIST, IMAGE_RECOGNITION_MODEL, OLLAMA_API_URL, VISION_MODEL_CTX
+from config import (
+    PROJECT_DIR,
+    MEMORY_CHANNEL_ALLOWLIST,
+    IMAGE_RECOGNITION_MODEL,
+    OLLAMA_API_URL,
+    VISION_MODEL_CTX,
+    CONTEXT_CHAR_LIMIT,
+    CONTEXT_MAX_MESSAGES,
+)
 
 ALIASES_PATH = os.path.join(PROJECT_DIR, "user_aliases.json")
 
@@ -400,13 +408,21 @@ async def _summarize_images(message_id: str, attachments) -> None:
 def get_recent_channel_messages(
     guild_id: str,
     channel_id: str,
-    limit: int = 20,
+    char_limit: int = CONTEXT_CHAR_LIMIT,
+    max_messages: int = CONTEXT_MAX_MESSAGES,
 ) -> List[dict]:
-    """Get the most recent messages in a channel, in chronological order.
+    """Get recent messages in a channel, sized by cumulative character count.
 
-    Returns dicts with: message_id, author_id, author_name, content,
-    reply_to_message_id, has_attachments, attachment_info, image_summary,
-    edit_history, created_at.
+    Walks backwards from the newest message and accumulates the character
+    length of each message's content (plus image_summary, since that text is
+    also injected into the prompt). Stops as soon as the cumulative count
+    exceeds ``char_limit``, but always includes the message that pushed it
+    over so the most recent message is never dropped. ``max_messages`` is a
+    hard safety bound on how many rows are pulled from the DB.
+
+    Returns dicts in chronological (oldest-first) order, with: message_id,
+    author_id, author_name, content, reply_to_message_id, has_attachments,
+    attachment_info, image_summary, edit_history, created_at.
     """
     conn = _get_conn()
     cursor = conn.execute(
@@ -417,11 +433,21 @@ def get_recent_channel_messages(
            WHERE guild_id = ? AND channel_id = ?
            ORDER BY id DESC
            LIMIT ?""",
-        (guild_id, channel_id, limit),
+        (guild_id, channel_id, max_messages),
     )
-    rows = [dict(r) for r in cursor.fetchall()]
-    rows.reverse()  # chronological order
-    return rows
+
+    selected: List[dict] = []
+    total_chars = 0
+    for row in cursor:
+        d = dict(row)
+        msg_chars = len(d.get("content") or "") + len(d.get("image_summary") or "")
+        selected.append(d)
+        total_chars += msg_chars
+        if total_chars >= char_limit:
+            break
+
+    selected.reverse()  # chronological order
+    return selected
 
 
 # ---------------------------------------------------------------------------

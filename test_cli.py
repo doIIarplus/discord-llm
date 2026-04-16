@@ -37,7 +37,13 @@ import aiohttp
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import CONTEXT_LIMIT, CHAT_MODEL, IMAGE_RECOGNITION_MODEL, MAX_DISCORD_MESSAGE_LENGTH
+from config import (
+    CONTEXT_CHAR_LIMIT,
+    CONTEXT_MAX_MESSAGES,
+    CHAT_MODEL,
+    IMAGE_RECOGNITION_MODEL,
+    MAX_DISCORD_MESSAGE_LENGTH,
+)
 from ollama_client import OllamaClient
 from claude_code_client import ClaudeCodeClient, RateLimitError
 from models import is_claude_code_model, Txt2TxtModel
@@ -246,8 +252,15 @@ class TestCLI:
             "image_files": image_files,
         })
 
-        # Maintain context limit
-        if len(self.context) > CONTEXT_LIMIT:
+        # Maintain context limit: trim oldest entries until we're under the
+        # cumulative char limit, with a hard message-count safety bound.
+        def _entry_chars(entry: dict) -> int:
+            return len(entry.get("content") or "")
+
+        while (
+            len(self.context) > CONTEXT_MAX_MESSAGES
+            or sum(_entry_chars(e) for e in self.context) > CONTEXT_CHAR_LIMIT
+        ) and len(self.context) > 1:
             self.context.pop(0)
 
         return fetched_sources

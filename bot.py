@@ -21,7 +21,8 @@ from PIL import Image
 
 from commands import CommandHandlers
 from config import (
-    CONTEXT_LIMIT,
+    CONTEXT_CHAR_LIMIT,
+    CONTEXT_MAX_MESSAGES,
     DISCORD_BOT_TOKEN,
     FILE_INPUT_FOLDER,
     GUILD_ID,
@@ -485,10 +486,12 @@ class OllamaBot(discord.Client):
     ):
         """Build conversation context from persistent chat history.
 
-        Fetches the last CONTEXT_LIMIT messages from chat_history.db for this
-        channel, so the bot sees all recent conversation — not just direct
-        interactions. The current message's attachments (images/docs) and web
-        extractions are still processed and attached to the final entry.
+        Fetches recent messages from chat_history.db for this channel, sized
+        by cumulative character count (CONTEXT_CHAR_LIMIT) and capped at
+        CONTEXT_MAX_MESSAGES, so the bot sees all recent conversation — not
+        just direct interactions. The current message's attachments
+        (images/docs) and web extractions are still processed and attached to
+        the final entry.
         """
         if image_files is None:
             image_files = []
@@ -498,13 +501,15 @@ class OllamaBot(discord.Client):
         channel = message.channel.id
         bot_user_id = str(self.user.id)
 
-        # Fetch recent messages from persistent DB (includes all users + bot)
-        # We fetch CONTEXT_LIMIT - 1 because the current message will be appended
+        # Fetch recent messages from persistent DB (includes all users + bot).
+        # The current message will be appended below; get_recent_channel_messages
+        # filters/trims by cumulative character count, so we don't pre-deduct.
         db_messages = await asyncio.to_thread(
             chat_history.get_recent_channel_messages,
             guild_id=str(server),
             channel_id=str(channel),
-            limit=CONTEXT_LIMIT - 1,
+            char_limit=CONTEXT_CHAR_LIMIT,
+            max_messages=CONTEXT_MAX_MESSAGES,
         )
 
         # Convert DB rows into the context format used by format_prompt/query_ollama
