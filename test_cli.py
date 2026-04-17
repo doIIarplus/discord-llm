@@ -38,8 +38,7 @@ import aiohttp
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
-    CONTEXT_CHAR_LIMIT,
-    CONTEXT_MAX_MESSAGES,
+    CONTEXT_LIMIT,
     CHAT_MODEL,
     IMAGE_RECOGNITION_MODEL,
     MAX_DISCORD_MESSAGE_LENGTH,
@@ -257,15 +256,8 @@ class TestCLI:
             "image_files": image_files,
         })
 
-        # Maintain context limit: trim oldest entries until we're under the
-        # cumulative char limit, with a hard message-count safety bound.
-        def _entry_chars(entry: dict) -> int:
-            return len(entry.get("content") or "")
-
-        while (
-            len(self.context) > CONTEXT_MAX_MESSAGES
-            or sum(_entry_chars(e) for e in self.context) > CONTEXT_CHAR_LIMIT
-        ) and len(self.context) > 1:
+        # Maintain context limit
+        if len(self.context) > CONTEXT_LIMIT:
             self.context.pop(0)
 
         return fetched_sources
