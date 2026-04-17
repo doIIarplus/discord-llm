@@ -22,6 +22,15 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _common import output
 
+try:
+    from croniter import croniter
+except ImportError:
+    sys.stderr.write(
+        "ERROR: croniter is required for tools/scheduler/run_due.py. "
+        "Install it with: pip install croniter\n"
+    )
+    raise
+
 TASKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks.json")
 PROJECT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 LOG_FILE = os.path.join(PROJECT_DIR, "scheduler.log")
@@ -35,14 +44,25 @@ _handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message
 _logger.addHandler(_handler)
 
 
-def _next_run(cron_expr):
-    """Compute the next run time from now."""
+def _next_run(cron_expr, current_next_run=None):
+    """Compute the next run time from now.
+
+    Returns an ISO-formatted next-run timestamp on success. On any failure
+    (invalid cron expression, unexpected croniter error), logs the error and
+    returns ``current_next_run`` unchanged so the caller does not overwrite
+    a valid next_run with None (which would cause the task to re-fire every
+    minute because _is_due treats missing next_run as not-due, but callers
+    that blindly assign would clobber the existing value).
+    """
     try:
-        from croniter import croniter
         cron = croniter(cron_expr, datetime.now(timezone.utc))
         return cron.get_next(datetime).isoformat()
-    except ImportError:
-        return None
+    except Exception as e:
+        _logger.error(
+            f"_next_run failed for cron_expr={cron_expr!r}: {e!r}. "
+            f"Returning current next_run unchanged."
+        )
+        return current_next_run
 
 
 def _is_due(task):
@@ -174,9 +194,38 @@ def main():
 
         # Update timestamps
         task["last_run"] = now.isoformat()
-        next_run = _next_run(task["schedule"])
-        if next_run:
-            task["next_run"] = next_run
+        current_next_run = task.get("next_run")
+        new_next_run = _next_run(task["schedule"], current_next_run)
+
+        # Safety: only overwrite next_run if it strictly advances past the
+        # previous value. If _next_run returned the old value (error path)
+        # or somehow produced a timestamp <= current, updating would either
+        # be a no-op or leave the task due-again-immediately, causing it to
+        # re-fire every minute until a human intervenes.
+        if new_next_run and new_next_run != current_next_run:
+            try:
+                new_dt = datetime.fromisoformat(new_next_run)
+                if new_dt.tzinfo is None:
+                    new_dt = new_dt.replace(tzinfo=timezone.utc)
+                cur_dt = None
+                if current_next_run:
+                    cur_dt = datetime.fromisoformat(current_next_run)
+                    if cur_dt.tzinfo is None:
+                        cur_dt = cur_dt.replace(tzinfo=timezone.utc)
+                if cur_dt is not None and new_dt <= cur_dt:
+                    _logger.error(
+                        f"_next_run did not advance for {task_label}: "
+                        f"new={new_next_run} <= current={current_next_run}. "
+                        f"Skipping next_run update to avoid re-firing every minute."
+                    )
+                else:
+                    task["next_run"] = new_next_run
+            except (ValueError, TypeError) as e:
+                _logger.error(
+                    f"Could not parse next_run for {task_label} "
+                    f"(new={new_next_run!r}, current={current_next_run!r}): {e!r}. "
+                    f"Skipping next_run update."
+                )
 
     # Remove one-shot tasks that have been executed
     if not args.dry_run and executed:
