@@ -24,12 +24,14 @@ from _common import output
 
 try:
     from croniter import croniter
-except ImportError:
+    _CRONITER_IMPORT_ERROR = None
+except ImportError as _e:
+    croniter = None
+    _CRONITER_IMPORT_ERROR = _e
     sys.stderr.write(
-        "ERROR: croniter is required for tools/scheduler/run_due.py. "
+        "WARNING: croniter is not installed; scheduled tasks cannot advance. "
         "Install it with: pip install croniter\n"
     )
-    raise
 
 TASKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks.json")
 PROJECT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
@@ -44,25 +46,28 @@ _handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message
 _logger.addHandler(_handler)
 
 
-def _next_run(cron_expr, current_next_run=None):
+def _next_run(cron_expr):
     """Compute the next run time from now.
 
-    Returns an ISO-formatted next-run timestamp on success. On any failure
-    (invalid cron expression, unexpected croniter error), logs the error and
-    returns ``current_next_run`` unchanged so the caller does not overwrite
-    a valid next_run with None (which would cause the task to re-fire every
-    minute because _is_due treats missing next_run as not-due, but callers
-    that blindly assign would clobber the existing value).
+    Returns an ISO-formatted next-run timestamp on success. Raises
+    ``RuntimeError`` with a clear message if croniter is unavailable or
+    fails to parse the schedule — callers MUST handle this and must not
+    leave the task's next_run in the past, otherwise cron will re-fire it
+    every minute (the Splitwise expense flood bug).
     """
+    if croniter is None:
+        raise RuntimeError(
+            f"croniter is not installed; cannot compute next_run for "
+            f"cron_expr={cron_expr!r}. Install it with: pip install croniter "
+            f"(original ImportError: {_CRONITER_IMPORT_ERROR!r})"
+        )
     try:
         cron = croniter(cron_expr, datetime.now(timezone.utc))
         return cron.get_next(datetime).isoformat()
     except Exception as e:
-        _logger.error(
-            f"_next_run failed for cron_expr={cron_expr!r}: {e!r}. "
-            f"Returning current next_run unchanged."
-        )
-        return current_next_run
+        raise RuntimeError(
+            f"croniter failed to parse schedule {cron_expr!r}: {e!r}"
+        ) from e
 
 
 def _is_due(task):
@@ -195,14 +200,25 @@ def main():
         # Update timestamps
         task["last_run"] = now.isoformat()
         current_next_run = task.get("next_run")
-        new_next_run = _next_run(task["schedule"], current_next_run)
+        try:
+            new_next_run = _next_run(task["schedule"])
+        except RuntimeError as e:
+            # _next_run could not compute a new timestamp. If we leave
+            # next_run where it is (in the past), cron will re-fire this
+            # task every minute — this is the Splitwise expense flood bug.
+            # Disable the task so it stops firing until a human fixes the
+            # schedule and re-enables it.
+            _logger.error(
+                f"DISABLING {task_label}: failed to compute next_run: {e}. "
+                f"Task will not re-fire until manually re-enabled."
+            )
+            task["enabled"] = False
+            continue
 
         # Safety: only overwrite next_run if it strictly advances past the
-        # previous value. If _next_run returned the old value (error path)
-        # or somehow produced a timestamp <= current, updating would either
-        # be a no-op or leave the task due-again-immediately, causing it to
-        # re-fire every minute until a human intervenes.
-        if new_next_run and new_next_run != current_next_run:
+        # previous value. A non-advancing timestamp would leave the task
+        # due-again-immediately, causing re-fire every minute.
+        if new_next_run != current_next_run:
             try:
                 new_dt = datetime.fromisoformat(new_next_run)
                 if new_dt.tzinfo is None:
@@ -214,18 +230,19 @@ def main():
                         cur_dt = cur_dt.replace(tzinfo=timezone.utc)
                 if cur_dt is not None and new_dt <= cur_dt:
                     _logger.error(
-                        f"_next_run did not advance for {task_label}: "
-                        f"new={new_next_run} <= current={current_next_run}. "
-                        f"Skipping next_run update to avoid re-firing every minute."
+                        f"DISABLING {task_label}: _next_run did not advance "
+                        f"(new={new_next_run} <= current={current_next_run}). "
+                        f"Task will not re-fire until manually re-enabled."
                     )
+                    task["enabled"] = False
                 else:
                     task["next_run"] = new_next_run
             except (ValueError, TypeError) as e:
                 _logger.error(
-                    f"Could not parse next_run for {task_label} "
-                    f"(new={new_next_run!r}, current={current_next_run!r}): {e!r}. "
-                    f"Skipping next_run update."
+                    f"DISABLING {task_label}: could not parse next_run "
+                    f"(new={new_next_run!r}, current={current_next_run!r}): {e!r}."
                 )
+                task["enabled"] = False
 
     # Remove one-shot tasks that have been executed
     if not args.dry_run and executed:
