@@ -16,7 +16,7 @@ from plugin_base import BasePlugin
 from sandbox import safe_path
 
 BLOCKLIST_PATH = "blocklist.json"
-DEFAULT_BLOCKED = {"354326385822531584"}  # KeerXKeer
+DEFAULT_BLOCKED: Set[str] = set()
 
 
 def _load() -> Set[str]:
