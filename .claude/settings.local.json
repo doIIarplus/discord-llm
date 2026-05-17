@@ -16,7 +16,8 @@
       "Bash(/home/dollarplus/projects/discord_llm_bot/venv/bin/pip install *)",
       "Bash(./venv/bin/python -c ' *)",
       "Bash(./venv/bin/pip list *)",
-      "Bash(./venv/bin/pip install *)"
+      "Bash(./venv/bin/pip install *)",
+      "Bash(./venv/bin/python *)"
     ]
   }
 }

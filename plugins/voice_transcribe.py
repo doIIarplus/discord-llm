@@ -33,18 +33,29 @@ class VoiceTranscribePlugin(BasePlugin):
         self._whisper = None
         self._whisper_lock = asyncio.Lock()
         # Discord voice messages have empty content, so the regex-based
-        # plugin message handlers never fire for them. Hook the raw event.
-        self.ctx.discord_client.add_listener(
-            self._on_message_raw, name="on_message"
-        )
+        # plugin message handlers never fire. discord.Client also lacks
+        # add_listener (that's only on commands.Bot), so wrap on_message.
+        bot = self.ctx.discord_client
+        self._original_on_message = bot.on_message
+        original = self._original_on_message
+
+        async def wrapped_on_message(message):
+            try:
+                if self._is_target_voice(message):
+                    await self._handle_voice(message, original)
+                    return
+            except Exception:
+                self.logger.exception(
+                    "voice handling failed; falling through to normal on_message"
+                )
+            await original(message)
+
+        bot.on_message = wrapped_on_message
 
     async def on_unload(self):
-        try:
-            self.ctx.discord_client.remove_listener(
-                self._on_message_raw, name="on_message"
-            )
-        except Exception:
-            pass
+        if hasattr(self, "_original_on_message"):
+            self.ctx.discord_client.on_message = self._original_on_message
+            del self._original_on_message
         self._whisper = None
 
     async def _ensure_whisper(self):
@@ -70,20 +81,15 @@ class VoiceTranscribePlugin(BasePlugin):
         segments, _ = self._whisper.transcribe(audio_path, beam_size=5)
         return " ".join(seg.text.strip() for seg in segments).strip()
 
-    async def _on_message_raw(self, message: discord.Message):
-        if message.author.bot:
-            return
-        if message.guild is None:
-            return
+    def _is_target_voice(self, message: discord.Message) -> bool:
+        if message.author.bot or message.guild is None:
+            return False
         if message.channel.id not in VOICE_TRANSCRIBE_CHANNEL_IDS:
-            return
+            return False
+        return any(a.is_voice_message for a in message.attachments)
 
-        voice_att = next(
-            (a for a in message.attachments if a.is_voice_message), None
-        )
-        if voice_att is None:
-            return
-
+    async def _handle_voice(self, message: discord.Message, original_on_message):
+        voice_att = next(a for a in message.attachments if a.is_voice_message)
         self.logger.info(
             f"Voice message from {message.author.display_name} "
             f"in #{getattr(message.channel, 'name', message.channel.id)} "
@@ -130,4 +136,4 @@ class VoiceTranscribePlugin(BasePlugin):
         if bot.user not in message.mentions:
             message.mentions.append(bot.user)
 
-        await bot.on_message(message)
+        await original_on_message(message)
