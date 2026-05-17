@@ -10,7 +10,13 @@
       "Bash(python3:*)",
       "Bash(python tools/:*)",
       "WebSearch",
-      "Bash(curl -sL https://raw.githubusercontent.com/QwenLM/Qwen3.6/main/README.md)"
+      "Bash(curl -sL https://raw.githubusercontent.com/QwenLM/Qwen3.6/main/README.md)",
+      "Bash(/home/dollarplus/projects/discord_llm_bot/venv/bin/python -c \"import discord; print\\('discord.py', discord.__version__\\); print\\('voice flag:', hasattr\\(discord.MessageFlags, 'voice'\\)\\)\")",
+      "Bash(/home/dollarplus/projects/discord_llm_bot/venv/bin/python *)",
+      "Bash(/home/dollarplus/projects/discord_llm_bot/venv/bin/pip install *)",
+      "Bash(./venv/bin/python -c ' *)",
+      "Bash(./venv/bin/pip list *)",
+      "Bash(./venv/bin/pip install *)"
     ]
   }
 }

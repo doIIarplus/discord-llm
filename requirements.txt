@@ -21,3 +21,5 @@ transformers
 torch
 pillow
 accelerate
+faster-whisper
+aioimaplib
