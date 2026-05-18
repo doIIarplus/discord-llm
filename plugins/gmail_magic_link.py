@@ -15,7 +15,7 @@ logger = logging.getLogger("Plugin.gmail_magic_link")
 
 TARGET_CHANNEL_ID = 1483701977954123806
 SUBJECT_FILTER = "Secure link to log in to Claude.ai"
-MAGIC_LINK_RE = re.compile(r'https://claude\.ai/magic-link#[^\s"\'<>]+')
+MAGIC_LINK_RE = re.compile(r'https://claude\.ai/magic-link(?:\?[^\s"\'<>#]*)?#[^\s"\'<>]+')
 
 IMAP_HOST = "imap.gmail.com"
 IDLE_TIMEOUT_SECONDS = 25 * 60  # Gmail kicks IDLE around 29 min — refresh before that
