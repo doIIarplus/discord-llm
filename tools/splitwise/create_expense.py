@@ -158,6 +158,9 @@ def main():
     parser.add_argument("--paid-by", type=int, default=None,
                         metavar="USER_ID",
                         help="User ID of payer (default: authenticated user)")
+    parser.add_argument("--date",
+                        help="Expense date in YYYY-MM-DD format (default: today). "
+                             "Use this for backfilling historical expenses.")
     args = parser.parse_args()
 
     if args.ratios and args.shares:
@@ -187,6 +190,9 @@ def main():
     data["currency_code"] = args.currency
     if args.group_id:
         data["group_id"] = args.group_id
+    if args.date:
+        # Splitwise expects ISO 8601; midnight UTC on the given day is fine.
+        data["date"] = f"{args.date}T00:00:00Z"
 
     # Check for duplicate before creating
     _check_duplicate(client, args.description, args.amount)
