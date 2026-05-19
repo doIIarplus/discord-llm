@@ -43,7 +43,7 @@ logger.info(f"Discord configuration loaded. Guild ID: {GUILD_ID}")
 
 # DM allowlist: only these Discord user IDs may DM the bot.
 # Messages from any other user are silently ignored.
-DM_ALLOWLIST: set = {118567805678256128}
+DM_ALLOWLIST: set = {118567805678256128, 124917446049005570}
 
 # Sentinel guild_id used in chat_history when recording DMs.
 # Schema requires guild_id TEXT NOT NULL; "0" cannot collide with real Discord IDs.
