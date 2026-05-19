@@ -23,6 +23,8 @@ from commands import CommandHandlers
 from config import (
     CONTEXT_LIMIT,
     DISCORD_BOT_TOKEN,
+    DM_ALLOWLIST,
+    DM_GUILD_SENTINEL,
     FILE_INPUT_FOLDER,
     GUILD_ID,
     IMAGE_RECOGNITION_MODEL,
@@ -429,7 +431,8 @@ class OllamaBot(discord.Client):
         """Handle message edits — update chat_history.db with the new content."""
         if after.author.bot:
             return
-        if after.guild is None:
+        # Allow edits in DMs from allowlisted users; otherwise require a guild
+        if after.guild is None and after.author.id not in DM_ALLOWLIST:
             return
         if before.content == after.content:
             return  # Embed-only update (link preview etc.), not a real edit
@@ -441,14 +444,20 @@ class OllamaBot(discord.Client):
         if message.author.bot:
             return
 
-        # Ignore DMs (no guild)
-        if message.guild is None:
+        # DM handling: only allowlisted users may DM the bot.
+        # In DMs, every message from an allowlisted user triggers a response
+        # (no @mention required — DMs are inherently direct).
+        is_dm = isinstance(message.channel, discord.DMChannel)
+        if is_dm and message.author.id not in DM_ALLOWLIST:
             return
 
-        # Record to persistent chat history (before any early returns)
+        # Record to persistent chat history (before any early returns).
+        # For DMs, chat_history uses DM_GUILD_SENTINEL as guild_id.
         await chat_history.record_message(message)
 
-        server = message.guild.id
+        # For DMs, use the sentinel guild id for in-memory context keying
+        # so /pick_model, build_context, and query_ollama all work uniformly.
+        server = message.guild.id if message.guild else int(DM_GUILD_SENTINEL)
         channel = message.channel.id
 
         # logger.info(f"[MSG-DEBUG] on_message: msg_id={message.id} author={message.author.display_name}"
@@ -476,24 +485,25 @@ class OllamaBot(discord.Client):
             else:
                 document_files.append(file_path)
 
-        # Determine response mode
-        is_direct_mention = self.user in message.mentions
-        is_reply_to_bot = False
+        # Determine response mode. DMs are inherently direct — always respond.
+        if not is_dm:
+            is_direct_mention = self.user in message.mentions
+            is_reply_to_bot = False
 
-        if message.reference:
-            # Use cached resolved message when available
-            ref_msg = message.reference.resolved
-            if ref_msg is None:
-                try:
-                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
-                except discord.NotFound:
-                    ref_msg = None
-            if ref_msg and ref_msg.author.id == self.user.id:
-                is_reply_to_bot = True
+            if message.reference:
+                # Use cached resolved message when available
+                ref_msg = message.reference.resolved
+                if ref_msg is None:
+                    try:
+                        ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                    except discord.NotFound:
+                        ref_msg = None
+                if ref_msg and ref_msg.author.id == self.user.id:
+                    is_reply_to_bot = True
 
-        # Only respond to direct mentions and replies
-        if not (is_direct_mention or is_reply_to_bot):
-            return
+            # Only respond to direct mentions and replies in guild channels
+            if not (is_direct_mention or is_reply_to_bot):
+                return
 
         # Track last active channel for crash reporting
         self._state["last_active_channel_id"] = channel

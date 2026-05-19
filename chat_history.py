@@ -20,6 +20,7 @@ from config import (
     OLLAMA_API_URL,
     VISION_MODEL_CTX,
     CONTEXT_LIMIT,
+    DM_GUILD_SENTINEL,
 )
 
 ALIASES_PATH = os.path.join(PROJECT_DIR, "user_aliases.json")
@@ -235,6 +236,10 @@ async def record_message(message) -> None:
         print(f"[chat_history] Skipping message {message.id} — channel {channel_id_str} not in allowlist")
         return
 
+    # DMs have no guild — use sentinel so the NOT NULL column is satisfied
+    # and DM rows are distinguishable from any real guild.
+    guild_id_str = str(message.guild.id) if message.guild else DM_GUILD_SENTINEL
+
     # Build attachment info if present
     attachment_info = None
     has_attachments = bool(message.attachments)
@@ -255,7 +260,7 @@ async def record_message(message) -> None:
     await asyncio.to_thread(
         _record_message_sync,
         message_id=str(message.id),
-        guild_id=str(message.guild.id),
+        guild_id=guild_id_str,
         channel_id=channel_id_str,
         author_id=str(message.author.id),
         author_name=message.author.display_name,
@@ -266,12 +271,12 @@ async def record_message(message) -> None:
         created_at=message.created_at.isoformat(),
     )
 
-    # Cache the channel name from Discord
+    # Cache the channel name from Discord (DMChannel has no .name)
     channel_name = getattr(message.channel, "name", None)
     if channel_name:
         await asyncio.to_thread(
             _update_channel_name_sync,
-            str(message.guild.id), str(message.channel.id), channel_name,
+            guild_id_str, str(message.channel.id), channel_name,
         )
 
     # Summarize images in the background (non-blocking)

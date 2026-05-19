@@ -41,6 +41,14 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = int(os.getenv("GUILD_ID", "363154169294618625"))
 logger.info(f"Discord configuration loaded. Guild ID: {GUILD_ID}")
 
+# DM allowlist: only these Discord user IDs may DM the bot.
+# Messages from any other user are silently ignored.
+DM_ALLOWLIST: set = {118567805678256128}
+
+# Sentinel guild_id used in chat_history when recording DMs.
+# Schema requires guild_id TEXT NOT NULL; "0" cannot collide with real Discord IDs.
+DM_GUILD_SENTINEL = "0"
+
 # Ollama Configuration
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:35b-a3b-q8_0")
