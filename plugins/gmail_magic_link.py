@@ -1,26 +1,58 @@
 """Watch a Gmail inbox via IMAP IDLE for Claude.ai magic-link emails
-and forward the link to a Discord channel, then delete the email."""
+and forward the link to a Discord channel.
+
+Emails are NEVER deleted or marked Seen — they stay visible in your inbox.
+Dedupe is handled locally via [[email_dedupe]] (a SQLite store of
+Message-IDs we've already processed).
+
+On first run (empty dedupe store), every existing matching email is treated
+as already-processed. Only emails that arrive AFTER first startup are acted on.
+"""
 
 import asyncio
 import email
 import logging
 import os
 import re
+import sys
 
 from aioimaplib import aioimaplib
 
-from plugin_base import BasePlugin
+# Ensure project root is on sys.path so we can import email_dedupe
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import email_dedupe  # noqa: E402
+from plugin_base import BasePlugin  # noqa: E402
 
 logger = logging.getLogger("Plugin.gmail_magic_link")
 
+PLUGIN_NAME = "gmail_magic_link"
 TARGET_CHANNEL_ID = 1483701977954123806
 SUBJECT_FILTER = "Secure link to log in to Claude.ai"
-MAGIC_LINK_RE = re.compile(r'https://claude\.ai/magic-link(?:\?[^\s"\'<>#]*)?#[^\s"\'<>]+')
+# Match any URL that contains "magic-link" anywhere — Anthropic keeps
+# changing the path/query format and this future-proofs against further changes.
+MAGIC_LINK_RE = re.compile(r'https?://[^\s"\'<>]*magic-link[^\s"\'<>]*')
 
 IMAP_HOST = "imap.gmail.com"
-IDLE_TIMEOUT_SECONDS = 25 * 60  # Gmail kicks IDLE around 29 min — refresh before that
+IDLE_TIMEOUT_SECONDS = 25 * 60
 RECONNECT_BACKOFF_INITIAL = 5
 RECONNECT_BACKOFF_MAX = 300
+
+# Match Message-ID: across any line of an IMAP fetch response
+_MSGID_RE = re.compile(r'^Message-ID:\s*(.+?)\s*$', re.MULTILINE | re.IGNORECASE)
+
+
+def _join_fetch_bytes(lines) -> bytes:
+    """Concatenate every bytes-ish line from an aioimaplib fetch response."""
+    return b"\n".join(bytes(ln) for ln in lines if isinstance(ln, (bytes, bytearray)))
+
+
+def _extract_message_id(raw_bytes: bytes) -> str:
+    """Pull Message-ID out of raw response bytes (header or full payload)."""
+    if not raw_bytes:
+        return ""
+    text = raw_bytes.decode("utf-8", errors="replace")
+    m = _MSGID_RE.search(text)
+    return m.group(1).strip() if m else ""
 
 
 def _extract_magic_link(raw_bytes: bytes) -> str | None:
@@ -44,8 +76,8 @@ def _extract_magic_link(raw_bytes: bytes) -> str | None:
 
 class GmailMagicLinkPlugin(BasePlugin):
     name = "gmail_magic_link"
-    version = "1.0.0"
-    description = "Forward Claude.ai magic-link emails from Gmail to a Discord channel"
+    version = "2.0.0"
+    description = "Forward Claude.ai magic-link emails to Discord (no email deletion, local dedupe)"
 
     async def on_load(self):
         self._email = os.getenv("GMAIL_ADDRESS", "")
@@ -91,10 +123,8 @@ class GmailMagicLinkPlugin(BasePlugin):
                 self.logger.info("IMAP connected, inbox selected")
                 backoff = RECONNECT_BACKOFF_INITIAL
 
-                # Catch up on anything that arrived while we were offline.
                 await self._scan_and_process(imap)
 
-                # Push loop.
                 while not self._stop.is_set():
                     idle_task = await imap.idle_start(timeout=IDLE_TIMEOUT_SECONDS)
                     try:
@@ -115,7 +145,7 @@ class GmailMagicLinkPlugin(BasePlugin):
                 self.logger.warning(f"IMAP loop error: {e}; reconnecting in {backoff}s")
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=backoff)
-                    return  # stop event set
+                    return
                 except asyncio.TimeoutError:
                     pass
                 backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
@@ -129,12 +159,8 @@ class GmailMagicLinkPlugin(BasePlugin):
     # ── Email handling ───────────────────────────────────────────────────
 
     async def _scan_and_process(self, imap):
-        """Find and forward all matching UNSEEN messages, deleting each one."""
-        # Gmail returns sequence-number SEARCH unless we ask for UID SEARCH.
-        # Build a quoted subject literal.
-        resp = await imap.uid_search(
-            "UNSEEN", "SUBJECT", f'"{SUBJECT_FILTER}"'
-        )
+        """Search ALL matching messages (any flag state), skip already-processed."""
+        resp = await imap.uid_search("SUBJECT", f'"{SUBJECT_FILTER}"')
         if resp.result != "OK":
             self.logger.warning(f"uid_search failed: {resp}")
             return
@@ -143,40 +169,82 @@ class GmailMagicLinkPlugin(BasePlugin):
         if not uids:
             return
 
-        self.logger.info(f"Found {len(uids)} matching email(s): {uids}")
+        # First-run seeding: if this plugin has never processed anything before,
+        # treat every existing matching email as already-processed. Only emails
+        # that arrive AFTER first startup will be acted on.
+        has_history = await asyncio.to_thread(email_dedupe.has_any, PLUGIN_NAME)
+        if not has_history:
+            seeded = await self._seed_backlog(imap, uids)
+            self.logger.info(
+                f"First run — seeded {seeded} existing matching email(s) as processed; "
+                f"backlog ignored"
+            )
+            return
 
         for uid in uids:
             try:
-                fetch_resp = await imap.uid("fetch", uid, "(RFC822)")
-                if fetch_resp.result != "OK":
-                    self.logger.warning(f"fetch uid={uid} failed: {fetch_resp}")
-                    continue
-
-                raw = self._extract_rfc822(fetch_resp.lines)
-                if not raw:
-                    self.logger.warning(f"uid={uid}: no RFC822 payload in fetch response")
-                    continue
-
-                link = _extract_magic_link(raw)
-                if not link:
-                    self.logger.warning(f"uid={uid}: no magic link found in body")
-                    continue
-
-                self.logger.info(f"uid={uid}: forwarding magic link to channel {TARGET_CHANNEL_ID}")
-                await self.ctx.send_message(TARGET_CHANNEL_ID, link)
-
-                # Mark deleted, then expunge so it actually disappears.
-                await imap.uid("store", uid, "+FLAGS", "(\\Deleted)")
-                await imap.expunge()
-                self.logger.info(f"uid={uid}: deleted")
+                await self._process_one(imap, uid)
             except Exception as e:
                 self.logger.exception(f"Failed to process uid={uid}: {e}")
 
-    @staticmethod
-    def _extract_rfc822(lines) -> bytes | None:
-        """aioimaplib FETCH returns multiple lines; the body is typically the
-        second element. Find the first bytes object that looks like an email."""
-        for ln in lines:
-            if isinstance(ln, (bytes, bytearray)) and len(ln) > 100:
-                return bytes(ln)
-        return None
+    async def _seed_backlog(self, imap, uids) -> int:
+        """Fetch Message-IDs (PEEK — no Seen flag) and seed the dedupe store."""
+        msg_ids: list[str] = []
+        for uid in uids:
+            r = await imap.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+            if r.result != "OK":
+                continue
+            raw = _join_fetch_bytes(r.lines)
+            mid = _extract_message_id(raw)
+            if mid:
+                msg_ids.append(mid)
+        return await asyncio.to_thread(
+            email_dedupe.bulk_mark_processed, PLUGIN_NAME, msg_ids
+        )
+
+    async def _process_one(self, imap, uid: str):
+        # Cheap check first: peek just the Message-ID header.
+        r = await imap.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+        if r.result != "OK":
+            self.logger.warning(f"header-fetch uid={uid} failed: {r}")
+            return
+        mid = _extract_message_id(_join_fetch_bytes(r.lines))
+        if mid and await asyncio.to_thread(email_dedupe.is_processed, PLUGIN_NAME, mid):
+            return  # already done
+
+        # Fetch the full body WITHOUT setting \Seen.
+        fr = await imap.uid("fetch", uid, "(BODY.PEEK[])")
+        if fr.result != "OK":
+            self.logger.warning(f"body-fetch uid={uid} failed: {fr}")
+            return
+        raw = b""
+        for ln in fr.lines:
+            if isinstance(ln, (bytes, bytearray)) and len(ln) > len(raw):
+                raw = bytes(ln)
+        if not raw or len(raw) < 100:
+            self.logger.warning(f"uid={uid}: empty/short body, skipping")
+            return
+
+        if not mid:
+            mid = _extract_message_id(raw)  # fallback from full payload
+
+        link = _extract_magic_link(raw)
+        if not link:
+            self.logger.warning(
+                f"uid={uid} mid={mid[:60]}: no magic-link URL found in body"
+            )
+            # Don't mark processed — we may want to retry after a regex fix.
+            return
+
+        self.logger.info(
+            f"uid={uid} mid={mid[:60]}: forwarding magic link to channel {TARGET_CHANNEL_ID}"
+        )
+        await self.ctx.send_message(TARGET_CHANNEL_ID, link)
+
+        if mid:
+            await asyncio.to_thread(email_dedupe.mark_processed, PLUGIN_NAME, mid)
+        else:
+            self.logger.warning(
+                f"uid={uid}: forwarded but no Message-ID found — "
+                f"future scans may re-forward this email"
+            )

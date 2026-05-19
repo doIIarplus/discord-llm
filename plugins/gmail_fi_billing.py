@@ -1,6 +1,13 @@
 """Watch a Gmail inbox via IMAP IDLE for Google Fi monthly statements,
 auto-create a Splitwise expense, and DM the user the result.
 
+Emails are NEVER deleted or marked Seen — they stay visible in your inbox.
+Dedupe is handled locally via [[email_dedupe]] (a SQLite store of
+Message-IDs we've already processed).
+
+On first run (empty dedupe store), every existing matching email is treated
+as already-processed. Only statements that arrive AFTER first startup are acted on.
+
 Account / split are hardcoded for jaspershan's plan:
   payer:        jaspershan (17073080)
   group:        Google Fi (33169167)
@@ -19,9 +26,14 @@ from datetime import datetime
 
 from aioimaplib import aioimaplib
 
-from plugin_base import BasePlugin
+# Ensure project root is on sys.path so we can import email_dedupe
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import email_dedupe  # noqa: E402
+from plugin_base import BasePlugin  # noqa: E402
 
 logger = logging.getLogger("Plugin.gmail_fi_billing")
+
+PLUGIN_NAME = "gmail_fi_billing"
 
 # --- Fixed config ----------------------------------------------------------
 DM_USER_ID = 118567805678256128
@@ -30,7 +42,7 @@ SUBJECT_FILTER = "Google Fi monthly statement"
 SPLITWISE_GROUP_ID = 33169167
 SPLITWISE_PAYER_ID = 17073080            # jaspershan
 SPLITWISE_SPLIT_WITH = ["43460287", "51458857"]  # junshu, Yang
-SPLITWISE_RATIOS = ["2", "1", "1"]       # payer first, then split-with order
+SPLITWISE_RATIOS = ["2", "1", "1"]
 SPLITWISE_CURRENCY = "USD"
 
 CREATE_EXPENSE_SCRIPT = os.path.join(
@@ -46,15 +58,26 @@ RECONNECT_BACKOFF_MAX = 300
 
 TOTAL_RE = re.compile(r'Your total is \$([\d,]+\.\d{2})')
 STATEMENT_DATE_RE = re.compile(r'summary of your ([A-Z][a-z]+ \d+) statement')
+_MSGID_RE = re.compile(r'^Message-ID:\s*(.+?)\s*$', re.MULTILINE | re.IGNORECASE)
 
-# Month name → 1-based number
 _MONTHS = {m: i for i, m in enumerate(
     ["January", "February", "March", "April", "May", "June",
      "July", "August", "September", "October", "November", "December"], start=1)}
 
 
+def _join_fetch_bytes(lines) -> bytes:
+    return b"\n".join(bytes(ln) for ln in lines if isinstance(ln, (bytes, bytearray)))
+
+
+def _extract_message_id(raw_bytes: bytes) -> str:
+    if not raw_bytes:
+        return ""
+    text = raw_bytes.decode("utf-8", errors="replace")
+    m = _MSGID_RE.search(text)
+    return m.group(1).strip() if m else ""
+
+
 def _extract_body_text(raw_bytes: bytes) -> str:
-    """Pull all text/plain bodies out of an email."""
     msg = email.message_from_bytes(raw_bytes)
     parts = []
     for part in msg.walk():
@@ -70,7 +93,7 @@ def _extract_body_text(raw_bytes: bytes) -> str:
 
 
 def _parse_statement(raw_bytes: bytes) -> dict | None:
-    """Return {'amount': float, 'date': 'YYYY-MM-DD'} or None if either is missing."""
+    """Return {'amount', 'date', 'month_label'} or None if either is missing."""
     msg = email.message_from_bytes(raw_bytes)
     body = _extract_body_text(raw_bytes)
     m_total = TOTAL_RE.search(body)
@@ -86,7 +109,6 @@ def _parse_statement(raw_bytes: bytes) -> dict | None:
     if month_num is None:
         return None
 
-    # Year comes from the email's Date header — statement month/day from body
     try:
         sent = email.utils.parsedate_to_datetime(msg.get("Date", ""))
         year = sent.year
@@ -102,8 +124,8 @@ def _parse_statement(raw_bytes: bytes) -> dict | None:
 
 class GmailFiBillingPlugin(BasePlugin):
     name = "gmail_fi_billing"
-    version = "1.0.0"
-    description = "Auto-create Splitwise expense from Google Fi monthly statements"
+    version = "2.0.0"
+    description = "Auto-create Splitwise expense from Google Fi statements (no email deletion, local dedupe)"
 
     async def on_load(self):
         self._email = os.getenv("GMAIL_FI_ADDRESS", "")
@@ -158,7 +180,6 @@ class GmailFiBillingPlugin(BasePlugin):
                 self.logger.info("IMAP connected, inbox selected")
                 backoff = RECONNECT_BACKOFF_INITIAL
 
-                # Catch up on anything unread (e.g. bot was offline when a bill arrived)
                 await self._scan_and_process(imap)
 
                 while not self._stop.is_set():
@@ -195,9 +216,8 @@ class GmailFiBillingPlugin(BasePlugin):
     # ── Email handling ───────────────────────────────────────────────────
 
     async def _scan_and_process(self, imap):
-        resp = await imap.uid_search(
-            "UNSEEN", "SUBJECT", f'"{SUBJECT_FILTER}"'
-        )
+        """Search ALL matching messages (any flag state), skip already-processed."""
+        resp = await imap.uid_search("SUBJECT", f'"{SUBJECT_FILTER}"')
         if resp.result != "OK":
             self.logger.warning(f"uid_search failed: {resp}")
             return
@@ -206,25 +226,60 @@ class GmailFiBillingPlugin(BasePlugin):
         if not uids:
             return
 
-        self.logger.info(f"Found {len(uids)} unread Fi statement(s): {uids}")
+        has_history = await asyncio.to_thread(email_dedupe.has_any, PLUGIN_NAME)
+        if not has_history:
+            seeded = await self._seed_backlog(imap, uids)
+            self.logger.info(
+                f"First run — seeded {seeded} existing matching email(s) as processed; "
+                f"backlog ignored"
+            )
+            return
+
+        self.logger.info(f"Found {len(uids)} matching Fi statement email(s) to inspect")
         for uid in uids:
             try:
                 await self._process_one(imap, uid)
             except Exception as e:
                 self.logger.exception(f"Failed to process uid={uid}: {e}")
 
-    async def _process_one(self, imap, uid: str):
-        fetch_resp = await imap.uid("fetch", uid, "(RFC822)")
-        if fetch_resp.result != "OK":
-            self.logger.warning(f"fetch uid={uid} failed: {fetch_resp}")
-            return
-        raw = max(
-            (bytes(ln) for ln in fetch_resp.lines if isinstance(ln, (bytes, bytearray))),
-            key=len, default=b"",
+    async def _seed_backlog(self, imap, uids) -> int:
+        msg_ids: list[str] = []
+        for uid in uids:
+            r = await imap.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+            if r.result != "OK":
+                continue
+            mid = _extract_message_id(_join_fetch_bytes(r.lines))
+            if mid:
+                msg_ids.append(mid)
+        return await asyncio.to_thread(
+            email_dedupe.bulk_mark_processed, PLUGIN_NAME, msg_ids
         )
-        if not raw:
-            self.logger.warning(f"uid={uid}: empty RFC822 payload")
+
+    async def _process_one(self, imap, uid: str):
+        # Cheap dedupe check using just the Message-ID header.
+        r = await imap.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+        if r.result != "OK":
+            self.logger.warning(f"header-fetch uid={uid} failed: {r}")
             return
+        mid = _extract_message_id(_join_fetch_bytes(r.lines))
+        if mid and await asyncio.to_thread(email_dedupe.is_processed, PLUGIN_NAME, mid):
+            return
+
+        # Fetch full body WITHOUT setting \Seen.
+        fr = await imap.uid("fetch", uid, "(BODY.PEEK[])")
+        if fr.result != "OK":
+            self.logger.warning(f"body-fetch uid={uid} failed: {fr}")
+            return
+        raw = b""
+        for ln in fr.lines:
+            if isinstance(ln, (bytes, bytearray)) and len(ln) > len(raw):
+                raw = bytes(ln)
+        if not raw or len(raw) < 100:
+            self.logger.warning(f"uid={uid}: empty/short body, skipping")
+            return
+
+        if not mid:
+            mid = _extract_message_id(raw)
 
         parsed = _parse_statement(raw)
         if parsed is None:
@@ -233,8 +288,7 @@ class GmailFiBillingPlugin(BasePlugin):
                 f"⚠️ Fi statement (uid {uid}) — couldn't parse amount/date. "
                 f"check the email manually and create the Splitwise expense by hand"
             )
-            # Mark read so we don't loop on the same broken email
-            await imap.uid("store", uid, "+FLAGS", "(\\Seen)")
+            # Don't mark processed — we may want to retry after a parser fix.
             return
 
         amount = parsed["amount"]
@@ -243,7 +297,8 @@ class GmailFiBillingPlugin(BasePlugin):
         desc = f"Google Fi {label}"
 
         self.logger.info(
-            f"uid={uid}: creating Splitwise expense '{desc}' ${amount:.2f} dated {date}"
+            f"uid={uid} mid={mid[:60]}: creating Splitwise expense "
+            f"'{desc}' ${amount:.2f} dated {date}"
         )
 
         cmd = [
@@ -269,11 +324,10 @@ class GmailFiBillingPlugin(BasePlugin):
             await self._dm(
                 f"❌ Fi statement {label} (${amount:.2f}) — Splitwise create FAILED:\n"
                 f"```\n{err}\n```\n"
-                f"email left unread, will retry on next reconnect"
+                f"not marked processed — will retry on next IDLE wake"
             )
             return
 
-        # Success — parse result and DM confirmation
         try:
             import json
             result = json.loads(stdout)
@@ -292,6 +346,11 @@ class GmailFiBillingPlugin(BasePlugin):
             f"{per_user}"
         )
 
-        # Mark read so we don't reprocess on next scan
-        await imap.uid("store", uid, "+FLAGS", "(\\Seen)")
-        self.logger.info(f"uid={uid}: processed and marked read")
+        if mid:
+            await asyncio.to_thread(email_dedupe.mark_processed, PLUGIN_NAME, mid)
+            self.logger.info(f"uid={uid}: processed and recorded in dedupe store")
+        else:
+            self.logger.warning(
+                f"uid={uid}: created expense but no Message-ID found — "
+                f"future scans may re-create this expense"
+            )
