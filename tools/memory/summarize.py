@@ -24,6 +24,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 # Add project root to path so we can import chat_history and config
 PROJECT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
@@ -33,6 +34,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _common import output, error
 
 from chat_history import (
+    DM_GUILD_SENTINEL,
     get_summarizer_state,
     get_messages_since,
     get_latest_message_time,
@@ -42,6 +44,10 @@ from chat_history import (
     get_user_aliases,
     get_channel_summaries,
     get_channel_name,
+    get_dm_channel_id_for_user,
+    get_dm_messages_since,
+    get_dm_latest_message_time,
+    dm_has_new_messages_since,
     upsert_user_profile,
     upsert_channel_summary,
     insert_server_event,
@@ -51,6 +57,7 @@ from chat_history import (
 from config import (
     MEMORY_SUMMARIZE_BATCH_SIZE, MEMORY_IDLE_MINUTES,
     MEMORY_MAX_PROFILE_CHARS, MEMORY_MAX_CHANNEL_CHARS, MEMORY_MAX_EVENTS,
+    DM_PROFILE_USER_IDS,
 )
 
 # Claude CLI path — use absolute path for cron compatibility
@@ -486,18 +493,215 @@ async def _run_summarization(guild_id: str, dry_run: bool = False):
     output(result)
 
 
+# ---------------------------------------------------------------------------
+# DM mode — per-user long-term profile built from a single DM channel.
+# ---------------------------------------------------------------------------
+
+def _dm_watermark_key(user_id: str) -> str:
+    """Synthetic key used to store DM watermark separately from guild watermarks."""
+    return f"dm:{user_id}"
+
+
+def _should_run_dm(user_id: str) -> dict:
+    """Self-gate for DM mode — needs new messages and an idle window."""
+    state = get_summarizer_state(_dm_watermark_key(user_id))
+
+    if state:
+        last_id = state["last_processed_message_id"]
+        if not dm_has_new_messages_since(user_id, last_id):
+            return {"should_run": False, "reason": "no new DM messages since last summary"}
+
+    latest_time_str = get_dm_latest_message_time(user_id)
+    if not latest_time_str:
+        return {"should_run": False, "reason": "no DM messages in database"}
+
+    latest_time = datetime.fromisoformat(latest_time_str)
+    if latest_time.tzinfo is None:
+        latest_time = latest_time.replace(tzinfo=timezone.utc)
+
+    idle_threshold = datetime.now(timezone.utc) - timedelta(minutes=MEMORY_IDLE_MINUTES)
+    if latest_time > idle_threshold:
+        minutes_ago = (datetime.now(timezone.utc) - latest_time).total_seconds() / 60
+        return {
+            "should_run": False,
+            "reason": f"DM still active (last message {minutes_ago:.0f}m ago, need {MEMORY_IDLE_MINUTES}m idle)",
+        }
+
+    return {"should_run": True}
+
+
+def _build_dm_summarization_prompt(user_id: str, messages: list, existing_profile: Optional[dict]) -> str:
+    """Prompt Claude to maintain a single-user DM profile.
+
+    DM-tuned: focus on personal preferences, ongoing projects, and recurring topics
+    the user discusses ONE-ON-ONE with the bot. Skip social dynamics with other users
+    (irrelevant in DMs), don't create events, don't summarize channels.
+    """
+    aliases = get_user_aliases()
+    real_name = ""
+    if user_id in aliases:
+        info = aliases[user_id]
+        real_name = info.get("real", "") if isinstance(info, dict) else info
+
+    existing_section = "None yet — create the initial profile from the messages below."
+    if existing_profile:
+        existing_section = json.dumps({
+            "user_id": existing_profile["user_id"],
+            "user_name": existing_profile["user_name"],
+            "profile": existing_profile["profile"],
+        }, indent=2)
+
+    msg_lines = []
+    for m in messages:
+        ts = m["created_at"][:16].replace("T", " ")
+        reply = ""
+        if m.get("reply_to_message_id"):
+            reply = f" (replying to msg {m['reply_to_message_id']})"
+        line = f"[{ts}] {m['author_name']} (id={m['author_id']}){reply}: {m['content']}"
+        if m.get("image_summary"):
+            line += f" [attached image: {m['image_summary']}]"
+        msg_lines.append(line)
+    messages_section = "\n".join(msg_lines)
+
+    name_hint = f" (real name: {real_name})" if real_name else ""
+
+    return f"""Maintain a long-term DM profile for user_id={user_id}{name_hint}, based on their 1-on-1 conversation with you (jaspt, a Discord bot).
+
+## Existing Profile
+{existing_section}
+
+## New DM Messages
+{messages_section}
+
+## Instructions
+- Update or create the profile for user_id={user_id} ONLY. Do not create profiles for other users mentioned.
+- Focus on what's relevant for a 1-on-1 assistant relationship:
+  - Personal preferences, opinions, taste
+  - Ongoing projects, side projects, technical interests
+  - Recurring topics they bring up in DMs
+  - Things they've explicitly shared (background, role, location, schedule, gear, etc.)
+  - Communication style they use with you specifically (tone, brevity, slang)
+- Merge new observations into the existing profile. Preserve what isn't contradicted.
+- Skip social dynamics, gossip, or anything they said about other users — DMs are private.
+- Do NOT include the bot's own information.
+- Keep the profile 2-5 paragraphs. Be specific (names, projects, preferences), not generic.
+
+Output ONLY valid JSON:
+{{
+  "profile": "Profile text..."
+}}"""
+
+
+def _parse_dm_response(response: str) -> dict:
+    """Parse the DM summarizer's JSON response, tolerating markdown fences."""
+    text = response.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end])
+            except json.JSONDecodeError:
+                pass
+        error(f"Failed to parse Claude DM response as JSON.\nResponse: {text[:500]}")
+
+
+async def _run_dm_summarization(user_id: str, dry_run: bool = False):
+    """DM-mode pipeline: maintain a single-user profile from their DM channel."""
+    if user_id not in DM_PROFILE_USER_IDS:
+        error(f"User {user_id} is not in DM_PROFILE_USER_IDS allowlist")
+
+    watermark_key = _dm_watermark_key(user_id)
+    state = get_summarizer_state(watermark_key)
+    since_id = state["last_processed_message_id"] if state else None
+
+    messages = get_dm_messages_since(user_id, since_message_id=since_id, limit=MEMORY_SUMMARIZE_BATCH_SIZE)
+    if not messages:
+        output({"status": "no_messages", "dm_user_id": user_id})
+        return
+
+    print(f"[summarize-dm] Processing {len(messages)} new DM messages for user {user_id}", file=sys.stderr)
+
+    if dry_run:
+        output({
+            "status": "dry_run",
+            "dm_user_id": user_id,
+            "message_count": len(messages),
+            "first_message": messages[0]["created_at"],
+            "last_message": messages[-1]["created_at"],
+        })
+        return
+
+    # Fetch any existing DM profile for this user. DM profiles are stored under
+    # guild_id=DM_GUILD_SENTINEL, keyed by user_id within that scope.
+    all_dm_profiles = get_user_profiles(DM_GUILD_SENTINEL)
+    existing = next((p for p in all_dm_profiles if p["user_id"] == user_id), None)
+
+    user_name = messages[-1]["author_name"] if messages[-1]["author_id"] == user_id else (
+        next((m["author_name"] for m in messages if m["author_id"] == user_id), user_id)
+    )
+
+    prompt = _build_dm_summarization_prompt(user_id, messages, existing)
+    print(f"[summarize-dm] Calling Claude (prompt: {len(prompt)} chars)...", file=sys.stderr)
+    start = time.perf_counter()
+    response = await _call_claude(prompt)
+    duration = time.perf_counter() - start
+    print(f"[summarize-dm] Claude responded in {duration:.1f}s", file=sys.stderr)
+
+    data = _parse_dm_response(response)
+    new_profile = (data or {}).get("profile", "").strip()
+    if not new_profile:
+        error("DM summarizer returned empty profile")
+
+    upsert_user_profile(
+        guild_id=DM_GUILD_SENTINEL,
+        user_id=user_id,
+        user_name=user_name,
+        profile=new_profile,
+    )
+
+    last_msg_id = messages[-1]["message_id"]
+    update_summarizer_state(watermark_key, last_msg_id)
+
+    output({
+        "status": "completed",
+        "dm_user_id": user_id,
+        "messages_processed": len(messages),
+        "profile_length": len(new_profile),
+        "duration_seconds": round(duration, 1),
+    })
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--guild-id", required=True,
-                        help="Discord guild (server) ID to summarize")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--guild-id",
+                      help="Discord guild (server) ID to summarize")
+    mode.add_argument("--dm-user-id",
+                      help="Discord user ID — summarize that user's DM channel into a per-user DM profile")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be processed without calling Claude")
     parser.add_argument("--force", action="store_true",
                         help="Skip idle-time check (still requires new messages)")
     args = parser.parse_args()
+
+    if args.dm_user_id:
+        if not args.force:
+            check = _should_run_dm(args.dm_user_id)
+            if not check["should_run"]:
+                output({"status": "skipped", "reason": check["reason"]})
+                return
+        asyncio.run(_run_dm_summarization(args.dm_user_id, dry_run=args.dry_run))
+        return
 
     # Gate checks
     if not args.force:

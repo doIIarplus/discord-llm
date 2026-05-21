@@ -28,6 +28,7 @@ for _noisy in (
     "aiohttp", "aiohttp.access", "aiohttp.client", "aiohttp.internal",
     "urllib3", "httpx", "httpcore", "chromadb", "sentence_transformers",
     "PIL", "asyncio",
+    "aioimaplib", "aioimaplib.aioimaplib",
 ):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
@@ -117,6 +118,13 @@ MEMORY_MAX_EVENTS = 50              # Keep only the most recent N events per gui
 _allowlist_raw = os.getenv("MEMORY_CHANNEL_ALLOWLIST", "")
 MEMORY_CHANNEL_ALLOWLIST: set = set(
     cid.strip() for cid in _allowlist_raw.split(",") if cid.strip()
+)
+
+# DM profile allowlist — only these user IDs get long-term DM profiles built.
+# Empty = no DM profiling. Comma-separated user IDs in .env: DM_PROFILE_USER_IDS=123,456
+_dm_profile_raw = os.getenv("DM_PROFILE_USER_IDS", "118567805678256128")
+DM_PROFILE_USER_IDS: set = set(
+    uid.strip() for uid in _dm_profile_raw.split(",") if uid.strip()
 )
 
 # Create output directories

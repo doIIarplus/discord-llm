@@ -346,6 +346,20 @@ class OllamaBot(discord.Client):
     async def on_ready(self):
         """Called when the bot is fully connected. Send post-restart notification if pending."""
         print(f"Logged in as {self.user}")
+
+        # Guild lock audit: leave any guild the bot is in that isn't the allowed one.
+        # Covers the case where the bot was added to another guild before this
+        # safeguard existed, or before on_guild_join had a chance to fire.
+        for g in list(self.guilds):
+            if g.id != GUILD_ID:
+                logger.warning(
+                    f"Found in disallowed guild {g.id} ({g.name!r}) — leaving"
+                )
+                try:
+                    await g.leave()
+                except Exception as e:
+                    logger.error(f"Failed to leave disallowed guild {g.id}: {e}")
+
         if not self._claude_code_max_reminder.is_running():
             self._claude_code_max_reminder.start()
 
@@ -431,6 +445,9 @@ class OllamaBot(discord.Client):
         """Handle message edits — update chat_history.db with the new content."""
         if after.author.bot:
             return
+        # Guild lock: only the allowed guild is honored.
+        if after.guild is not None and after.guild.id != GUILD_ID:
+            return
         # Allow edits in DMs from allowlisted users; otherwise require a guild
         if after.guild is None and after.author.id not in DM_ALLOWLIST:
             return
@@ -438,10 +455,31 @@ class OllamaBot(discord.Client):
             return  # Embed-only update (link preview etc.), not a real edit
         await chat_history.update_message_content(after.id, after.content or "")
 
+    async def on_guild_join(self, guild: discord.Guild):
+        """Auto-leave any guild that isn't the allowed one.
+
+        Defense in depth: if someone adds the bot to another server (e.g. via
+        an OAuth invite they shouldn't have), we exit immediately without ever
+        responding to anything in that guild.
+        """
+        if guild.id != GUILD_ID:
+            logger.warning(
+                f"Joined disallowed guild {guild.id} ({guild.name!r}) — leaving"
+            )
+            try:
+                await guild.leave()
+            except Exception as e:
+                logger.error(f"Failed to leave disallowed guild {guild.id}: {e}")
+
     async def on_message(self, message: discord.Message):
         """Handle incoming messages"""
         # Ignore bot messages (including self)
         if message.author.bot:
+            return
+
+        # Guild lock: only the allowed guild is honored. DMs (no guild) skip
+        # this check — they're gated separately by DM_ALLOWLIST below.
+        if message.guild is not None and message.guild.id != GUILD_ID:
             return
 
         # DM handling: only allowlisted users may DM the bot.

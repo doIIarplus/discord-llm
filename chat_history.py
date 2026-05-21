@@ -232,7 +232,12 @@ async def record_message(message) -> None:
     Respects MEMORY_CHANNEL_ALLOWLIST: if set, only records messages from those channels.
     """
     channel_id_str = str(message.channel.id)
-    if MEMORY_CHANNEL_ALLOWLIST and channel_id_str not in MEMORY_CHANNEL_ALLOWLIST:
+    is_dm = message.guild is None
+    # The channel allowlist scopes the memory summarizer's privacy boundary,
+    # so it only applies to guild channels. DMs use their own gate (DM_ALLOWLIST
+    # in bot.py), and they're stored under DM_GUILD_SENTINEL — the summarizer
+    # never picks them up anyway since it queries by real guild_id.
+    if MEMORY_CHANNEL_ALLOWLIST and not is_dm and channel_id_str not in MEMORY_CHANNEL_ALLOWLIST:
         print(f"[chat_history] Skipping message {message.id} — channel {channel_id_str} not in allowlist")
         return
 
@@ -520,6 +525,99 @@ def has_new_messages_since(guild_id: str, since_message_id: str) -> bool:
     count = conn.execute(
         "SELECT COUNT(*) as cnt FROM messages WHERE guild_id = ? AND id > ?",
         (guild_id, row["id"]),
+    ).fetchone()
+    return count["cnt"] > 0
+
+
+# ---------------------------------------------------------------------------
+# DM queries (DMs share guild_id = DM_GUILD_SENTINEL; isolation is by channel_id,
+# which Discord allocates uniquely per user-bot DM pair)
+# ---------------------------------------------------------------------------
+
+def get_dm_channel_id_for_user(user_id: str) -> Optional[str]:
+    """Find the DM channel between the bot and a given user, based on any
+    message they've sent in their DM thread. Returns None if no DM history."""
+    conn = _get_conn()
+    row = conn.execute(
+        """SELECT channel_id FROM messages
+           WHERE guild_id = ? AND author_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        (DM_GUILD_SENTINEL, user_id),
+    ).fetchone()
+    return row["channel_id"] if row else None
+
+
+def get_dm_messages_since(
+    user_id: str,
+    since_message_id: Optional[str] = None,
+    limit: int = 500,
+) -> List[dict]:
+    """Get messages in the user's DM channel since a given watermark.
+    Mirrors get_messages_since but scoped by user's DM channel."""
+    channel_id = get_dm_channel_id_for_user(user_id)
+    if not channel_id:
+        return []
+
+    conn = _get_conn()
+    if since_message_id:
+        row = conn.execute(
+            "SELECT id FROM messages WHERE message_id = ?", (since_message_id,)
+        ).fetchone()
+        if row:
+            cursor = conn.execute(
+                """SELECT message_id, guild_id, channel_id, author_id, author_name,
+                          content, reply_to_message_id, image_summary, created_at
+                   FROM messages
+                   WHERE guild_id = ? AND channel_id = ? AND id > ?
+                   ORDER BY id ASC
+                   LIMIT ?""",
+                (DM_GUILD_SENTINEL, channel_id, row["id"], limit),
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    # No watermark (or watermark not found) — fetch latest N, return chronological
+    cursor = conn.execute(
+        """SELECT message_id, guild_id, channel_id, author_id, author_name,
+                  content, reply_to_message_id, image_summary, created_at
+           FROM messages
+           WHERE guild_id = ? AND channel_id = ?
+           ORDER BY id DESC
+           LIMIT ?""",
+        (DM_GUILD_SENTINEL, channel_id, limit),
+    )
+    return [dict(r) for r in cursor.fetchall()][::-1]
+
+
+def get_dm_latest_message_time(user_id: str) -> Optional[str]:
+    """Get the most recent message timestamp in a user's DM channel."""
+    channel_id = get_dm_channel_id_for_user(user_id)
+    if not channel_id:
+        return None
+    conn = _get_conn()
+    row = conn.execute(
+        """SELECT created_at FROM messages
+           WHERE guild_id = ? AND channel_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        (DM_GUILD_SENTINEL, channel_id),
+    ).fetchone()
+    return row["created_at"] if row else None
+
+
+def dm_has_new_messages_since(user_id: str, since_message_id: str) -> bool:
+    """Check if there are messages newer than the watermark in a user's DM channel."""
+    channel_id = get_dm_channel_id_for_user(user_id)
+    if not channel_id:
+        return False
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT id FROM messages WHERE message_id = ?", (since_message_id,)
+    ).fetchone()
+    if not row:
+        return True  # watermark missing, treat as new messages present
+    count = conn.execute(
+        """SELECT COUNT(*) as cnt FROM messages
+           WHERE guild_id = ? AND channel_id = ? AND id > ?""",
+        (DM_GUILD_SENTINEL, channel_id, row["id"]),
     ).fetchone()
     return count["cnt"] > 0
 
