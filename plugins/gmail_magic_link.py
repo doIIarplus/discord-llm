@@ -34,8 +34,17 @@ MAGIC_LINK_RE = re.compile(r'https?://[^\s"\'<>]*magic-link[^\s"\'<>]*')
 
 IMAP_HOST = "imap.gmail.com"
 IDLE_TIMEOUT_SECONDS = 25 * 60
-RECONNECT_BACKOFF_INITIAL = 5
-RECONNECT_BACKOFF_MAX = 300
+# Backoff schedule for IMAP reconnection (seconds). Each entry is used for the
+# nth consecutive failure; once we run off the end we stay at the last value.
+RECONNECT_BACKOFF_SCHEDULE = (5, 15, 30, 60)
+# Trigger reconnection if this many UID fetches fail in a row inside one
+# _scan_and_process pass — a strong signal the underlying socket is dead even
+# though the per-uid try/except is masking the IMAP-level errors.
+MAX_CONSECUTIVE_FETCH_FAILURES = 3
+# Hard ceiling on how long a single IDLE wait can block before we tear down
+# and reconnect. The aioimaplib IDLE timeout doesn't always fire when the
+# socket is half-dead, so we layer wait_for on top as a safety net.
+IDLE_WAIT_TIMEOUT_SECONDS = IDLE_TIMEOUT_SECONDS + 60
 
 # Match Message-ID: across any line of an IMAP fetch response
 _MSGID_RE = re.compile(r'^Message-ID:\s*(.+?)\s*$', re.MULTILINE | re.IGNORECASE)
@@ -109,7 +118,7 @@ class GmailMagicLinkPlugin(BasePlugin):
     # ── Main loop ────────────────────────────────────────────────────────
 
     async def _watch_loop(self):
-        backoff = RECONNECT_BACKOFF_INITIAL
+        attempt = 0
         while not self._stop.is_set():
             imap = None
             try:
@@ -121,14 +130,17 @@ class GmailMagicLinkPlugin(BasePlugin):
                     raise RuntimeError(f"IMAP login failed: {resp}")
                 await imap.select("INBOX")
                 self.logger.info("IMAP connected, inbox selected")
-                backoff = RECONNECT_BACKOFF_INITIAL
+                attempt = 0  # successful connect resets the backoff
 
                 await self._scan_and_process(imap)
 
                 while not self._stop.is_set():
                     idle_task = await imap.idle_start(timeout=IDLE_TIMEOUT_SECONDS)
                     try:
-                        await imap.wait_server_push()
+                        await asyncio.wait_for(
+                            imap.wait_server_push(),
+                            timeout=IDLE_WAIT_TIMEOUT_SECONDS,
+                        )
                     except asyncio.TimeoutError:
                         pass
                     imap.idle_done()
@@ -142,28 +154,58 @@ class GmailMagicLinkPlugin(BasePlugin):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.logger.warning(f"IMAP loop error: {e}; reconnecting in {backoff}s")
+                backoff = RECONNECT_BACKOFF_SCHEDULE[
+                    min(attempt, len(RECONNECT_BACKOFF_SCHEDULE) - 1)
+                ]
+                self.logger.warning(
+                    f"IMAP loop error ({type(e).__name__}: {e}); "
+                    f"reconnecting in {backoff}s (attempt #{attempt + 1})"
+                )
+                attempt += 1
+                # Close the current connection BEFORE sleeping so the next
+                # iteration starts with a clean slate. logout() can itself
+                # hang on a half-dead socket, hence the timeout.
+                await self._close_imap(imap)
+                imap = None
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=backoff)
                     return
                 except asyncio.TimeoutError:
                     pass
-                backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
             finally:
                 if imap is not None:
-                    try:
-                        await imap.logout()
-                    except Exception:
-                        pass
+                    await self._close_imap(imap)
+
+    async def _close_imap(self, imap):
+        """Best-effort connection teardown with a timeout.
+
+        Swallows everything except CancelledError so we never wedge the
+        reconnect loop on a stuck logout.
+        """
+        if imap is None:
+            return
+        try:
+            await asyncio.wait_for(imap.logout(), timeout=5)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            pass
 
     # ── Email handling ───────────────────────────────────────────────────
 
     async def _scan_and_process(self, imap):
-        """Search ALL matching messages (any flag state), skip already-processed."""
+        """Search ALL matching messages (any flag state), skip already-processed.
+
+        Treats search failures and a burst of consecutive fetch failures as
+        connection-level errors and re-raises — the watch loop will reconnect.
+        Isolated per-uid errors are still logged and skipped.
+        """
+        # uid_search failing is connection-level: re-raise so we reconnect
+        # instead of silently entering IDLE on a dead socket (which is how
+        # this plugin previously wedged itself).
         resp = await imap.uid_search("SUBJECT", f'"{SUBJECT_FILTER}"')
         if resp.result != "OK":
-            self.logger.warning(f"uid_search failed: {resp}")
-            return
+            raise RuntimeError(f"uid_search failed: {resp}")
         ids_line = resp.lines[0] if resp.lines else b""
         uids = ids_line.decode().split() if ids_line else []
         if not uids:
@@ -181,11 +223,21 @@ class GmailMagicLinkPlugin(BasePlugin):
             )
             return
 
+        consecutive_failures = 0
         for uid in uids:
             try:
                 await self._process_one(imap, uid)
+                consecutive_failures = 0
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 self.logger.exception(f"Failed to process uid={uid}: {e}")
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FETCH_FAILURES:
+                    raise RuntimeError(
+                        f"{consecutive_failures} consecutive UID-fetch failures "
+                        f"(last uid={uid}); assuming IMAP connection is dead"
+                    ) from e
 
     async def _seed_backlog(self, imap, uids) -> int:
         """Fetch Message-IDs (PEEK — no Seen flag) and seed the dedupe store."""
