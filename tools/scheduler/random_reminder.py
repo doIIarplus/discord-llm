@@ -7,6 +7,9 @@ import random
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../.env"))
 
 CHANNEL_ID = "1171545202486431745"
 TASK_NAME = "yang-rights-reminder"
@@ -14,13 +17,13 @@ TOOLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 PYTHON = sys.executable
 
 MESSAGES = [
-    "<@134429572405002240> hey don't let anyone violate your first amendment rights",
-    "<@134429572405002240> reminder: your first amendment rights cannot be taken from you",
-    "<@134429572405002240> remember bro, no one can legally violate your first amendment rights",
-    "<@134429572405002240> psa: your first amendment rights are protected, don't let anyone tell u otherwise",
-    "<@134429572405002240> just a reminder that ur first amendment rights exist and cannot be violated",
-    "<@134429572405002240> hey quick reminder — first amendment rights are yours and nobody can take them",
-    "<@134429572405002240> don't forget: the first amendment protects ur rights, stand on that",
+    "<@134429572405002240> hey. protect your first amendment rights.",
+    "<@134429572405002240> don't let them take your first amendment rights.",
+    "<@134429572405002240> your first amendment rights. don't forget.",
+    "<@134429572405002240> first amendment. yours. protect it.",
+    "<@134429572405002240> they can't take your first amendment rights. remember that.",
+    "<@134429572405002240> hey. first amendment rights. protect them.",
+    "<@134429572405002240> just a reminder. first amendment. it's yours.",
 ]
 
 
@@ -33,14 +36,13 @@ def run(cmd, **kwargs):
 
 
 def delete_existing_tasks():
-    """Find and delete any tasks named yang-rights-reminder or yang-first-amendment-reminder."""
+    """Delete any existing yang-rights-reminder tasks so we can replace with the new one."""
     result = run([PYTHON, os.path.join(TOOLS_DIR, "scheduler/list_tasks.py")])
     if result.returncode != 0:
         return
     try:
-        tasks = json.loads(result.stdout)
-        if isinstance(tasks, dict) and "tasks" in tasks:
-            tasks = tasks["tasks"]
+        data = json.loads(result.stdout)
+        tasks = data["tasks"] if isinstance(data, dict) and "tasks" in data else data
         stale_names = {TASK_NAME, "yang-first-amendment-reminder"}
         for task in tasks:
             if task.get("name") in stale_names:
@@ -63,26 +65,30 @@ def send_message():
 
 
 def pick_next_datetime():
-    """Pick a random future datetime using the specified distribution."""
+    """Bimodal distribution: 70% spooky window (10pm–4am), 30% any time in next 3–10 days."""
     now = datetime.now(timezone.utc)
 
-    # Day offset: gauss(7, 4) clamped to [2, 18]
-    day_offset = int(random.gauss(7, 4))
-    day_offset = max(2, min(18, day_offset))
-
-    # Hour: 70% daytime (10-22), 15% early morning (0-5), 15% late night (22-24)
-    roll = random.random()
-    if roll < 0.70:
-        hour = random.randint(10, 22)
-    elif roll < 0.85:
-        hour = random.randint(0, 5)
+    if random.random() < 0.70:
+        # Spooky window: 10pm–4am (22:00–27:59 wrapping to next day)
+        # Represent as minutes past 22:00; window = 6 hours = 360 minutes
+        # Day offset: pick a random day 1–10 days out, then snap to the spooky window
+        day_offset = random.randint(1, 10)
+        base = now + timedelta(days=day_offset)
+        spooky_minute_offset = random.randint(0, 359)  # 0–359 minutes past 22:00
+        hour = (22 + spooky_minute_offset // 60) % 24
+        minute = spooky_minute_offset % 60
+        # If we wrapped past midnight, add an extra day
+        extra_day = 1 if (22 + spooky_minute_offset // 60) >= 24 else 0
+        target = base + timedelta(days=extra_day)
+        target = target.replace(hour=hour, minute=minute, second=0, microsecond=0)
     else:
-        hour = random.randint(22, 23)
+        # Any time in the next 3–10 days
+        day_offset = random.randint(3, 10)
+        hour = random.randint(0, 23)
+        minute = random.randint(0, 59)
+        target = now + timedelta(days=day_offset)
+        target = target.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-    minute = random.randint(0, 59)
-
-    target = now + timedelta(days=day_offset)
-    target = target.replace(hour=hour, minute=minute, second=0, microsecond=0)
     return target
 
 
