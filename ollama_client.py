@@ -252,7 +252,7 @@ class OllamaClient:
 
         full_prompt = f"System: {system_prompt}\nUser: {prompt}\nAssistant: "
         response = await self.generate(
-            full_prompt, model=CHAT_MODEL, keep_alive=-1, num_ctx=4096, think=False,
+            full_prompt, model=CHAT_MODEL, keep_alive=300, num_ctx=4096, think=False,
         )
 
         return "yes" in response.lower()
@@ -282,7 +282,7 @@ class OllamaClient:
         full_prompt = f"System: {system_prompt}\nUser: {prompt}\nAssistant:"
         raw = await self.generate(
             full_prompt, model=TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL,
-            keep_alive=-1, num_ctx=4096, think=False,
+            keep_alive=300, num_ctx=4096, think=False,
         )
         return _sanitize_prompt_output(raw)
 
@@ -338,7 +338,7 @@ class OllamaClient:
         )
         raw = await self.generate(
             full_prompt, model=TEXT_TO_IMAGE_PROMPT_GENERATION_MODEL,
-            keep_alive=-1, num_ctx=4096, think=False,
+            keep_alive=300, num_ctx=4096, think=False,
         )
         return _sanitize_prompt_output(raw)
 
@@ -412,7 +412,7 @@ class OllamaClient:
         raw = await self.generate(
             full_prompt,
             model=CHAT_MODEL,
-            keep_alive=-1,
+            keep_alive=300,
             num_ctx=4096,
             num_predict=80,
         )
@@ -467,7 +467,7 @@ class OllamaClient:
             images=[image_base64],
             num_ctx=4096,
             num_predict=1500,  # headroom for qwen3-vl's thinking + output
-            keep_alive=-1,
+            keep_alive=300,
         )
         return _sanitize_prompt_output(raw)
 
@@ -558,6 +558,6 @@ class OllamaClient:
             images=images,
             num_ctx=4096,
             num_predict=32,  # "NSFW"/"SFW" is 1-2 tokens; 32 gives headroom
-            keep_alive=-1,
+            keep_alive=300,
         )
         return "nsfw" in response.lower()

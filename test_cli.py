@@ -452,17 +452,17 @@ class TestCLI:
                 reset = self.claude_code_client.rate_limit_resets_at or "unknown"
                 print(c(f"  [Claude Code rate limited, resets at {reset}, falling back to local]", "red"))
                 model = CHAT_MODEL
-                raw_response = await self.ollama_client.generate(prompt, model, keep_alive=-1)
+                raw_response = await self.ollama_client.generate(prompt, model, keep_alive=1800)
                 if raw_response == "No response from Ollama.":
                     return ["No response from Ollama."]
             except Exception as cc_err:
                 print(c(f"  [Claude Code error: {cc_err}, falling back to local]", "red"))
                 model = CHAT_MODEL
-                raw_response = await self.ollama_client.generate(prompt, model, keep_alive=-1)
+                raw_response = await self.ollama_client.generate(prompt, model, keep_alive=1800)
                 if raw_response == "No response from Ollama.":
                     return ["No response from Ollama."]
         else:
-            raw_response = await self.ollama_client.generate(prompt, model, keep_alive=-1)
+            raw_response = await self.ollama_client.generate(prompt, model, keep_alive=1800)
             if raw_response == "No response from Ollama.":
                 return ["No response from Ollama."]
         elapsed = time.perf_counter() - start

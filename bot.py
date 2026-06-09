@@ -61,9 +61,24 @@ from plugin_manager import PluginManager
 # Exit code that tells the wrapper script (run_bot.sh) to restart the bot
 RESTART_EXIT_CODE = 42
 
-# Keywords that suggest an image generation request
+# Keywords that suggest an image generation request.
+# Two alternatives:
+#   1. verb (generate/create/draw/...) within 120 chars of a visual noun
+#      (image/picture/photo/...). The {0,120} gap lets verbose phrasings
+#      through ("draw me a guy who communicates exclusively in reaction images"
+#      has 51 chars between verb + noun).
+#   2. standalone imperative form: "draw|paint|sketch|... + me/us/a/an/the/some"
+#      catches "draw me a cat" where no explicit visual noun is named.
+# False positives from #2 are filtered downstream by the LLM classifier
+# (is_image_generation_task), so it's safe to be permissive here.
 _IMAGE_GEN_KEYWORDS = re.compile(
-    r'\b(generate|create|draw|make|paint|render|sketch)\b.{0,30}\b(image|picture|photo|illustration|art|drawing|painting)\b',
+    r'(?:'
+    r'\b(?:generate|create|draw|make|paint|render|sketch|illustrate)\b'
+    r'.{0,120}'
+    r'\b(?:images?|pictures?|photos?|illustrations?|arts?|drawings?|paintings?|portraits?|gifs?|memes?|stickers?|emojis?)\b'
+    r'|'
+    r'\b(?:draw|paint|sketch|render|illustrate)\s+(?:me|us|a|an|the|some|that)\b'
+    r')',
     re.IGNORECASE
 )
 
@@ -1448,7 +1463,7 @@ class OllamaBot(discord.Client):
                     print(f"  [Claude Code rate limited, resets at {reset}, falling back to local model]")
                     model = CHAT_MODEL
                     ctx = VISION_MODEL_CTX if images else None
-                    raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1, num_ctx=ctx)
+                    raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=1800, num_ctx=ctx)
 
                     if raw_response == "No response from Ollama.":
                         return ["No response from Ollama."]
@@ -1456,14 +1471,14 @@ class OllamaBot(discord.Client):
                     print(f"  [Claude Code error: {cc_err}, falling back to local model]")
                     model = CHAT_MODEL
                     ctx = VISION_MODEL_CTX if images else None
-                    raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1, num_ctx=ctx)
+                    raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=1800, num_ctx=ctx)
 
                     if raw_response == "No response from Ollama.":
                         return ["No response from Ollama."]
 
             else:
                 ctx = VISION_MODEL_CTX if images else None
-                raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=-1, num_ctx=ctx)
+                raw_response = await self.ollama_client.generate(prompt, model, images, keep_alive=1800, num_ctx=ctx)
 
                 if raw_response == "No response from Ollama.":
                     print("No response from Ollama")
