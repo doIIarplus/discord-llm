@@ -167,6 +167,7 @@ class TestCLI:
             "- tools/discord/create_thread.py — create a thread (from message or standalone)\n"
             "- tools/discord/list_channels.py — list guild channels\n"
             "- tools/discord/create_channel.py — create a text, voice, or category channel\n"
+            "- tools/discord/rename_channel.py — rename an existing channel\n"
             "- tools/discord/delete_channel.py — delete a channel\n"
             "- tools/discord/send_webhook.py — send Discord messages via webhook\n"
             "For reminders: use tools/scheduler/create_task.py --once with a command that calls tools/discord/send_message.py. "

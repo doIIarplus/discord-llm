@@ -190,6 +190,7 @@ Requires `DISCORD_BOT_TOKEN` in env. Webhook tools also need `DISCORD_WEBHOOK_<N
 | `create_thread.py --channel-id ID --name TEXT [--message-id ID] [--content TEXT] [--auto-archive N]` | Create a thread (from message or standalone) |
 | `list_channels.py --guild-id ID [--type N]` | List channels (0=text, 2=voice, 4=category) |
 | `create_channel.py --guild-id ID --name TEXT [--type N] [--parent-id ID] [--topic TEXT]` | Create a text, voice, or category channel |
+| `rename_channel.py --channel-id ID --name TEXT` | Rename an existing channel |
 | `delete_channel.py --channel-id ID` | Delete a channel (irreversible) |
 | `send_webhook.py --webhook NAME --content TEXT [--username NAME]` | Send message via webhook (different identity). Supports `<@USER_ID>` mentions. |
 
