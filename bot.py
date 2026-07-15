@@ -97,6 +97,48 @@ _EDIT_CODE_TAG = re.compile(
     re.DOTALL
 )
 
+# High-confidence signatures of leaked chain-of-thought / decision narration that
+# local models sometimes emit (without <think> tags) before their actual reply.
+# Kept conservative to avoid stripping legitimate chat. See _strip_reasoning_leak.
+_REASONING_LEAK_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (
+        r'\bnot a code[- ]edit request\b',
+        r"\bno request here\b",
+        r'\bplain greeting\b',
+        r'\bjust a (?:question|greeting|statement|comment|observation)\b.*\b(?:no|not)\b',
+        r'\balready answered\b.*\bturns?\s*\d',
+        r'\[/?Turn\b',
+        r'\bthe user (?:is|just|wants|said|asked)\b.*\b(?:no|not|just|so I)\b',
+    )
+]
+
+
+def _strip_reasoning_leak(text: str) -> str:
+    """Drop ---MSG--- segments that are clearly leaked reasoning, not real replies.
+
+    Local models occasionally narrate their decision-making (e.g. classifying the
+    user's message: 'Just "hi" — no request here, plain greeting.') and emit it as
+    a leading message before the actual response. We split on the same marker the
+    sender uses, drop any segment matching a high-confidence leak signature, and
+    rejoin — but never drop everything (if all segments match, keep them as-is so
+    we don't send nothing).
+    """
+    if '---MSG---' not in text:
+        segments = [text]
+    else:
+        segments = text.split('---MSG---')
+
+    def is_leak(seg: str) -> bool:
+        s = seg.strip()
+        if not s:
+            return False
+        return any(p.search(s) for p in _REASONING_LEAK_PATTERNS)
+
+    kept = [seg for seg in segments if not is_leak(seg)]
+    if not kept:
+        return text  # everything looked like a leak — bail out, send original
+    return '---MSG---'.join(kept)
+
 
 class OllamaBot(discord.Client):
     """Main Discord bot class"""
@@ -143,6 +185,15 @@ class OllamaBot(discord.Client):
             "The conversation history uses numbered [Turn N] tags. Each turn is a REAL message from a REAL user or your previous response. "
             "ONLY respond to the LAST turn. Do NOT invent, fabricate, or continue with additional user messages. "
             "Do NOT generate text inside [Turn] tags — only produce your own single response.\n\n"
+            "NEVER NARRATE YOUR REASONING:\n"
+            "Output ONLY the message you'd actually send in chat. Do NOT think out loud, do NOT analyze or classify "
+            "the user's message, and do NOT explain your decision-making. Specifically, NEVER write things like "
+            "'this is just a question', 'not a code edit request', 'no request here, plain greeting', "
+            "'already answered in turn N', or any meta-commentary about what the user said or what you're about to do. "
+            "Quoting the user's message back and labeling it is FORBIDDEN. "
+            "If you genuinely need to deliberate (e.g. whether to use [EDIT_CODE]), do it SILENTLY inside "
+            "<think>...</think> tags — everything inside those tags is stripped and never shown. Anything outside the "
+            "tags is sent verbatim to Discord, so it must read as a natural chat message, nothing else.\n\n"
             "MULTI-MESSAGE RESPONSES:\n"
             "When your response would naturally be multiple messages (like a greeting followed by information, "
             "or multiple distinct points), you can split them using the marker: ---MSG---\n"
@@ -1102,6 +1153,10 @@ class OllamaBot(discord.Client):
         """Process response text, handling length limits"""
         # Remove thinking tags
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        # Backstop: drop leaked reasoning/decision narration that local models
+        # sometimes emit without <think> tags (e.g. classifying the user's
+        # message before answering). See _strip_reasoning_leak.
+        text = _strip_reasoning_leak(text)
         # Wrap bare URLs in <> to suppress Discord auto-embeds
         text = re.sub(r'(?<![<])(https?://\S+)', r'<\1>', text)
         # Split long text to fit Discord's message length limit

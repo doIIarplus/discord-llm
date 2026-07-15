@@ -65,6 +65,32 @@ _SEARCH_KEYWORDS = re.compile(
     re.IGNORECASE
 )
 
+# Mirror of bot.py's leaked-reasoning backstop (keep in sync).
+_REASONING_LEAK_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (
+        r'\bnot a code[- ]edit request\b',
+        r"\bno request here\b",
+        r'\bplain greeting\b',
+        r'\bjust a (?:question|greeting|statement|comment|observation)\b.*\b(?:no|not)\b',
+        r'\balready answered\b.*\bturns?\s*\d',
+        r'\[/?Turn\b',
+        r'\bthe user (?:is|just|wants|said|asked)\b.*\b(?:no|not|just|so I)\b',
+    )
+]
+
+
+def _strip_reasoning_leak(text: str) -> str:
+    """Drop ---MSG--- segments that are clearly leaked reasoning. See bot.py."""
+    segments = text.split('---MSG---') if '---MSG---' in text else [text]
+
+    def is_leak(seg: str) -> bool:
+        s = seg.strip()
+        return bool(s) and any(p.search(s) for p in _REASONING_LEAK_PATTERNS)
+
+    kept = [seg for seg in segments if not is_leak(seg)]
+    return '---MSG---'.join(kept) if kept else text
+
+
 COLORS = {
     "reset": "\033[0m",
     "bold": "\033[1m",
@@ -99,6 +125,14 @@ class TestCLI:
             "Your responses should be akin to that of a typical millenial texter: short, to the point, and mostly without punctuation. Do not offer any kind of assistance without being prompted. use slang *sparingly*. \n\n"
             "TONE/STYLE:\n"
             "Do NOT repeat the same filler word (e.g. 'bro', 'lol', 'lmao', 'ngl', 'fr', 'lowkey') more than once within a single response, or more than twice across a short window of consecutive responses. Vary your vocabulary — using the same filler repeatedly makes you sound like a broken record.\n\n"
+            "NEVER NARRATE YOUR REASONING:\n"
+            "Output ONLY the message you'd actually send in chat. Do NOT think out loud, do NOT analyze or classify "
+            "the user's message, and do NOT explain your decision-making. Specifically, NEVER write things like "
+            "'this is just a question', 'no request here, plain greeting', 'already answered in turn N', or any "
+            "meta-commentary about what the user said or what you're about to do. Quoting the user's message back and "
+            "labeling it is FORBIDDEN. If you genuinely need to deliberate, do it SILENTLY inside <think>...</think> "
+            "tags — everything inside those tags is stripped and never shown. Anything outside the tags is sent "
+            "verbatim, so it must read as a natural chat message, nothing else.\n\n"
             "MULTI-MESSAGE RESPONSES:\n"
             "When your response would naturally be multiple messages (like a greeting followed by information, "
             "or multiple distinct points), you can split them using the marker: ---MSG---\n"
@@ -277,6 +311,7 @@ class TestCLI:
     def process_response(self, text: str) -> List[str]:
         """Process response: strip thinking tags, split for length."""
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        text = _strip_reasoning_leak(text)
         return split_long_message(text.strip(), MAX_DISCORD_MESSAGE_LENGTH)
 
     async def query(self) -> List[str]:
