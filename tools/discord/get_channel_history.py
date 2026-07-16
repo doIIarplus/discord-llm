@@ -24,6 +24,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _common import output, error
 from discord._client import DiscordClient
+from discord._permissions import require_permission
 
 
 def _format_message(msg):
@@ -58,6 +59,8 @@ def main():
 
     if args.limit > 100:
         error("Discord API limits to 100 messages per request")
+
+    require_permission("VIEW_CHANNEL", channel_id=args.channel_id)
 
     client = DiscordClient()
 

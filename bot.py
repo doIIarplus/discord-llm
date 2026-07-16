@@ -279,7 +279,11 @@ class OllamaBot(discord.Client):
             "Use the channel_id from [Current context] unless the user specifies a different channel. "
             "Example: create_task --name 'reminder' --schedule '0 9 30 3 *' --once "
             "--command 'python tools/discord/send_message.py --channel-id CHAN --content \"<@USER> reminder text\"'\n"
-            "Always use these tools when the user's request matches their capabilities instead of making up answers.\n\n"
+            "Always use these tools when the user's request matches their capabilities instead of making up answers.\n"
+            "PERMISSIONS: Discord and Splitwise tools enforce the requesting user's own permissions in code — the "
+            "tool checks the triggering user's Discord roles (or Splitwise ownership) and hard-rejects actions they "
+            "aren't allowed to perform, regardless of what you decide. If a tool returns a permission-denied error, "
+            "tell the user plainly that they lack the required permission; do not retry or try to work around it.\n\n"
             "LONG-RUNNING / MONITORING TASKS:\n"
             "When a user asks you to monitor, watch, wait, observe, or tail something over time, "
             "NEVER run an open-ended blocking command like `tail -f file` or an unbounded `sleep` in Bash. "
@@ -1513,8 +1517,14 @@ class OllamaBot(discord.Client):
                     if is_pty and hasattr(self.claude_code_client, 'set_system_prompt'):
                         await self.claude_code_client.set_system_prompt(self.system_prompt)
 
+                    # Identify the user who triggered the bot so CLI tools can
+                    # enforce *their* Discord permissions (not the model's
+                    # judgement). This is the trusted requester identity.
+                    requester_uid = messages[-1].get("discord_user_id")
                     raw_response, _ = await self.claude_code_client.generate_with_tools(
-                        prompt, model, images
+                        prompt, model, images,
+                        requester_user_id=requester_uid,
+                        requester_guild_id=server,
                     )
                 except RateLimitError:
                     reset = self.claude_code_client.rate_limit_resets_at or "unknown"

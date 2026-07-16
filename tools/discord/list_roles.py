@@ -15,6 +15,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _common import output, error
 from discord._client import DiscordClient
+from discord._permissions import require_permission
 
 
 def main():
@@ -24,6 +25,8 @@ def main():
     )
     parser.add_argument("--guild-id", required=True, help="Discord guild (server) ID")
     args = parser.parse_args()
+
+    require_permission("VIEW_CHANNEL", guild_id=args.guild_id)
 
     client = DiscordClient()
     roles = client.get(f"/guilds/{args.guild_id}/roles")

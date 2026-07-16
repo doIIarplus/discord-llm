@@ -15,6 +15,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _common import output, error
 from discord._client import DiscordClient
+from discord._permissions import require_permission, get_requester
 
 
 def main():
@@ -30,6 +31,14 @@ def main():
 
     if not args.nickname and not args.clear:
         error("Provide --nickname or --clear")
+
+    # Changing your own nickname only needs CHANGE_NICKNAME; changing someone
+    # else's needs MANAGE_NICKNAMES.
+    requester_id, _ = get_requester()
+    if requester_id and str(args.user_id) == str(requester_id):
+        require_permission("CHANGE_NICKNAME", guild_id=args.guild_id)
+    else:
+        require_permission("MANAGE_NICKNAMES", guild_id=args.guild_id)
 
     client = DiscordClient()
     nick = None if args.clear else args.nickname

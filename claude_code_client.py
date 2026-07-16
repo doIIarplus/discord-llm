@@ -333,11 +333,16 @@ class ClaudeCodeClient:
         return model in _OLLAMA_MODEL_MAP or model not in _CLAUDE_ALIASES
 
     @staticmethod
-    def _build_env(model: str) -> dict:
+    def _build_env(model: str, requester_user_id=None, requester_guild_id=None) -> dict:
         """Build environment variables for the CLI process.
 
         For Ollama models, sets ANTHROPIC_BASE_URL and auth vars.
         For Claude models, strips vars that interfere with subscription auth.
+
+        When ``requester_user_id`` is provided, injects the triggering Discord
+        user's identity so CLI tools can enforce that user's permissions
+        (see tools/discord/_permissions.py). These are inherited by the Bash
+        tool subprocesses Claude spawns.
         """
         _STRIP_VARS = {"CLAUDECODE", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"}
         env = {k: v for k, v in os.environ.items() if k not in _STRIP_VARS}
@@ -346,6 +351,15 @@ class ClaudeCodeClient:
             env["ANTHROPIC_BASE_URL"] = OLLAMA_BASE_URL
             env["ANTHROPIC_AUTH_TOKEN"] = "ollama"
             env["ANTHROPIC_API_KEY"] = ""
+
+        # Trusted requester identity for tool-side permission enforcement.
+        # Always overwrite (don't inherit a stale value from the parent env).
+        env.pop("DISCORD_REQUESTING_USER_ID", None)
+        env.pop("DISCORD_REQUESTING_GUILD_ID", None)
+        if requester_user_id:
+            env["DISCORD_REQUESTING_USER_ID"] = str(requester_user_id)
+        if requester_guild_id:
+            env["DISCORD_REQUESTING_GUILD_ID"] = str(requester_guild_id)
         return env
 
     @staticmethod
@@ -421,11 +435,17 @@ class ClaudeCodeClient:
         prompt: str,
         model: str = "sonnet",
         images: Optional[List[str]] = None,
+        requester_user_id=None,
+        requester_guild_id=None,
     ) -> Tuple[str, List[dict]]:
         """Generate a response with Bash + web tools enabled.
 
         Claude can call CLI tools in tools/ via Bash and search the web.
         Tool documentation is picked up automatically from CLAUDE.md.
+
+        ``requester_user_id`` / ``requester_guild_id`` identify the Discord user
+        who triggered the bot; they are injected into the tool subprocess env so
+        tools can enforce that user's permissions.
 
         Returns:
             (response_text, sources) — same interface as generate_with_search.
@@ -433,7 +453,10 @@ class ClaudeCodeClient:
         if images:
             print("  [warning: images not supported via Claude Code CLI, ignoring]")
 
-        text = await self._run_cli(prompt, model, enable_tools=True, method="generate_with_tools")
+        text = await self._run_cli(
+            prompt, model, enable_tools=True, method="generate_with_tools",
+            requester_user_id=requester_user_id, requester_guild_id=requester_guild_id,
+        )
         return text, []
 
     async def run_code_edit(
@@ -948,6 +971,8 @@ class ClaudeCodeClient:
         enable_tools: bool = False,
         timeout: Optional[float] = None,
         method: str = "generate",
+        requester_user_id=None,
+        requester_guild_id=None,
     ) -> str:
         """Run the claude CLI and return the response text."""
         if timeout is None:
@@ -985,7 +1010,7 @@ class ClaudeCodeClient:
         try:
             start_time = time.perf_counter()
 
-            env = self._build_env(model)
+            env = self._build_env(model, requester_user_id, requester_guild_id)
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,

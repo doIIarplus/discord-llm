@@ -9,8 +9,17 @@ to one-shot `claude -p` processes since those need specific tool restrictions.
 """
 
 import asyncio
+import json
+import os
 import time
 from typing import List, Optional, Tuple
+
+# Trusted requester-identity file read by tools/discord/_permissions.py as a
+# fallback when per-process env vars aren't available (the PTY session's env is
+# fixed at startup, so we can't pass per-message identity through it).
+_REQUEST_CONTEXT_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tools", "discord", ".request_context"
+)
 
 from claude_code_client import (
     ClaudeCodeClient, RateLimitError, TestResult,
@@ -126,15 +135,33 @@ class ClaudeCodeClientPTY(ClaudeCodeClient):
         text = await self._pty_generate(prompt, "generate_with_search")
         return text, []
 
+    def _write_request_context(self, requester_user_id, requester_guild_id):
+        """Persist the triggering user's identity for tool permission checks.
+
+        The PTY session's env is fixed at startup, so tools read the requester
+        from this file instead. send_prompt is serialized on the single tmux
+        session, so tool calls for this message finish before the next prompt.
+        """
+        try:
+            with open(_REQUEST_CONTEXT_FILE, "w") as f:
+                json.dump(
+                    {"user_id": requester_user_id, "guild_id": requester_guild_id}, f
+                )
+        except OSError as e:
+            print(f"[pty] warning: could not write request context: {e}")
+
     async def generate_with_tools(
         self,
         prompt: str,
         model: str = "sonnet",
         images: Optional[List[str]] = None,
+        requester_user_id=None,
+        requester_guild_id=None,
     ) -> Tuple[str, List[dict]]:
         """Generate with tools — interactive session has all tools available."""
         if images:
             print("  [warning: images not supported via Claude Code PTY, ignoring]")
+        self._write_request_context(requester_user_id, requester_guild_id)
         text = await self._pty_generate(prompt, "generate_with_tools")
         return text, []
 

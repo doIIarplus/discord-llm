@@ -16,6 +16,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _common import output, error
 from discord._client import DiscordClient
+from discord._permissions import require_permission
 
 
 def main():
@@ -27,6 +28,8 @@ def main():
     parser.add_argument("--message-id", required=True, help="Message to pin/unpin")
     parser.add_argument("--unpin", action="store_true", help="Unpin instead of pin")
     args = parser.parse_args()
+
+    require_permission("MANAGE_MESSAGES", channel_id=args.channel_id)
 
     client = DiscordClient()
 

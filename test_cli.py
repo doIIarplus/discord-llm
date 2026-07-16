@@ -8,7 +8,7 @@ Usage:
     python test_cli.py
 
 Commands:
-    /user <name>          Switch active user
+    /user <name> [id]     Switch active user (optional discord_id for permission tests)
     /attach <path>        Attach a file to the next message
     /clear                Clear conversation context
     /context              Show current context
@@ -174,7 +174,11 @@ class TestCLI:
             "Use the channel_id from [Current context] unless the user specifies a different channel. "
             "Example: create_task --name 'reminder' --schedule '0 9 30 3 *' --once "
             "--command 'python tools/discord/send_message.py --channel-id CHAN --content \"<@USER> reminder text\"'\n"
-            "Always use these tools when the user's request matches their capabilities instead of making up answers.\n\n"
+            "Always use these tools when the user's request matches their capabilities instead of making up answers.\n"
+            "PERMISSIONS: Discord and Splitwise tools enforce the requesting user's own permissions in code — the "
+            "tool checks the triggering user's Discord roles (or Splitwise ownership) and hard-rejects actions they "
+            "aren't allowed to perform, regardless of what you decide. If a tool returns a permission-denied error, "
+            "tell the user plainly that they lack the required permission; do not retry or try to work around it.\n\n"
             "LONG-RUNNING / MONITORING TASKS:\n"
             "When asked to monitor, watch, wait, observe, or tail something, NEVER run a blocking "
             "`tail -f` or unbounded `sleep` — the Bash tool will time out with no output. Use capped "
@@ -183,6 +187,11 @@ class TestCLI:
         )
         self.original_system_prompt = self.system_prompt
         self.current_user = "TestUser"
+        # Requester identity used for tool permission enforcement. Defaults to
+        # the owner + default guild so tools work out of the box; override with
+        # `/user <name> [discord_id]` to test permission-denied paths.
+        self.current_user_id = "118567805678256128"
+        self.current_guild_id = "363154169294618625"
         self.pending_attachments: List[str] = []
         self.use_ddg = False
         self.plugin_manager = self._init_plugin_manager()
@@ -485,7 +494,11 @@ class TestCLI:
         start = time.perf_counter()
         if using_claude_code:
             try:
-                raw_response, _ = await self.claude_code_client.generate_with_tools(prompt, model)
+                raw_response, _ = await self.claude_code_client.generate_with_tools(
+                    prompt, model,
+                    requester_user_id=self.current_user_id,
+                    requester_guild_id=self.current_guild_id,
+                )
             except RateLimitError as rl_err:
                 reset = self.claude_code_client.rate_limit_resets_at or "unknown"
                 print(c(f"  [Claude Code rate limited, resets at {reset}, falling back to local]", "red"))
@@ -708,7 +721,7 @@ class TestCLI:
 
     def print_help(self):
         print(c("\n  Commands:", "bold"))
-        print("  /user <name>          Switch active user")
+        print("  /user <name> [id]     Switch active user (optional discord_id for permission tests)")
         print("  /attach <path>        Attach a file to next message")
         print("  /clear                Clear conversation context")
         print("  /context              Show current context")
@@ -769,10 +782,13 @@ class TestCLI:
                     self.print_help()
                 elif cmd == "/user":
                     if arg:
-                        self.current_user = arg
-                        print(c(f"  Switched to user: {self.current_user}", "yellow"))
+                        parts = arg.split()
+                        self.current_user = parts[0]
+                        if len(parts) > 1:
+                            self.current_user_id = parts[1]
+                        print(c(f"  Switched to user: {self.current_user} (discord_id={self.current_user_id})", "yellow"))
                     else:
-                        print(c(f"  Current user: {self.current_user}", "dim"))
+                        print(c(f"  Current user: {self.current_user} (discord_id={self.current_user_id})", "dim"))
                 elif cmd == "/attach":
                     if not arg:
                         print(c("  Usage: /attach <file_path>", "red"))

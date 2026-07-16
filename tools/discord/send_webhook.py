@@ -29,6 +29,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _common import output, error
+from discord._permissions import require_permission
 
 
 def _resolve_webhook_url(name=None, url=None):
@@ -61,6 +62,8 @@ def main():
     parser.add_argument("--username", default=None,
                         help="Override the webhook's display name")
     args = parser.parse_args()
+
+    require_permission("MANAGE_WEBHOOKS")
 
     webhook_url = _resolve_webhook_url(name=args.webhook, url=args.webhook_url)
 

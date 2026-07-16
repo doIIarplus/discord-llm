@@ -20,6 +20,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _common import output, error
 from discord._client import DiscordClient
+from discord._permissions import require_permission
 
 CHANNEL_TYPE_NAMES = {
     0: "text",
@@ -40,6 +41,8 @@ def main():
     parser.add_argument("--type", type=int, default=None,
                         help="Filter by channel type (0=text, 2=voice, 4=category)")
     args = parser.parse_args()
+
+    require_permission("VIEW_CHANNEL", guild_id=args.guild_id)
 
     client = DiscordClient()
     channels = client.get(f"/guilds/{args.guild_id}/channels")

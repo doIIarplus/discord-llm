@@ -10,9 +10,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from _client import SplitwiseClient
 from _common import output
+from _auth import require_owner
 
 
 def main():
+    require_owner()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--all", action="store_true",
                         help="Include friends with zero balance")

@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _common import output, error
 from discord._client import DiscordClient
+from discord._permissions import require_permission
 
 
 def main():
@@ -40,6 +41,8 @@ def main():
 
     if not args.message_id and not args.content:
         error("Standalone threads require --content for the opening message")
+
+    require_permission("CREATE_PUBLIC_THREADS", channel_id=args.channel_id)
 
     client = DiscordClient()
 

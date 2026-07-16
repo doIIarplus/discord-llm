@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _common import output, error
 from discord._client import DiscordClient
+from discord._permissions import require_permission
 
 MAX_TIMEOUT = timedelta(days=28)
 
@@ -62,6 +63,8 @@ def main():
 
     if not args.duration and not args.remove:
         error("Provide --duration or --remove")
+
+    require_permission("MODERATE_MEMBERS", guild_id=args.guild_id)
 
     client = DiscordClient()
 

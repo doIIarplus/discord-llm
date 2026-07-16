@@ -41,6 +41,29 @@ class DiscordClient:
         req = urllib.request.Request(url, headers=self._headers())
         return self._do(req, endpoint)
 
+    def get_or_none(self, endpoint, params=None):
+        """Like get(), but return None on HTTP error instead of aborting.
+
+        Used by permission checks that want to treat a 404 (e.g. the requesting
+        user isn't a member of the guild) as a clean denial rather than a raw
+        API error.
+        """
+        url = f"{BASE_URL}{endpoint}"
+        if params:
+            url += "?" + urllib.parse.urlencode(
+                {k: v for k, v in params.items() if v is not None}
+            )
+        req = urllib.request.Request(url, headers=self._headers())
+        try:
+            resp = urllib.request.urlopen(req, timeout=15)
+            if resp.status == 204:
+                return None
+            return json.loads(resp.read().decode())
+        except urllib.error.HTTPError:
+            return None
+        except Exception as e:
+            error(f"Request failed: {e}")
+
     def post(self, endpoint, data=None):
         """POST JSON to Discord API. Returns parsed JSON."""
         url = f"{BASE_URL}{endpoint}"

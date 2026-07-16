@@ -142,7 +142,15 @@ Standalone Python scripts in `tools/` that Claude can call via Bash. Each tool u
 - **Mutating tools** (create, delete, generate, schedule): Describe the action and wait for user confirmation before executing.
 
 ### Access control
-- **Splitwise tools**: Only available to Discord user `118567805678256128` (dollarplus). If any other user requests Splitwise actions, politely decline — the tools are tied to dollarplus's personal Splitwise account. The requesting user's Discord ID is included in the prompt as `discord_id=`.
+
+Access control is **enforced in code**, not just by prompt. The bot injects the *triggering* Discord user's identity into every tool subprocess as the `DISCORD_REQUESTING_USER_ID` / `DISCORD_REQUESTING_GUILD_ID` env vars (for the persistent PTY session, whose env is fixed at startup, it is written to `tools/discord/.request_context` instead). Tools read this trusted identity — not the `--user-id` the model passes — so a user cannot act beyond their own permissions even if the model is convinced to try.
+
+- **Discord tools** ([tools/discord/_permissions.py](tools/discord/_permissions.py)): Every Discord tool calls `require_permission(...)`, which resolves the requesting user's Discord roles/permissions in the guild (with owner + Administrator bypass and channel-overwrite handling) and **hard-rejects** if they lack the permission the action needs. E.g. `delete_channel.py` requires Manage Channels; if the requester lacks it, the tool exits with a permission-denied error and never calls Discord. Mapping of tool → required permission lives in each tool (e.g. delete/create/rename channel → Manage Channels; timeout → Moderate Members; add/remove role → Manage Roles; delete/pin/edit message → Manage Messages; read tools → View Channel).
+- **Splitwise tools** ([tools/splitwise/_auth.py](tools/splitwise/_auth.py)): Restricted in code to Discord user `118567805678256128` (dollarplus) via `require_owner()`. Any other requester is denied. Still decline politely in conversation, but the code is the backstop.
+- **Fail closed**: if the requesting user cannot be verified, the action is denied.
+- **Trust boundary**: this stops the normal failure mode (the model relaying a request from an unauthorized user). It is not a sandbox — a model with unrestricted Bash could bypass it. For a hard guarantee, move enforcement to a Claude Code PreToolUse hook.
+
+When a tool returns a permission-denied error, relay it to the user plainly (they lack the required Discord permission); do not retry or attempt a workaround.
 
 ### Splitwise (`tools/splitwise/`)
 Requires `SPLITWISE_API_KEY` in environment.

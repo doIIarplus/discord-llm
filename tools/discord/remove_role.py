@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _common import output, error
 from discord._client import DiscordClient
+from discord._permissions import require_permission
 
 
 def main():
@@ -23,6 +24,8 @@ def main():
     parser.add_argument("--user-id", required=True, help="User ID to remove role from")
     parser.add_argument("--role-id", required=True, help="Role ID to remove")
     args = parser.parse_args()
+
+    require_permission("MANAGE_ROLES", guild_id=args.guild_id)
 
     client = DiscordClient()
     client.delete(f"/guilds/{args.guild_id}/members/{args.user_id}/roles/{args.role_id}")

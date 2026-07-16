@@ -17,7 +17,12 @@
       "Bash(./venv/bin/python -c ' *)",
       "Bash(./venv/bin/pip list *)",
       "Bash(./venv/bin/pip install *)",
-      "Bash(./venv/bin/python *)"
+      "Bash(./venv/bin/python *)",
+      "Bash(awk 'NR>=1380 && NR<=1420 && /def /' bot.py)",
+      "Bash(awk 'NR<1420 && /    async def |    def /{last=NR\": \"$0} END{}' bot.py)",
+      "Bash(cd *)",
+      "Bash(git checkout *)",
+      "Bash(git add *)"
     ]
   }
 }
