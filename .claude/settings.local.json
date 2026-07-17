@@ -22,7 +22,8 @@
       "Bash(awk 'NR<1420 && /    async def |    def /{last=NR\": \"$0} END{}' bot.py)",
       "Bash(cd *)",
       "Bash(git checkout *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit -q -m ' *)"
     ]
   }
 }
