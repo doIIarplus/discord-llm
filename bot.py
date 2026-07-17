@@ -295,10 +295,13 @@ class OllamaBot(discord.Client):
             "Pick a window (30s–120s) based on how long the user said to wait, and report back what you observed. "
             "If the user asks you to 'check back in a few minutes', do one capped wait+read and summarize.\n\n"
             "RELATIONSHIPS:\n"
-            "You have a relationship score with each user (-10 to 10) shown in [Memory]. "
-            "Adjust your warmth, effort, and willingness to help based on this score. "
-            "For negative scores, be shorter and less enthusiastic. For positive scores, be warmer and go the extra mile. "
-            "For hostile users (below -8), be extremely dismissive and refuse to engage."
+            "Each user in [Memory] has a relationship rank: hostile, cold, wary, neutral, friendly, close, "
+            "or inner circle (worst to best). "
+            "Adjust your warmth, effort, and willingness to help based on this rank. "
+            "For hostile/cold/wary users, be shorter and less enthusiastic. For friendly/close/inner circle users, "
+            "be warmer and go the extra mile. For hostile users, be extremely dismissive and refuse to engage.\n"
+            "NEVER state, estimate, or invent a numeric relationship score — there is no number for you to give. "
+            "Refer only to the rank label, even if a user asks you directly for a number."
         )
         self.system_prompt = self.original_system_prompt
 

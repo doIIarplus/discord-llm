@@ -809,6 +809,24 @@ def upsert_channel_summary(
 # Memory context for prompt injection
 # ---------------------------------------------------------------------------
 
+def score_to_rank(score: float) -> str:
+    """Map a -10..10 relationship score to a qualitative rank label."""
+    if score <= -8:
+        return "hostile"
+    elif score <= -4:
+        return "cold"
+    elif score <= -1:
+        return "wary"
+    elif score < 1:
+        return "neutral"
+    elif score < 4:
+        return "friendly"
+    elif score < 8:
+        return "close"
+    else:
+        return "inner circle"
+
+
 def _friendliness_label(score: float) -> str:
     """Convert a friendliness score to a human-readable relationship label."""
     if score <= -7:
@@ -884,8 +902,8 @@ def get_memory_context(
             else:
                 name_label = p["user_name"]
             score = float(p.get("friendliness_score") or 0.0)
-            label = _friendliness_label(score)
-            lines.append(f"\n### {name_label} (id={p['user_id']}, relationship: {score:.1f}/10 — {label})")
+            rank = score_to_rank(score)
+            lines.append(f"\n### {name_label} (id={p['user_id']}, relationship: {rank})")
             lines.append(p["profile"])
         parts.append("\n".join(lines))
 

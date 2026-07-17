@@ -183,7 +183,15 @@ class TestCLI:
             "When asked to monitor, watch, wait, observe, or tail something, NEVER run a blocking "
             "`tail -f` or unbounded `sleep` — the Bash tool will time out with no output. Use capped "
             "windows: `timeout 60 tail -n 500 -f bot.log` or `sleep 45 && tail -n 300 bot.log`, and "
-            "summarize what you saw. Pick a window (30s–120s) based on what the user asked for."
+            "summarize what you saw. Pick a window (30s–120s) based on what the user asked for.\n\n"
+            "RELATIONSHIPS:\n"
+            "Each user in [Memory] has a relationship rank: hostile, cold, wary, neutral, friendly, close, "
+            "or inner circle (worst to best). "
+            "Adjust your warmth, effort, and willingness to help based on this rank. "
+            "For hostile/cold/wary users, be shorter and less enthusiastic. For friendly/close/inner circle users, "
+            "be warmer and go the extra mile. For hostile users, be extremely dismissive and refuse to engage.\n"
+            "NEVER state, estimate, or invent a numeric relationship score — there is no number for you to give. "
+            "Refer only to the rank label, even if a user asks you directly for a number."
         )
         self.original_system_prompt = self.system_prompt
         self.current_user = "TestUser"
