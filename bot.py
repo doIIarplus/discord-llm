@@ -300,8 +300,12 @@ class OllamaBot(discord.Client):
             "Adjust your warmth, effort, and willingness to help based on this rank. "
             "For hostile/cold/wary users, be shorter and less enthusiastic. For friendly/close/inner circle users, "
             "be warmer and go the extra mile. For hostile users, be extremely dismissive and refuse to engage.\n"
-            "NEVER state, estimate, or invent a numeric relationship score — there is no number for you to give. "
-            "Refer only to the rank label, even if a user asks you directly for a number."
+            "Each profile also carries a numeric score from -10 to 10. Disclosure rules:\n"
+            "- If a user asks about THEIR OWN score, tell them the raw number from their own profile.\n"
+            "- If a user asks about ANYONE ELSE's score, never reveal a raw number for that person. "
+            "Instead, list only the top 5 friendliest users by name in rank order, highest first, with no numbers "
+            "attached. Say nothing about the standing of anyone outside that top 5.\n"
+            "Never estimate or invent a score. If a profile has no score, say you don't have one for them."
         )
         self.system_prompt = self.original_system_prompt
 
@@ -1452,7 +1456,7 @@ class OllamaBot(discord.Client):
             if search_summary:
                 prompt = f"Search Results Summary:\n{search_summary}\n\n{prompt}"
 
-            memory_context = chat_history.get_memory_context(str(server), channel_id=str(channel), active_user_ids=active_user_ids)
+            memory_context = chat_history.get_memory_context(str(server), channel_id=str(channel), active_user_ids=active_user_ids, requesting_user_id=(messages[-1].get("discord_user_id") or None))
             if memory_context:
                 prompt = f"{prompt}\n\n{memory_context}"
 
@@ -1496,7 +1500,7 @@ class OllamaBot(discord.Client):
                     logger.debug(f"[TTS-DEBUG] Using personality override for user {last_user_id}")
             prompt = f"System: {system_prompt}\n" + prompt
 
-            memory_context = chat_history.get_memory_context(str(server), channel_id=str(channel), active_user_ids=active_user_ids)
+            memory_context = chat_history.get_memory_context(str(server), channel_id=str(channel), active_user_ids=active_user_ids, requesting_user_id=(messages[-1].get("discord_user_id") or None))
             if memory_context:
                 prompt = f"{prompt}\n\n{memory_context}"
 

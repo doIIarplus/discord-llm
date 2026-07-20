@@ -28,6 +28,8 @@ Commands:
 import asyncio
 import os
 import re
+
+import chat_history
 import sys
 import time
 from typing import List
@@ -190,8 +192,12 @@ class TestCLI:
             "Adjust your warmth, effort, and willingness to help based on this rank. "
             "For hostile/cold/wary users, be shorter and less enthusiastic. For friendly/close/inner circle users, "
             "be warmer and go the extra mile. For hostile users, be extremely dismissive and refuse to engage.\n"
-            "NEVER state, estimate, or invent a numeric relationship score — there is no number for you to give. "
-            "Refer only to the rank label, even if a user asks you directly for a number."
+            "Each profile also carries a numeric score from -10 to 10. Disclosure rules:\n"
+            "- If a user asks about THEIR OWN score, tell them the raw number from their own profile.\n"
+            "- If a user asks about ANYONE ELSE's score, never reveal a raw number for that person. "
+            "Instead, list only the top 5 friendliest users by name in rank order, highest first, with no numbers "
+            "attached. Say nothing about the standing of anyone outside that top 5.\n"
+            "Never estimate or invent a score. If a profile has no score, say you don't have one for them."
         )
         self.original_system_prompt = self.system_prompt
         self.current_user = "TestUser"
@@ -494,6 +500,16 @@ class TestCLI:
         # Add search summary if available
         if search_summary:
             prompt = f"Search Results Summary:\n{search_summary}\n\n{prompt}"
+
+        # Mirror bot.py: inject memory (profiles, relationship ranks, top 5)
+        # scoped to the current user so disclosure behaviour is testable here.
+        memory_context = chat_history.get_memory_context(
+            self.current_guild_id,
+            active_user_ids=[m["discord_user_id"] for m in messages if m.get("discord_user_id")],
+            requesting_user_id=self.current_user_id,
+        )
+        if memory_context:
+            prompt = f"{prompt}\n\n{memory_context}"
 
         prompt = f"System: {self.system_prompt}\n" + prompt
 

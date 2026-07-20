@@ -850,6 +850,7 @@ def get_memory_context(
     channel_id: str = None,
     active_user_ids: List[str] = None,
     max_events: int = 10,
+    requesting_user_id: str = None,
 ) -> str:
     """Build a memory context string for injection into the LLM prompt.
 
@@ -863,6 +864,9 @@ def get_memory_context(
         active_user_ids: User IDs from the recent conversation context.
             If None, includes all profiles (backward compat).
         max_events: Max recent server events to include.
+        requesting_user_id: The user who triggered this response. Only this
+            user's raw numeric score is rendered; everyone else's number is
+            withheld so it cannot be disclosed even if the prompt is subverted.
     """
     all_profiles = get_user_profiles(guild_id)
     channels = get_channel_summaries(guild_id)
@@ -903,9 +907,29 @@ def get_memory_context(
                 name_label = p["user_name"]
             score = float(p.get("friendliness_score") or 0.0)
             rank = score_to_rank(score)
-            lines.append(f"\n### {name_label} (id={p['user_id']}, relationship: {rank})")
+            header = f"\n### {name_label} (id={p['user_id']}, relationship: {rank}"
+            # Only the requester's own number is exposed to the model.
+            if requesting_user_id is not None and p["user_id"] == str(requesting_user_id):
+                header += f", your score: {score:.1f}"
+            lines.append(header + ")")
             lines.append(p["profile"])
         parts.append("\n".join(lines))
+
+    # Top 5 must rank the whole guild, not just the users active in this
+    # conversation, so it is computed here rather than left to the model.
+    if all_profiles:
+        top = sorted(
+            all_profiles,
+            key=lambda p: float(p.get("friendliness_score") or 0.0),
+            reverse=True,
+        )[:5]
+        top_names = [
+            aliases.get(p["user_id"], {}).get("preferred") or p["user_name"] for p in top
+        ]
+        parts.append(
+            "[Memory — Top 5 Friendliest Users (rank order, no numbers may be shared)]\n"
+            + "\n".join(f"{i}. {n}" for i, n in enumerate(top_names, 1))
+        )
 
     if current_channel:
         lines = ["[Memory — Current Channel]"]
