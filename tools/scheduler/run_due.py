@@ -143,7 +143,12 @@ def main():
         ts_slug = now.strftime("%Y%m%d_%H%M%S")
         log_path = os.path.join(TASK_LOGS_DIR, f"{task['task_id']}_{ts_slug}.log")
 
-        # Execute the command
+        # Execute the command. Mark the environment as a trusted system
+        # context so Discord tools launched here (e.g. cron reminders that call
+        # send_message.py) don't hard-reject for lacking a requesting-user
+        # identity. Only scheduler-launched commands get this flag.
+        task_env = dict(os.environ)
+        task_env["DISCORD_SYSTEM_CONTEXT"] = "1"
         try:
             result = subprocess.run(
                 command,
@@ -152,6 +157,7 @@ def main():
                 text=True,
                 timeout=600,
                 cwd=PROJECT_DIR,
+                env=task_env,
             )
             success = result.returncode == 0
 

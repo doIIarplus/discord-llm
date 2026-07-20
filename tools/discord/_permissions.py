@@ -83,6 +83,27 @@ def get_requester():
         return None, None
 
 
+def is_system_context():
+    """Return True if this invocation is a trusted scheduler/system context.
+
+    The scheduler (tools/scheduler/run_due.py) sets ``DISCORD_SYSTEM_CONTEXT=1``
+    in the environment of the subprocesses it launches for due tasks. When there
+    is no requesting user (no ``DISCORD_REQUESTING_USER_ID`` env var AND no
+    ``.request_context`` file), a scheduler-launched tool is running on behalf of
+    the system (e.g. a cron reminder), not a Discord user, so permission checks
+    that would otherwise fail closed are allowed to proceed.
+
+    This bypass is gated behind the explicit env flag so that *arbitrary*
+    no-context invocations still fail closed — only tasks the scheduler itself
+    started (which set the flag) get the system pass. If a real requesting user
+    identity IS present, this returns False and normal enforcement applies.
+    """
+    if os.environ.get("DISCORD_SYSTEM_CONTEXT") != "1":
+        return False
+    uid, _ = get_requester()
+    return uid is None
+
+
 def _base_permissions(guild, member, requester_id):
     """Compute a member's guild-level permission bitfield.
 
@@ -147,6 +168,12 @@ def require_permission(perm_name, guild_id=None, channel_id=None):
 
     requester_id, requester_guild = get_requester()
     if not requester_id:
+        # No Discord user context. If the scheduler launched this tool (it sets
+        # DISCORD_SYSTEM_CONTEXT=1), treat it as a trusted system context and
+        # allow the action instead of hard-rejecting. Any other no-context
+        # invocation still fails closed.
+        if is_system_context():
+            return
         error(
             "Permission check failed: could not determine which Discord user "
             "requested this action, so it was blocked. (The bot injects the "
