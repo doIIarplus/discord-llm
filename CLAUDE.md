@@ -244,6 +244,13 @@ Logs are written to `scheduler.log` in the project root. Check it for task execu
 
 The summarizer is registered as a scheduled task running every 5 minutes. Most invocations exit immediately (no new messages or server still active). When it does run, it calls Claude Sonnet to analyze messages and update `chat_history.db`.
 
+### Resume Review (`tools/resume/`)
+Modeled on interviewstreet/hiring-agent: a resume-to-score pipeline. Read-only.
+
+| Tool | Description |
+|------|-------------|
+| `review.py --pdf PATH [--role-description TEXT] [--role-file PATH] [--github-username USER]` | Extract text from a resume PDF (pypdf), optionally enrich with public GitHub signals, and score the candidate with the local LLM across a fixed rubric (technical skills, experience, project quality, education, overall fit). Outputs JSON: `{overall_score, categories: [{name, score, reasoning}], summary}`. |
+
 ## File I/O
 
 - Uploaded attachments temporarily saved to `multimodal_input/`, deleted after processing

@@ -154,6 +154,7 @@ class TestCLI:
             "- tools/splitwise/ — list_friends, get_balances, create_expense, delete_expense, list_groups, list_expenses (ONLY for discord_id=118567805678256128)\n"
             "- tools/scheduler/ — create_task (--once for one-shot reminders), list_tasks, delete_task\n"
             "- tools/web_search/search.py — search the web\n"
+            "- tools/resume/review.py — score a resume PDF against a role (rubric-based, explainable), optional GitHub enrichment\n"
             "- tools/discord/send_message.py — send a message as the bot to any channel\n"
             "- tools/discord/edit_message.py — edit a bot-sent message\n"
             "- tools/discord/delete_message.py — delete a message\n"
