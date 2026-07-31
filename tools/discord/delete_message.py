@@ -27,9 +27,15 @@ def main():
     parser.add_argument("--message-id", required=True, help="Message ID to delete")
     args = parser.parse_args()
 
-    require_permission("MANAGE_MESSAGES", channel_id=args.channel_id)
-
     client = DiscordClient()
+
+    # DM (1) and group DM (3) channels have no guild to resolve permissions
+    # against. In those channels the bot can only delete its own messages,
+    # which needs no Manage Messages permission, so skip the check entirely.
+    channel = client.get(f"/channels/{args.channel_id}")
+    if channel.get("type") not in (1, 3):
+        require_permission("MANAGE_MESSAGES", channel_id=args.channel_id)
+
     client.delete(f"/channels/{args.channel_id}/messages/{args.message_id}")
 
     output({
