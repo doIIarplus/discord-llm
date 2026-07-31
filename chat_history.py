@@ -138,6 +138,28 @@ def _init_schema(conn: sqlite3.Connection):
             last_run_at TEXT NOT NULL,
             UNIQUE(guild_id)
         );
+
+        -- Resumable Claude Code CLI sessions, one per channel. The session
+        -- itself lives on disk in ~/.claude/projects/<cwd-slug>/<id>.jsonl; this
+        -- table is only the pointer plus the invalidation metadata, so sessions
+        -- survive bot restarts. chat_history.messages remains the source of
+        -- truth — losing a row here degrades to the full-transcript path.
+        CREATE TABLE IF NOT EXISTS claude_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            last_message_id TEXT,           -- watermark: last message fed in
+            model TEXT NOT NULL,
+            system_prompt_hash TEXT NOT NULL,
+            memory_hash TEXT,
+            context_tokens INTEGER DEFAULT 0,
+            turns INTEGER DEFAULT 0,
+            handoff TEXT,                   -- summary seeded from a rotated session
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(guild_id, channel_id)
+        );
     """)
     conn.commit()
 
@@ -439,6 +461,114 @@ def get_recent_channel_messages(
     rows = [dict(r) for r in cursor.fetchall()]
     rows.reverse()  # chronological order
     return rows
+
+
+def get_channel_messages_since(
+    guild_id: str,
+    channel_id: str,
+    since_message_id: Optional[str] = None,
+    limit: int = 200,
+) -> List[dict]:
+    """Messages in one channel after `since_message_id`, chronological.
+
+    The per-channel counterpart to get_messages_since (which is guild-wide).
+    Used to feed a resumed Claude session only what it hasn't seen yet.
+
+    If the watermark message no longer exists (deleted, or DB pruned), falls
+    back to the most recent `limit` messages rather than returning nothing —
+    same behavior as get_messages_since.
+    """
+    if not guild_id or not channel_id:
+        return []
+    conn = _get_conn()
+    cols = """message_id, guild_id, channel_id, author_id, author_name,
+              content, reply_to_message_id, has_attachments, attachment_info,
+              image_summary, edit_history, created_at"""
+
+    if since_message_id:
+        row = conn.execute(
+            "SELECT id FROM messages WHERE message_id = ?", (since_message_id,)
+        ).fetchone()
+        if row:
+            cursor = conn.execute(
+                f"""SELECT {cols} FROM messages
+                    WHERE guild_id = ? AND channel_id = ? AND id > ?
+                    ORDER BY id ASC LIMIT ?""",
+                (guild_id, channel_id, row["id"], limit),
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    cursor = conn.execute(
+        f"""SELECT {cols} FROM messages
+            WHERE guild_id = ? AND channel_id = ?
+            ORDER BY id DESC LIMIT ?""",
+        (guild_id, channel_id, limit),
+    )
+    return [dict(r) for r in cursor.fetchall()][::-1]  # chronological
+
+
+# ---------------------------------------------------------------------------
+# Resumable Claude sessions
+# ---------------------------------------------------------------------------
+
+def get_claude_session(guild_id: str, channel_id: str) -> Optional[dict]:
+    """Return the stored session row for a channel, or None."""
+    if not guild_id or not channel_id:
+        return None
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM claude_sessions WHERE guild_id = ? AND channel_id = ?",
+        (str(guild_id), str(channel_id)),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_claude_session(
+    guild_id: str,
+    channel_id: str,
+    session_id: str,
+    last_message_id: Optional[str],
+    model: str,
+    system_prompt_hash: str,
+    memory_hash: Optional[str],
+    context_tokens: int,
+    turns: int,
+    handoff: Optional[str] = None,
+) -> None:
+    """Create or update a channel's session pointer."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO claude_sessions
+               (guild_id, channel_id, session_id, last_message_id, model,
+                system_prompt_hash, memory_hash, context_tokens, turns,
+                handoff, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+               session_id = excluded.session_id,
+               last_message_id = excluded.last_message_id,
+               model = excluded.model,
+               system_prompt_hash = excluded.system_prompt_hash,
+               memory_hash = excluded.memory_hash,
+               context_tokens = excluded.context_tokens,
+               turns = excluded.turns,
+               handoff = excluded.handoff,
+               updated_at = excluded.updated_at""",
+        (str(guild_id), str(channel_id), session_id, last_message_id, model,
+         system_prompt_hash, memory_hash, context_tokens, turns, handoff,
+         now, now),
+    )
+    conn.commit()
+
+
+def delete_claude_session(guild_id: str, channel_id: str) -> None:
+    """Drop a channel's session pointer (used by /clear and on resume failure)."""
+    conn = _get_conn()
+    conn.execute(
+        "DELETE FROM claude_sessions WHERE guild_id = ? AND channel_id = ?",
+        (str(guild_id), str(channel_id)),
+    )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------

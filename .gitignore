@@ -21,3 +21,6 @@ scheduler_task_logs/
 *:Zone.Identifier
 # Trusted per-message requester identity (written by PTY path, not committed)
 tools/discord/.request_context
+
+# Image service auth token (regenerated per bot start)
+tools/images/.image_service

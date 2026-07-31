@@ -10,7 +10,8 @@ Usage:
 Commands:
     /user <name> [id]     Switch active user (optional discord_id for permission tests)
     /attach <path>        Attach a file to the next message
-    /clear                Clear conversation context
+    /clear                Clear conversation context (and reset the Claude session)
+    /session              Show this channel's resumable Claude session
     /context              Show current context
     /search <query>       Web search via Tavily
     /model [name]         Show/switch active model (e.g. /model claude_code)
@@ -40,13 +41,15 @@ import aiohttp
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
+    CLAUDE_RESUME_SESSIONS,
+    CLAUDE_SESSION_MAX_TOKENS,
     CONTEXT_LIMIT,
     CHAT_MODEL,
     IMAGE_RECOGNITION_MODEL,
     MAX_DISCORD_MESSAGE_LENGTH,
 )
 from ollama_client import OllamaClient
-from claude_code_client import ClaudeCodeClient, RateLimitError
+from claude_code_client import ClaudeCodeClient, RateLimitError, SessionResumeError
 from models import is_claude_code_model, Txt2TxtModel
 from web_extractor import extract_webpage_context, web_search, format_search_results, js_renderer
 from file_parser import FileParser
@@ -173,11 +176,51 @@ class TestCLI:
             "- tools/discord/rename_channel.py — rename an existing channel\n"
             "- tools/discord/delete_channel.py — delete a channel\n"
             "- tools/discord/send_webhook.py — send Discord messages via webhook\n"
+            "- tools/images/generate.py — draw an image with the diffusion model (Flux2 Klein)\n"
+            "- tools/images/edit.py — edit an existing image with the diffusion model\n"
+            "- tools/images/attach.py — attach an image you made yourself with code\n"
+            "\n"
+            "IMAGES: you decide when a message wants a picture — there's no keyword trigger. "
+            "You also decide HOW to make it, and the two options are good at opposite things.\n"
+            "PREFER WRITING CODE (matplotlib, PIL/Pillow, SVG, graphviz) then "
+            "tools/images/attach.py for: charts, graphs, plots, any data visualization; "
+            "diagrams, flowcharts, timelines; anything with legible text, labels, numbers or "
+            "axes; tables/scoreboards/calendars as images; precise geometry or exact colors. "
+            "Diffusion models garble text and can't be trusted with real data — if the image "
+            "carries information, draw it with code. Save the file under the project dir "
+            "(api_out/ is fine) and register it with attach.py.\n"
+            "USE tools/images/generate.py for: photographic, painterly, or imaginative "
+            "visuals — scenes, characters, creatures, textures, 'draw me a X', album-art "
+            "vibes. Anything where realism or aesthetics matter and exact text doesn't.\n"
+            "USE tools/images/edit.py when someone wants an existing image changed ('make "
+            "her hair green', 'remove the background'). Source images are in "
+            "multimodal_input/ (user uploads) and api_out/ (things you generated). Describe "
+            "ONLY what changes, not the whole scene.\n"
+            "Any image from these three tools is attached to your reply automatically — do "
+            "NOT try to send it with tools/discord/send_message.py, and don't paste the file "
+            "path into chat. Just write your reply text normally; the picture rides along. "
+            "If a request doesn't want an image, don't make one.\n"
             "For reminders: use tools/scheduler/create_task.py --once with a command that calls tools/discord/send_message.py. "
             "Use the channel_id from [Current context] unless the user specifies a different channel. "
             "Example: create_task --name 'reminder' --schedule '0 9 30 3 *' --once "
             "--command 'python tools/discord/send_message.py --channel-id CHAN --content \"<@USER> reminder text\"'\n"
             "Always use these tools when the user's request matches their capabilities instead of making up answers.\n"
+            "ACT, DON'T ANNOUNCE: your process exits the moment you finish replying. "
+            "Nothing runs in the background, so anything you said you'd 'go do' simply "
+            "never happens. You may well remember this conversation next time someone "
+            "pings you — but remembering is not doing, and the work still won't exist. "
+            "This message is your only chance to act. So NEVER reply with "
+            "intent instead of results: no 'lemme go check', 'i'll re-render it', 'gimme "
+            "a sec', 'im on it', 'one moment'. Run the tools FIRST, then describe what "
+            "you actually did. If someone asks for something you can build, build it in "
+            "this turn before you answer. Saying you'll do it and stopping is the single "
+            "worst thing you can do here — it reads as lying. If a task genuinely can't "
+            "be done in one turn, say that plainly and say what you'd need; do not imply "
+            "it's underway. Long tool work is fine — taking a few minutes and delivering "
+            "beats replying instantly with a promise.\n"
+            "The casual tone is style ONLY — this is a real server with real requests, not "
+            "roleplay. When someone asks for a thing, they want the thing, not a character "
+            "performance about the thing.\n"
             "PERMISSIONS: Discord and Splitwise tools enforce the requesting user's own permissions in code — the "
             "tool checks the triggering user's Discord roles (or Splitwise ownership) and hard-rejects actions they "
             "aren't allowed to perform, regardless of what you decide. If a tool returns a permission-denied error, "
@@ -218,6 +261,12 @@ class TestCLI:
         # `/user <name> [discord_id]` to test permission-denied paths.
         self.current_user_id = "118567805678256128"
         self.current_guild_id = "363154169294618625"
+        # Stands in for a Discord channel so per-channel Claude sessions can be
+        # exercised here (see /session and /clear).
+        self.current_channel_id = "test-cli-channel"
+        # Lazily started in query() — mirrors bot.py so Claude's tools/images/*
+        # calls hit the resident Flux pipeline instead of loading their own.
+        self.image_service = None
         self.pending_attachments: List[str] = []
         self.use_ddg = False
         self.plugin_manager = self._init_plugin_manager()
@@ -350,10 +399,88 @@ class TestCLI:
         text = _strip_reasoning_leak(text)
         return split_long_message(text.strip(), MAX_DISCORD_MESSAGE_LENGTH)
 
+    # --- Resumable Claude sessions (mirrors bot.py) ------------------------
+
+    def _system_prompt_hash(self) -> str:
+        import hashlib
+        return hashlib.sha256(self.system_prompt.encode("utf-8")).hexdigest()[:16]
+
+    def _session_pointer(self, model: str):
+        """Return (resume_session_id, row) for this 'channel', or (None, None).
+
+        Same invalidation rules as bot.py: a session bakes in its system prompt
+        and model, so changing either starts a new one.
+        """
+        if not CLAUDE_RESUME_SESSIONS:
+            return None, None
+        row = chat_history.get_claude_session(
+            self.current_guild_id, self.current_channel_id)
+        if not row:
+            return None, None
+        if row.get("model") != model:
+            print(c("  [session: model changed, starting fresh]", "dim"))
+            chat_history.delete_claude_session(
+                self.current_guild_id, self.current_channel_id)
+            return None, None
+        if row.get("system_prompt_hash") != self._system_prompt_hash():
+            print(c("  [session: system prompt changed, starting fresh]", "dim"))
+            chat_history.delete_claude_session(
+                self.current_guild_id, self.current_channel_id)
+            return None, None
+        if (row.get("context_tokens") or 0) >= CLAUDE_SESSION_MAX_TOKENS:
+            print(c(f"  [session: over {CLAUDE_SESSION_MAX_TOKENS} tokens, rotating]", "dim"))
+            chat_history.delete_claude_session(
+                self.current_guild_id, self.current_channel_id)
+            return None, None
+        print(c(f"  [session: resuming {row['session_id'][:8]} "
+                f"(turn {(row.get('turns') or 0) + 1}, "
+                f"{row.get('context_tokens')} tokens)]", "dim"))
+        return row["session_id"], row
+
+    def _record_session(self, model: str, meta: dict, row):
+        """Persist the session pointer after a turn."""
+        if not CLAUDE_RESUME_SESSIONS:
+            return
+        session_id = meta.get("session_id")
+        if not session_id:
+            return
+        chat_history.upsert_claude_session(
+            guild_id=self.current_guild_id,
+            channel_id=self.current_channel_id,
+            session_id=session_id,
+            last_message_id=None,
+            model=model,
+            system_prompt_hash=self._system_prompt_hash(),
+            memory_hash=None,
+            context_tokens=meta.get("context_tokens") or 0,
+            turns=((row.get("turns") or 0) if row else 0) + 1,
+        )
+
+    async def _ensure_image_service(self):
+        """Start the local image service once, on first Claude query."""
+        if self.image_service is not None:
+            return self.image_service
+        from image_generation import ImageGenerator
+        from image_service import ImageService
+        self.image_service = ImageService(ImageGenerator())
+        await self.image_service.start()
+        print(c("  [image service started for tools/images/*]", "dim"))
+        return self.image_service
+
     async def query(self) -> List[str]:
         """Query Ollama, same logic as bot.py's query_ollama."""
         messages = self.context
         user_content = messages[-1]["content"]
+
+        # Mirror bot.py: on the Claude Code backend, Claude owns the decision to
+        # draw and the choice of diffusion vs. code, so the keyword/classifier
+        # heuristic below is skipped entirely.
+        claude_owns_images = (
+            is_claude_code_model(self.active_model)
+            and not self.claude_code_client.is_rate_limited
+        )
+        if claude_owns_images:
+            print(c("  [image decisions delegated to Claude]", "dim"))
 
         # Check if this is an image generation task (fast heuristic first)
         # Also check if this could be a follow-up to a recent image generation
@@ -361,7 +488,9 @@ class TestCLI:
             msg.get("role") == "assistant" and "[Generated an image" in msg.get("content", "")
             for msg in messages[-4:]
         )
-        if _IMAGE_GEN_KEYWORDS.search(user_content) or has_recent_image_gen:
+        if not claude_owns_images and (
+            _IMAGE_GEN_KEYWORDS.search(user_content) or has_recent_image_gen
+        ):
             # For follow-ups, give the classifier context about the recent image
             classify_input = user_content
             if has_recent_image_gen and not _IMAGE_GEN_KEYWORDS.search(user_content):
@@ -528,13 +657,46 @@ class TestCLI:
         print(c(f"  [model: {model}]", "dim"))
 
         start = time.perf_counter()
+        claude_images = []
         if using_claude_code:
             try:
-                raw_response, _ = await self.claude_code_client.generate_with_tools(
-                    prompt, model,
-                    requester_user_id=self.current_user_id,
-                    requester_guild_id=self.current_guild_id,
-                )
+                import uuid as _uuid
+                svc = await self._ensure_image_service()
+                image_request_id = _uuid.uuid4().hex
+                # Mirror bot.py: resume this "channel's" session when enabled,
+                # so continuity is testable offline.
+                resume_id, sess_row = self._session_pointer(model)
+                meta = {}
+                try:
+                    try:
+                        raw_response, _ = await self.claude_code_client.generate_with_tools(
+                            prompt, model,
+                            requester_user_id=self.current_user_id,
+                            requester_guild_id=self.current_guild_id,
+                            image_request_id=image_request_id,
+                            resume_session_id=resume_id,
+                            persist_session=CLAUDE_RESUME_SESSIONS,
+                            meta=meta,
+                        )
+                    except SessionResumeError as e:
+                        print(c(f"  [session resume failed, retrying fresh: {e}]", "red"))
+                        chat_history.delete_claude_session(
+                            self.current_guild_id, self.current_channel_id)
+                        meta = {}
+                        sess_row = None
+                        raw_response, _ = await self.claude_code_client.generate_with_tools(
+                            prompt, model,
+                            requester_user_id=self.current_user_id,
+                            requester_guild_id=self.current_guild_id,
+                            image_request_id=image_request_id,
+                            persist_session=CLAUDE_RESUME_SESSIONS,
+                            meta=meta,
+                        )
+                except BaseException:
+                    svc.discard(image_request_id)
+                    raise
+                claude_images = svc.drain(image_request_id)
+                self._record_session(model, meta, sess_row)
             except RateLimitError as rl_err:
                 reset = self.claude_code_client.rate_limit_resets_at or "unknown"
                 print(c(f"  [Claude Code rate limited, resets at {reset}, falling back to local]", "red"))
@@ -567,6 +729,33 @@ class TestCLI:
         final_parts = []
         for part in parts:
             final_parts.extend(splitter(part))
+
+        # Surface images Claude produced this turn. In Discord these are
+        # attached to the reply; here we print the paths so the flow is testable.
+        for img in claude_images:
+            kind = img.get("kind")
+            detail = (
+                f"seed: {img['seed']}, {img['width']}x{img['height']}"
+                if img.get("seed") is not None
+                else f"{img['width']}x{img['height']}, drawn with code"
+            )
+            nsfw = " | NSFW (would be spoilered)" if img.get("nsfw") else ""
+            final_parts.append(
+                f"[Attached image | {kind} | {detail}{nsfw} | {img['path']}]"
+            )
+            # Record the marker so follow-up edits can find the path, matching
+            # what bot.py persists to chat history.
+            self.context.append({
+                "role": "assistant",
+                "content": (
+                    f"[Generated an image with the following prompt: "
+                    f"{img.get('prompt', '')}] "
+                    f"(seed: {img.get('seed')}, "
+                    f"size: {img.get('width')}x{img.get('height')}, "
+                    f"path: {img['path']})"
+                ),
+                "timestamp": time.time(),
+            })
 
         print(c(f"  [{elapsed:.2f}s]", "dim"))
         return final_parts
@@ -759,7 +948,8 @@ class TestCLI:
         print(c("\n  Commands:", "bold"))
         print("  /user <name> [id]     Switch active user (optional discord_id for permission tests)")
         print("  /attach <path>        Attach a file to next message")
-        print("  /clear                Clear conversation context")
+        print("  /clear                Clear conversation context (and reset the Claude session)")
+        print("  /session              Show this channel's resumable Claude session")
         print("  /context              Show current context")
         print("  /search <query>       Web search + LLM summary")
         print("  /ddg                  Toggle DuckDuckGo / Tavily search")
@@ -835,7 +1025,25 @@ class TestCLI:
                         print(c(f"  Attached: {os.path.basename(arg)}", "yellow"))
                 elif cmd == "/clear":
                     self.context = []
-                    print(c("  Context cleared", "yellow"))
+                    # Match bot.py's /clear: drop the Claude session too.
+                    if chat_history.get_claude_session(
+                            self.current_guild_id, self.current_channel_id):
+                        chat_history.delete_claude_session(
+                            self.current_guild_id, self.current_channel_id)
+                        print(c("  Context cleared (and Claude session reset)", "yellow"))
+                    else:
+                        print(c("  Context cleared", "yellow"))
+                elif cmd == "/session":
+                    row = chat_history.get_claude_session(
+                        self.current_guild_id, self.current_channel_id)
+                    if not row:
+                        print(c(f"  No active session (resume enabled: {CLAUDE_RESUME_SESSIONS})", "yellow"))
+                    else:
+                        print(c(f"  session_id:     {row['session_id']}", "cyan"))
+                        print(c(f"  turns:          {row.get('turns')}", "cyan"))
+                        print(c(f"  context_tokens: {row.get('context_tokens')} "
+                                f"(rotates at {CLAUDE_SESSION_MAX_TOKENS})", "cyan"))
+                        print(c(f"  model:          {row.get('model')}", "cyan"))
                 elif cmd == "/context":
                     self.show_context()
                 elif cmd == "/time":

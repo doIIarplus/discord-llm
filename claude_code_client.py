@@ -269,6 +269,29 @@ class RateLimitError(Exception):
         self.resets_at = resets_at
 
 
+class SessionResumeError(Exception):
+    """Raised when --resume fails because the session id is unusable.
+
+    The CLI signals this with exit code 1, empty stdout, and a stderr of
+    "No conversation found with session ID: <id>" — which happens when the
+    session file was pruned, the CWD slug changed, or the id is stale. Callers
+    should drop the stored id and retry as a fresh session rather than
+    surfacing an error to chat.
+    """
+
+    def __init__(self, message: str, session_id: Optional[str] = None):
+        super().__init__(message)
+        self.session_id = session_id
+
+
+# stderr fragments that mean "that session id is no good" rather than a real failure
+_SESSION_GONE_MARKERS = (
+    "no conversation found with session id",
+    "session not found",
+    "could not find session",
+)
+
+
 @dataclass
 class TestResult:
     """Results from the pre-apply test step."""
@@ -333,7 +356,8 @@ class ClaudeCodeClient:
         return model in _OLLAMA_MODEL_MAP or model not in _CLAUDE_ALIASES
 
     @staticmethod
-    def _build_env(model: str, requester_user_id=None, requester_guild_id=None) -> dict:
+    def _build_env(model: str, requester_user_id=None, requester_guild_id=None,
+                   image_request_id=None) -> dict:
         """Build environment variables for the CLI process.
 
         For Ollama models, sets ANTHROPIC_BASE_URL and auth vars.
@@ -360,6 +384,13 @@ class ClaudeCodeClient:
             env["DISCORD_REQUESTING_USER_ID"] = str(requester_user_id)
         if requester_guild_id:
             env["DISCORD_REQUESTING_GUILD_ID"] = str(requester_guild_id)
+
+        # Ties images produced by tools/images/* to this turn so the bot can
+        # attach them to its reply. Always overwrite to avoid a stale id
+        # leaking images into the wrong response.
+        env.pop("IMAGE_REQUEST_ID", None)
+        if image_request_id:
+            env["IMAGE_REQUEST_ID"] = str(image_request_id)
         return env
 
     @staticmethod
@@ -437,6 +468,10 @@ class ClaudeCodeClient:
         images: Optional[List[str]] = None,
         requester_user_id=None,
         requester_guild_id=None,
+        image_request_id=None,
+        resume_session_id=None,
+        persist_session: bool = False,
+        meta: Optional[dict] = None,
     ) -> Tuple[str, List[dict]]:
         """Generate a response with Bash + web tools enabled.
 
@@ -456,8 +491,56 @@ class ClaudeCodeClient:
         text = await self._run_cli(
             prompt, model, enable_tools=True, method="generate_with_tools",
             requester_user_id=requester_user_id, requester_guild_id=requester_guild_id,
+            image_request_id=image_request_id,
+            resume_session_id=resume_session_id,
+            persist_session=persist_session,
+            meta=meta,
         )
         return text, []
+
+    async def summarize_session_for_handoff(
+        self,
+        session_id: str,
+        model: str = "sonnet",
+        timeout: float = 180.0,
+    ) -> Optional[str]:
+        """Ask a session to summarize itself before it's rotated out.
+
+        Called when a channel's session outgrows its token budget. The point is
+        to carry forward the *concrete* state a prose summary would drop — file
+        paths written, URLs that worked, commands that succeeded — so the
+        replacement session isn't amnesiac about its own artifacts.
+
+        Best-effort: returns None on any failure, and the caller falls back to
+        seeding a plain fresh session.
+        """
+        handoff_prompt = (
+            "This conversation is being archived and replaced by a fresh one. "
+            "Write a compact handoff note for your replacement. Include, only if "
+            "they exist:\n"
+            "- exact paths of files you created or edited (full paths, verbatim)\n"
+            "- URLs / API endpoints that worked, and any that didn't\n"
+            "- commands or scripts that succeeded and are worth reusing\n"
+            "- decisions made and why, plus anything still unfinished\n"
+            "Be terse and factual — a list, not prose. No pleasantries. If there "
+            "is nothing concrete to hand off, reply with exactly: NOTHING")
+        try:
+            text = await self._run_cli(
+                handoff_prompt, model,
+                method="summarize_session_for_handoff",
+                timeout=timeout,
+                resume_session_id=session_id,
+                persist_session=True,
+            )
+        except Exception as e:
+            print(f"  [handoff summary failed for session {session_id}: {e}]")
+            return None
+        if not text:
+            return None
+        text = text.strip()
+        if not text or text.upper().startswith("NOTHING"):
+            return None
+        return text
 
     async def run_code_edit(
         self,
@@ -973,8 +1056,20 @@ class ClaudeCodeClient:
         method: str = "generate",
         requester_user_id=None,
         requester_guild_id=None,
+        image_request_id=None,
+        resume_session_id=None,
+        persist_session: bool = False,
+        meta: Optional[dict] = None,
     ) -> str:
-        """Run the claude CLI and return the response text."""
+        """Run the claude CLI and return the response text.
+
+        ``persist_session`` keeps the session on disk so it can be resumed later
+        (i.e. omits --no-session-persistence). ``resume_session_id`` continues an
+        existing conversation instead of starting fresh.
+
+        ``meta``, if given, is populated with ``session_id`` and
+        ``context_tokens`` so the caller can persist the session pointer.
+        """
         if timeout is None:
             timeout = CLAUDE_CODE_TIMEOUT
         # Check if we're currently rate limited
@@ -993,8 +1088,18 @@ class ClaudeCodeClient:
             "--output-format", "json",
             "--verbose",
             "--model", model_alias,
-            "--no-session-persistence",
         ]
+
+        # Session handling. By default sessions are thrown away after each
+        # invocation; persist_session keeps them so a later turn can --resume.
+        # Note: --resume keeps the SAME session id (verified), so the stored
+        # pointer stays valid across turns. We deliberately do NOT pass
+        # --fork-session, which would mint a new id (and a new on-disk file)
+        # every turn; same-channel concurrency is serialized by a lock instead.
+        if not persist_session:
+            cmd.append("--no-session-persistence")
+        if resume_session_id:
+            cmd.extend(["--resume", resume_session_id])
 
         # Tool access modes (mutually exclusive):
         #   enable_tools: Bash + web (for CLI tool calling)
@@ -1010,7 +1115,8 @@ class ClaudeCodeClient:
         try:
             start_time = time.perf_counter()
 
-            env = self._build_env(model, requester_user_id, requester_guild_id)
+            env = self._build_env(model, requester_user_id, requester_guild_id,
+                                  image_request_id)
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -1039,6 +1145,20 @@ class ClaudeCodeClient:
             if isinstance(result_data, dict):
                 self._check_rate_limit(result_data)
 
+            # Hand the caller the session pointer + how big the context has
+            # grown. input_tokens alone is misleading (observed as 2 alongside
+            # 17,901 cache reads) — the real context size is the sum.
+            if meta is not None:
+                if isinstance(result_data, dict) and result_data.get("session_id"):
+                    meta["session_id"] = result_data["session_id"]
+                elif resume_session_id:
+                    meta["session_id"] = resume_session_id
+                meta["context_tokens"] = (
+                    (parsed["input_tokens"] or 0)
+                    + (parsed["cache_read_tokens"] or 0)
+                    + (parsed["cache_creation_tokens"] or 0)
+                )
+
             # Log to SQLite
             _log_request(
                 method=method,
@@ -1060,6 +1180,17 @@ class ClaudeCodeClient:
             if proc.returncode != 0:
                 detail = raw_err or raw_out
                 print(f"Claude Code CLI error (rc={proc.returncode}): {detail}")
+
+                # A dead session id is recoverable — the caller drops the
+                # pointer and retries fresh. Check before the generic paths so
+                # it never reaches chat as an error.
+                if resume_session_id and any(
+                    m in detail.lower() for m in _SESSION_GONE_MARKERS
+                ):
+                    raise SessionResumeError(
+                        f"session {resume_session_id} is no longer resumable: {detail}",
+                        session_id=resume_session_id,
+                    )
 
                 # Check if the error is a rate limit
                 if self._is_rate_limit_error(detail, result_data):
@@ -1108,7 +1239,7 @@ class ClaudeCodeClient:
                 duration_ms=timeout * 1000,
             )
             raise RuntimeError(f"Claude Code CLI timed out after {timeout}s")
-        except (RateLimitError, RuntimeError):
+        except (RateLimitError, RuntimeError, SessionResumeError):
             raise
         except Exception as e:
             print(f"Error in Claude Code CLI: {e}")

@@ -99,6 +99,37 @@ OUTPUT_DIR = os.path.join(PROJECT_DIR, "api_out")
 OUTPUT_DIR_T2I = os.path.join(OUTPUT_DIR, "txt2img")
 OUTPUT_DIR_I2I = os.path.join(OUTPUT_DIR, "img2img")
 
+# Image service: a localhost-only HTTP shim the bot runs so Claude-invoked CLI
+# tools (tools/images/*) can drive the ALREADY-RESIDENT Flux pipeline instead of
+# loading a second 9B model into VRAM per subprocess. Bound to loopback and
+# guarded by a token written to IMAGE_SERVICE_TOKEN_FILE at startup (mode 0600).
+IMAGE_SERVICE_HOST = os.getenv("IMAGE_SERVICE_HOST", "127.0.0.1")
+# NOTE: spookie_merged uses 8765. These two bots run on the same box, so this
+# one gets its own port — otherwise whichever starts second fails to bind.
+IMAGE_SERVICE_PORT = int(os.getenv("IMAGE_SERVICE_PORT", "8766"))
+# Overridable so a test harness can run a second service without clobbering the
+# token file a live bot is using (the CLI tools locate the service through it).
+IMAGE_SERVICE_TOKEN_FILE = os.getenv(
+    "IMAGE_SERVICE_TOKEN_FILE",
+    os.path.join(PROJECT_DIR, "tools", "images", ".image_service"),
+)
+
+# Resumable Claude sessions (per Discord channel).
+# When on, a channel's Claude Code CLI session is kept on disk and resumed on
+# the next turn, so the model remembers what it actually did (files written,
+# URLs that worked) instead of only seeing a re-rendered chat transcript.
+# Applies to the Claude Code backend; the local Ollama backend and the PTY
+# client (which has its own single global session) keep the transcript path.
+# Set CLAUDE_RESUME_SESSIONS=0 to fall back everywhere.
+CLAUDE_RESUME_SESSIONS = os.getenv("CLAUDE_RESUME_SESSIONS", "1").lower() not in (
+    "0", "false", "no",
+)
+# Rotate a session once its context passes this many tokens. On rotation the
+# outgoing session writes a handoff note that seeds its replacement.
+CLAUDE_SESSION_MAX_TOKENS = int(os.getenv("CLAUDE_SESSION_MAX_TOKENS", "180000"))
+# Optional turn cap (0 = unlimited); tokens are usually the binding constraint.
+CLAUDE_SESSION_MAX_TURNS = int(os.getenv("CLAUDE_SESSION_MAX_TURNS", "0"))
+
 # Context Configuration
 CONTEXT_LIMIT = 20
 VISION_MODEL_CTX = 32768  # Cap context window for vision models to avoid OOM (default 256K is way too much)

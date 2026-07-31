@@ -1,6 +1,7 @@
 """Discord LLM Bot - Main module"""
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -9,6 +10,7 @@ import random
 import sys
 import time
 import traceback
+import uuid
 from typing import Dict, List
 
 logger = logging.getLogger("Bot")
@@ -29,6 +31,9 @@ from config import (
     GUILD_ID,
     IMAGE_RECOGNITION_MODEL,
     CHAT_MODEL,
+    CLAUDE_RESUME_SESSIONS,
+    CLAUDE_SESSION_MAX_TOKENS,
+    CLAUDE_SESSION_MAX_TURNS,
     MAX_DISCORD_MESSAGE_LENGTH,
     OUTPUT_DIR_T2I,
     VISION_MODEL_CTX,
@@ -40,9 +45,10 @@ from image_generation import (
     choose_source_dimensions,
     clean_edit_instruction,
 )
+from image_service import ImageService
 from ollama_client import OllamaClient
 from claude_client import ClaudeClient
-from claude_code_client import ClaudeCodeClient, RateLimitError
+from claude_code_client import ClaudeCodeClient, RateLimitError, SessionResumeError
 from claude_code_client_pty import ClaudeCodeClientPTY
 from models import is_claude_code_model, is_anthropic_model
 from utils import encode_images_to_base64
@@ -162,7 +168,14 @@ class OllamaBot(discord.Client):
             self.claude_code_client = ClaudeCodeClient()
             print("[bot] Using Claude Code CLI client (one-shot)")
         self.image_gen = ImageGenerator()
+        # Loopback HTTP shim over image_gen, so Claude's tools/images/* CLIs
+        # reuse the resident Flux model. Started in setup_hook.
+        self.image_service = ImageService(self.image_gen)
         self._last_search_sources: List[dict] = []
+        # One lock per (guild, channel) so two messages in the same channel
+        # can't resume the same Claude session concurrently. Different channels
+        # have different sessions and run in parallel freely.
+        self._session_locks: Dict[tuple, asyncio.Lock] = {}
 
         # Active model (switchable via /set_model, persisted to disk)
         self._state_file = os.path.join(os.path.dirname(__file__), "bot_state.json")
@@ -276,11 +289,51 @@ class OllamaBot(discord.Client):
             "- tools/discord/rename_channel.py — rename an existing channel\n"
             "- tools/discord/delete_channel.py — delete a channel\n"
             "- tools/discord/send_webhook.py — send Discord messages via webhook\n"
+            "- tools/images/generate.py — draw an image with the diffusion model (Flux2 Klein)\n"
+            "- tools/images/edit.py — edit an existing image with the diffusion model\n"
+            "- tools/images/attach.py — attach an image you made yourself with code\n"
+            "\n"
+            "IMAGES: you decide when a message wants a picture — there's no keyword trigger. "
+            "You also decide HOW to make it, and the two options are good at opposite things.\n"
+            "PREFER WRITING CODE (matplotlib, PIL/Pillow, SVG, graphviz) then "
+            "tools/images/attach.py for: charts, graphs, plots, any data visualization; "
+            "diagrams, flowcharts, timelines; anything with legible text, labels, numbers or "
+            "axes; tables/scoreboards/calendars as images; precise geometry or exact colors. "
+            "Diffusion models garble text and can't be trusted with real data — if the image "
+            "carries information, draw it with code. Save the file under the project dir "
+            "(api_out/ is fine) and register it with attach.py.\n"
+            "USE tools/images/generate.py for: photographic, painterly, or imaginative "
+            "visuals — scenes, characters, creatures, textures, 'draw me a X', album-art "
+            "vibes. Anything where realism or aesthetics matter and exact text doesn't.\n"
+            "USE tools/images/edit.py when someone wants an existing image changed ('make "
+            "her hair green', 'remove the background'). Source images are in "
+            "multimodal_input/ (user uploads) and api_out/ (things you generated). Describe "
+            "ONLY what changes, not the whole scene.\n"
+            "Any image from these three tools is attached to your reply automatically — do "
+            "NOT try to send it with tools/discord/send_message.py, and don't paste the file "
+            "path into chat. Just write your reply text normally; the picture rides along. "
+            "If a request doesn't want an image, don't make one.\n"
             "For reminders: use tools/scheduler/create_task.py --once with a command that calls tools/discord/send_message.py. "
             "Use the channel_id from [Current context] unless the user specifies a different channel. "
             "Example: create_task --name 'reminder' --schedule '0 9 30 3 *' --once "
             "--command 'python tools/discord/send_message.py --channel-id CHAN --content \"<@USER> reminder text\"'\n"
             "Always use these tools when the user's request matches their capabilities instead of making up answers.\n"
+            "ACT, DON'T ANNOUNCE: your process exits the moment you finish replying. "
+            "Nothing runs in the background, so anything you said you'd 'go do' simply "
+            "never happens. You may well remember this conversation next time someone "
+            "pings you — but remembering is not doing, and the work still won't exist. "
+            "This message is your only chance to act. So NEVER reply with "
+            "intent instead of results: no 'lemme go check', 'i'll re-render it', 'gimme "
+            "a sec', 'im on it', 'one moment'. Run the tools FIRST, then describe what "
+            "you actually did. If someone asks for something you can build, build it in "
+            "this turn before you answer. Saying you'll do it and stopping is the single "
+            "worst thing you can do here — it reads as lying. If a task genuinely can't "
+            "be done in one turn, say that plainly and say what you'd need; do not imply "
+            "it's underway. Long tool work is fine — taking a few minutes and delivering "
+            "beats replying instantly with a promise.\n"
+            "The casual tone is style ONLY — this is a real server with real requests, not "
+            "roleplay. When someone asks for a thing, they want the thing, not a character "
+            "performance about the thing.\n"
             "PERMISSIONS: Discord and Splitwise tools enforce the requesting user's own permissions in code — the "
             "tool checks the triggering user's Discord roles (or Splitwise ownership) and hard-rejects actions they "
             "aren't allowed to perform, regardless of what you decide. If a tool returns a permission-denied error, "
@@ -347,6 +400,297 @@ class OllamaBot(discord.Client):
         """Persist current model selection to disk."""
         self._save_state()
 
+    # --- Resumable Claude sessions ----------------------------------------
+    # Each channel gets its own Claude Code CLI session, kept on disk so it
+    # survives restarts. The session remembers what the model actually DID
+    # (files written, URLs fetched) rather than just what was said, which the
+    # re-rendered transcript can never convey. chat_history.db stays the source
+    # of truth: any failure here degrades to the full-transcript path.
+
+    def _session_lock(self, server, channel) -> asyncio.Lock:
+        """Get (or create) the per-channel session lock."""
+        key = (server, channel)
+        lock = self._session_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[key] = lock
+        return lock
+
+    @staticmethod
+    def _hash_text(text: str) -> str:
+        """Short stable hash, used to detect prompt/memory changes."""
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+    def resume_enabled_for(self, using_claude_code: bool, is_pty: bool) -> bool:
+        """Whether this turn should use a resumable session.
+
+        The Claude Code backend only. The local Ollama backend has no session
+        concept, and the PTY client already has its own persistent session.
+        """
+        return CLAUDE_RESUME_SESSIONS and using_claude_code and not is_pty
+
+    def _session_is_stale(self, row: dict, model: str, system_prompt_hash: str):
+        """Return a reason string if the stored session can't be reused, else None.
+
+        A session bakes in its system prompt and model at creation, so changing
+        either (via /set_system_prompt, /reset_system_prompt, /set_model) has to
+        start a new one. Size limits are reported separately because they get a
+        handoff summary rather than a plain reset.
+        """
+        if row.get("model") != model:
+            return f"model changed ({row.get('model')} -> {model})"
+        if row.get("system_prompt_hash") != system_prompt_hash:
+            return "system prompt changed"
+        return None
+
+    def _session_is_full(self, row: dict):
+        """Return a reason string if the session should be rotated, else None."""
+        tokens = row.get("context_tokens") or 0
+        if tokens >= CLAUDE_SESSION_MAX_TOKENS:
+            return f"context {tokens} >= {CLAUDE_SESSION_MAX_TOKENS} tokens"
+        turns = row.get("turns") or 0
+        if CLAUDE_SESSION_MAX_TURNS and turns >= CLAUDE_SESSION_MAX_TURNS:
+            return f"{turns} turns >= {CLAUDE_SESSION_MAX_TURNS}"
+        return None
+
+    async def _prepare_session(self, server, channel, model: str,
+                               system_prompt_hash: str) -> dict:
+        """Decide whether to resume, rotate, or start fresh for this channel.
+
+        Returns {"row", "resume_id", "handoff", "reason"}. A None row means
+        "start a fresh session"; `handoff` carries state rescued from a rotated
+        session so the replacement isn't amnesiac about its own artifacts.
+        Must be called under the channel's session lock.
+        """
+        row = chat_history.get_claude_session(str(server), str(channel))
+        if not row:
+            return {"row": None, "resume_id": None, "handoff": None,
+                    "reason": "no stored session"}
+
+        stale = self._session_is_stale(row, model, system_prompt_hash)
+        if stale:
+            logger.info("[session] %s/%s starting fresh: %s", server, channel, stale)
+            chat_history.delete_claude_session(str(server), str(channel))
+            return {"row": None, "resume_id": None, "handoff": None, "reason": stale}
+
+        full = self._session_is_full(row)
+        if full:
+            logger.info("[session] %s/%s rotating: %s", server, channel, full)
+            handoff = await self.claude_code_client.summarize_session_for_handoff(
+                row["session_id"], model,
+            )
+            if handoff:
+                logger.info("[session] handoff captured (%d chars)", len(handoff))
+            else:
+                logger.warning("[session] handoff unavailable, rotating without it")
+            chat_history.delete_claude_session(str(server), str(channel))
+            return {"row": None, "resume_id": None, "handoff": handoff,
+                    "reason": f"rotated ({full})"}
+
+        return {"row": row, "resume_id": row["session_id"], "handoff": None,
+                "reason": None}
+
+    def _build_session_delta_prompt(
+        self,
+        server,
+        channel,
+        messages: List[dict],
+        user_content: str,
+        search_summary,
+        active_user_ids,
+        row: dict,
+        trigger_message_id=None,
+    ) -> tuple:
+        """Build the incremental prompt for a resumed session.
+
+        The session already holds the conversation, so we send only what it
+        hasn't seen: every message recorded in this channel since the watermark,
+        plus the per-turn volatile context. Returns (prompt, memory_hash).
+
+        Bot-authored rows are excluded deliberately — the session generated
+        those replies itself, and record_bot_response writes them to the DB
+        *after* the turn, so without this filter the model would re-read its own
+        output as if a user had said it.
+        """
+        bot_user_id = str(self.user.id) if self.user else None
+        delta = chat_history.get_channel_messages_since(
+            str(server), str(channel), row.get("last_message_id"), limit=200,
+        )
+
+        lines = []
+        for r in delta:
+            if bot_user_id and str(r.get("author_id")) == bot_user_id:
+                continue
+            # The triggering message is added separately below using
+            # user_content, which is richer (parsed docs, fetched URLs, image
+            # notes) than the raw stored text.
+            if trigger_message_id and str(r.get("message_id")) == str(trigger_message_id):
+                continue
+            body = r.get("content") or ""
+            if r.get("image_summary"):
+                body += f"\n[Attached image: {r['image_summary']}]"
+            if not body.strip():
+                continue
+            lines.append(f"[{r.get('author_name', 'Unknown')} "
+                         f"(discord_id={r.get('author_id', '')})] {body}")
+
+        last_msg = messages[-1]
+        name = last_msg.get("name", "Unknown")
+        uid = last_msg.get("discord_user_id", "")
+
+        # Per-user personality override goes in as a turn-level note, not the
+        # system prompt — a session's system prompt is fixed at creation, and
+        # the next message in this channel may come from a different user.
+        personality_note = ""
+        if uid:
+            override = self.plugin_manager.get_system_prompt_override(int(uid))
+            if override:
+                personality_note = f"[Personality override for this user: {override}]\n"
+
+        if lines:
+            missed = "\n".join(lines)
+            prompt = (
+                f"{personality_note}[Messages in this channel since your last reply:]\n"
+                f"{missed}\n\n[{name} (discord_id={uid})] {user_content}"
+            )
+        else:
+            prompt = f"{personality_note}[{name} (discord_id={uid})] {user_content}"
+
+        if search_summary:
+            prompt = f"Search Results Summary:\n{search_summary}\n\n{prompt}"
+
+        # Memory (user profiles / channel summaries / server events) changes
+        # only when the summarizer runs, so re-send it just when it differs from
+        # what this session already has.
+        memory_context = chat_history.get_memory_context(
+            str(server), channel_id=str(channel), active_user_ids=active_user_ids,
+            requesting_user_id=(last_msg.get("discord_user_id") or None),
+        )
+        memory_hash = self._hash_text(memory_context) if memory_context else None
+        if memory_context and memory_hash != row.get("memory_hash"):
+            prompt = f"{prompt}\n\n[Updated server memory:]\n{memory_context}"
+
+        guild = self.get_guild(server)
+        mention_context = extract_mention_context(user_content, guild)
+        if mention_context:
+            prompt = f"{prompt}\n\n{mention_context}"
+
+        if self.rag_enabled:
+            wiki_context = self.rag_system.get_context_for_query(user_content)
+            if wiki_context:
+                prompt = f"Wiki Context:\n{wiki_context}\n\n{prompt}"
+
+        return prompt, memory_hash
+
+    async def _claude_turn_with_session(
+        self,
+        server,
+        channel,
+        model: str,
+        messages: List[dict],
+        user_content: str,
+        search_summary,
+        active_user_ids,
+        requester_uid,
+        images,
+        full_prompt: str,
+        image_request_id: str,
+        trigger_message_id=None,
+    ) -> str:
+        """Run one Claude-with-tools turn against this channel's session.
+
+        Resumes the channel's session when there is a usable one (sending only
+        new messages), otherwise starts a fresh persisted session seeded with
+        the full transcript in `full_prompt`. Returns the raw response text.
+
+        Serialized per channel: two concurrent turns must not --resume the same
+        session id, and the watermark write must not race.
+        """
+        system_prompt_hash = self._hash_text(self.system_prompt)
+
+        async with self._session_lock(server, channel):
+            sess = await self._prepare_session(
+                server, channel, model, system_prompt_hash,
+            )
+            row = sess["row"]
+
+            if row:
+                prompt, memory_hash = self._build_session_delta_prompt(
+                    server, channel, messages, user_content, search_summary,
+                    active_user_ids, row, trigger_message_id=trigger_message_id,
+                )
+                turns = (row.get("turns") or 0)
+            else:
+                # Fresh session: full transcript, and fold in any handoff
+                # rescued from the session this one replaces.
+                prompt = full_prompt
+                if sess["handoff"]:
+                    prompt = (
+                        "[Continuing an earlier conversation in this channel. "
+                        "Handoff notes from it — these paths and findings are "
+                        "real, reuse them instead of redoing the work:]\n"
+                        f"{sess['handoff']}\n\n{prompt}"
+                    )
+                memory_hash = None
+                turns = 0
+
+            meta = {}
+            try:
+                raw_response, _ = await self.claude_code_client.generate_with_tools(
+                    prompt, model, images,
+                    requester_user_id=requester_uid,
+                    requester_guild_id=server,
+                    image_request_id=image_request_id,
+                    resume_session_id=sess["resume_id"],
+                    persist_session=True,
+                    meta=meta,
+                )
+            except SessionResumeError as e:
+                # The stored id is dead (session file pruned, cwd changed).
+                # Drop it and retry once from scratch rather than erroring out.
+                logger.warning("[session] %s/%s resume failed, retrying fresh: %s",
+                               server, channel, e)
+                chat_history.delete_claude_session(str(server), str(channel))
+                meta = {}
+                raw_response, _ = await self.claude_code_client.generate_with_tools(
+                    full_prompt, model, images,
+                    requester_user_id=requester_uid,
+                    requester_guild_id=server,
+                    image_request_id=image_request_id,
+                    resume_session_id=None,
+                    persist_session=True,
+                    meta=meta,
+                )
+                memory_hash = None
+                turns = 0
+
+            session_id = meta.get("session_id")
+            if session_id:
+                chat_history.upsert_claude_session(
+                    guild_id=str(server),
+                    channel_id=str(channel),
+                    session_id=session_id,
+                    last_message_id=str(trigger_message_id) if trigger_message_id else None,
+                    model=model,
+                    system_prompt_hash=system_prompt_hash,
+                    memory_hash=memory_hash,
+                    context_tokens=meta.get("context_tokens") or 0,
+                    turns=turns + 1,
+                    handoff=sess["handoff"],
+                )
+                logger.info(
+                    "[session] %s/%s %s id=%s turns=%d tokens=%s",
+                    server, channel, "resumed" if row else "created",
+                    session_id, turns + 1, meta.get("context_tokens"),
+                )
+            else:
+                # No id came back — don't leave a stale pointer behind.
+                logger.warning("[session] %s/%s no session_id returned; clearing pointer",
+                               server, channel)
+                chat_history.delete_claude_session(str(server), str(channel))
+
+            return raw_response
+
     async def setup_hook(self):
         """Setup hook for Discord bot"""
         self.command_handlers.setup_commands()
@@ -357,6 +701,12 @@ class OllamaBot(discord.Client):
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         await js_renderer.start()
+        # Localhost shim so Claude-invoked tools/images/* drive the resident
+        # Flux pipeline instead of loading their own copy of a 9B model.
+        try:
+            await self.image_service.start()
+        except Exception as e:
+            logger.error(f"Failed to start image service: {e}")
 
     def _read_recent_logs(self, max_lines: int = 200) -> str:
         """Read the last N lines from bot.log."""
@@ -762,6 +1112,9 @@ class OllamaBot(discord.Client):
             "timestamp": time.time(),
             "images": images,
             "image_files": list(image_files),  # Keep paths for img2img editing
+            # Discord id of the triggering message — the watermark a resumed
+            # Claude session advances to, so the next turn's delta starts here.
+            "message_id": str(message.id),
         })
 
         # Store as the active context for query_ollama / pick_model
@@ -902,11 +1255,51 @@ class OllamaBot(discord.Client):
                 if i < len(all_parts) - 1:
                     await asyncio.sleep(random.uniform(0.3, 0.8))
 
-            # Handle any image items
+            # Handle any image items (Claude-produced: diffusion or code-drawn)
             for response_item in response_data:
                 if isinstance(response_item, dict) and "image" in response_item:
-                    file = discord.File(response_item["image"])
-                    await message.channel.send(file=file)
+                    img_path = response_item["image"]
+                    if not os.path.exists(img_path):
+                        logger.warning("[img] queued image vanished before send: %s", img_path)
+                        continue
+                    info = response_item.get("info") or {}
+                    file = discord.File(img_path, filename=os.path.basename(img_path))
+                    if response_item.get("nsfw"):
+                        file.spoiler = True
+
+                    # Only diffusion output has generation params worth showing.
+                    embed = None
+                    if info.get("seed") is not None:
+                        embed = discord.Embed()
+                        embed.set_image(url=f"attachment://{file.filename}")
+                        embed.set_footer(
+                            text=(
+                                f"steps: {info.get('steps')}, "
+                                f"size: {info.get('width')}x{info.get('height')}, "
+                                f"seed: {info.get('seed')}"
+                            )
+                        )
+
+                    sent_img = await message.channel.send(file=file, embed=embed)
+
+                    # Persist a marker so follow-up turns know an image exists
+                    # and can reference/edit it by path.
+                    marker = (
+                        f"[Generated an image with the following prompt: "
+                        f"{info.get('prompt', '')}] "
+                        f"(seed: {info.get('seed')}, "
+                        f"size: {info.get('width')}x{info.get('height')}, "
+                        f"path: {img_path})"
+                    )
+                    await chat_history.record_bot_response(
+                        guild_id=server,
+                        channel_id=channel,
+                        bot_user_id=self.user.id,
+                        bot_name=self.user.display_name,
+                        content=marker,
+                        message_id=sent_img.id,
+                        reply_to_message_id=None,
+                    )
         else:
             logger.debug(f"[TTS-DEBUG] Text suppressed — skipping {len(all_parts)} text parts")
 
@@ -1193,6 +1586,22 @@ class OllamaBot(discord.Client):
         user_content = messages[-1]['content']
         images = messages[-1].get("images", [])
 
+        # Image routing. On the Claude Code backend, Claude decides for itself
+        # whether to draw something — and whether to use the diffusion model
+        # (tools/images/generate.py) or write code and attach the result
+        # (tools/images/attach.py). We skip the keyword/classifier heuristic
+        # entirely in that case.
+        #
+        # The heuristic below remains the fallback for the local Ollama backend,
+        # which has no tool-calling path, and for rate-limited fallback.
+        _routing_model = self.pick_model(server, channel)
+        claude_owns_images = (
+            is_claude_code_model(_routing_model)
+            and not self.claude_code_client.is_rate_limited
+        )
+        if claude_owns_images:
+            logger.info("[img] delegating image decisions to Claude")
+
         # Check if this is an image generation / edit task.
         # Three entry conditions:
         #   1. Direct keyword match ("generate/create/draw/... image/picture/...")
@@ -1209,7 +1618,9 @@ class OllamaBot(discord.Client):
             "[img] detection user_content_len=%d keyword_match=%s has_recent_image_gen=%s has_attached_image=%s",
             len(user_content), keyword_match, has_recent_image_gen, has_attached_image,
         )
-        if keyword_match or has_recent_image_gen or has_attached_image:
+        if not claude_owns_images and (
+            keyword_match or has_recent_image_gen or has_attached_image
+        ):
             # Give the classifier enough context to disambiguate chat-about-image
             # from edit-this-image. Prefix based on what triggered us.
             classify_input = user_content
@@ -1448,6 +1859,10 @@ class OllamaBot(discord.Client):
         # Build prompt — PTY sessions keep their own history, so only send
         # the new message + fresh context. One-shot CLI needs the full history.
         is_pty = isinstance(self.claude_code_client, ClaudeCodeClientPTY)
+        # Resumable per-channel sessions. The full prompt is still built below:
+        # it's local work (no API calls) and it's exactly what seeds a fresh
+        # session. A resumed session replaces it with a delta prompt instead.
+        resume_ok = self.resume_enabled_for(using_claude_code, is_pty)
 
         if is_pty and using_claude_code:
             # PTY mode: send only the latest user message with metadata
@@ -1505,18 +1920,58 @@ class OllamaBot(discord.Client):
 
             last_user_id = messages[-1].get("discord_user_id")
             system_prompt = self.system_prompt
+            override_note = ""
             if last_user_id:
                 override = self.plugin_manager.get_system_prompt_override(last_user_id)
                 if override:
-                    system_prompt = override
+                    if resume_ok:
+                        # A session bakes its system prompt in at creation, and
+                        # the next message here may come from a different user.
+                        # Keep the session's prompt the base one and apply the
+                        # override per turn (same trick as the PTY path).
+                        override_note = f"[Personality override for this user: {override}]\n"
+                    else:
+                        system_prompt = override
                     logger.debug(f"[TTS-DEBUG] Using personality override for user {last_user_id}")
-            prompt = f"System: {system_prompt}\n" + prompt
+            prompt = f"System: {system_prompt}\n" + override_note + prompt
 
             memory_context = chat_history.get_memory_context(str(server), channel_id=str(channel), active_user_ids=active_user_ids, requesting_user_id=(messages[-1].get("discord_user_id") or None))
             if memory_context:
                 prompt = f"{prompt}\n\n{memory_context}"
 
             prompt += f"\n\n[Current context: guild_id={server}, channel_id={channel}]"
+
+            # The Claude Code CLI has no vision input (allowedTools is
+            # Bash,WebSearch,WebFetch), so attachments never reach it as images.
+            # Surface the saved paths instead: Claude can't look at them, but it
+            # can pass them to tools/images/edit.py.
+            if claude_owns_images:
+                attached = messages[-1].get("image_files") or []
+                if attached:
+                    prompt += (
+                        "\n[The user attached "
+                        f"{len(attached)} image(s), saved at: {', '.join(attached)}. "
+                        "You cannot view them directly. If they're asking for an edit, "
+                        "pass the path to tools/images/edit.py.]"
+                    )
+                # Most recent image this channel produced, for follow-up edits
+                # ('make it bluer') without re-deriving state from chat text.
+                prev = next(
+                    (
+                        m for m in reversed(messages[:-1])
+                        if m.get("role") == "assistant"
+                        and "[Generated an image" in m.get("content", "")
+                    ),
+                    None,
+                )
+                if prev:
+                    path_match = re.search(r"path: (.+?)\)", prev["content"])
+                    if path_match and os.path.exists(path_match.group(1)):
+                        prompt += (
+                            f"\n[Your most recent image in this channel: "
+                            f"{path_match.group(1)} — pass this to "
+                            f"tools/images/edit.py for follow-up edits.]"
+                        )
 
             guild = self.get_guild(server)
             mention_context = extract_mention_context(user_content, guild)
@@ -1525,6 +1980,10 @@ class OllamaBot(discord.Client):
 
         if images:
             print("Sending image")
+
+        # Images Claude produced during this turn (diffusion via
+        # tools/images/generate.py|edit.py, or code-drawn via attach.py).
+        claude_images: List[dict] = []
 
         try:
             print(f"Using model: {model}")
@@ -1540,11 +1999,50 @@ class OllamaBot(discord.Client):
                     # enforce *their* Discord permissions (not the model's
                     # judgement). This is the trusted requester identity.
                     requester_uid = messages[-1].get("discord_user_id")
-                    raw_response, _ = await self.claude_code_client.generate_with_tools(
-                        prompt, model, images,
-                        requester_user_id=requester_uid,
-                        requester_guild_id=server,
-                    )
+                    # Correlates any image tools/images/* produces during this
+                    # turn so we can attach it to the reply below.
+                    image_request_id = uuid.uuid4().hex
+                    try:
+                        if resume_ok:
+                            # Resumable per-channel session: the model keeps its
+                            # own memory of what it actually did, and we send
+                            # only new messages.
+                            raw_response = await self._claude_turn_with_session(
+                                server=server,
+                                channel=channel,
+                                model=model,
+                                messages=messages,
+                                user_content=user_content,
+                                search_summary=search_summary,
+                                active_user_ids=active_user_ids,
+                                requester_uid=requester_uid,
+                                images=images,
+                                full_prompt=prompt,
+                                image_request_id=image_request_id,
+                                trigger_message_id=messages[-1].get("message_id"),
+                            )
+                        else:
+                            raw_response, _ = await self.claude_code_client.generate_with_tools(
+                                prompt, model, images,
+                                requester_user_id=requester_uid,
+                                requester_guild_id=server,
+                                image_request_id=image_request_id,
+                            )
+                    except BaseException:
+                        # Don't leave orphaned images queued under this id —
+                        # they'd never be attached and would leak memory.
+                        self.image_service.discard(image_request_id)
+                        raise
+                    claude_images = self.image_service.drain(image_request_id)
+                    if claude_images:
+                        logger.info(
+                            "[img] Claude produced %d image(s): %s",
+                            len(claude_images),
+                            ", ".join(
+                                f"{i['kind']}:{os.path.basename(i['path'])}"
+                                for i in claude_images
+                            ),
+                        )
                 except RateLimitError:
                     reset = self.claude_code_client.rate_limit_resets_at or "unknown"
                     print(f"  [Claude Code rate limited, resets at {reset}, falling back to local model]")
@@ -1572,7 +2070,17 @@ class OllamaBot(discord.Client):
                     return ["No response from Ollama."]
 
             print(f"Response: {raw_response}")
-            return self.process_response(raw_response)
+            parts = self.process_response(raw_response)
+            # Append any images Claude made this turn. _send_response sends
+            # dict items with an "image" key as files after the text parts,
+            # so typing simulation and message splitting still apply.
+            for img in claude_images:
+                parts.append({
+                    "image": img["path"],
+                    "nsfw": img.get("nsfw", False),
+                    "info": img,
+                })
+            return parts
 
         except Exception as e:
             print(f"Error: {e}")
@@ -1595,6 +2103,7 @@ class OllamaBot(discord.Client):
         if hasattr(self.claude_code_client, 'shutdown'):
             await self.claude_code_client.shutdown()
         await js_renderer.stop()
+        await self.image_service.stop()
         await super().close()
 
 

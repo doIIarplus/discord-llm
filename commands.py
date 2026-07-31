@@ -9,6 +9,7 @@ import aiohttp
 import discord
 from discord import app_commands
 
+import chat_history
 from models import Txt2TxtModel
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -305,7 +306,19 @@ class CommandHandlers:
             if server in self.bot.context and channel in self.bot.context[server]:
                 self.bot.context[server][channel] = []
                 logger.debug(f"Cleared context for server {server}, channel {channel}")
-            await interaction.response.send_message("Context cleared")
+
+            # Also drop this channel's resumable Claude session, so "clear"
+            # means one thing. Without this the model would keep its own memory
+            # of the conversation the user just asked to forget.
+            had_session = chat_history.get_claude_session(str(server), str(channel)) is not None
+            if had_session:
+                chat_history.delete_claude_session(str(server), str(channel))
+                logger.info(f"Dropped Claude session for server {server}, channel {channel}")
+
+            await interaction.response.send_message(
+                "Context cleared (and Claude session reset)" if had_session
+                else "Context cleared"
+            )
             logger.info("Context cleared successfully")
 
         @self.bot.tree.command(name="ask", description="Ask something")

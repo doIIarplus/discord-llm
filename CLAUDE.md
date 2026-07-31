@@ -82,7 +82,11 @@ asyncio.run(t())
 
 **Model selection**: If the last message has images attached, switches to `IMAGE_RECOGNITION_MODEL` (`qwen3-vl:32b`); otherwise uses `CHAT_MODEL` (`gemma-3-27b-it-abliterated`).
 
-**Image generation detection**: Uses a fast keyword heuristic (generate/create/draw + image/picture/photo) before calling the LLM classifier, avoiding an Ollama round-trip for most messages.
+**Image generation detection**: On the Claude Code backend, Claude decides for
+itself whether to draw and picks diffusion vs. code — see
+[Images](#images-toolsimages). The keyword heuristic (generate/create/draw +
+image/picture/photo) followed by an LLM classifier is now only the **fallback**
+for the local Ollama backend and rate-limited fallback.
 
 **Multi-message responses**: LLM can split its response with `---MSG---` markers; each part is sent as a separate Discord message with simulated typing delay.
 
@@ -139,7 +143,25 @@ Standalone Python scripts in `tools/` that Claude can call via Bash. Each tool u
 
 ### Confirmation policy
 - **Read-only tools** (list, get, search, stats): Execute immediately, report results.
-- **Mutating tools** (create, delete, generate, schedule): Describe the action and wait for user confirmation before executing.
+- **Producing / additive tools** (generate or edit an image, render a chart, send a
+  message, create a thread, schedule a task): **Execute immediately.** These are
+  cheap and reversible, and the user asking for the thing *is* the confirmation.
+  Do not describe what you are about to do and stop — that reads as a broken
+  promise, because nothing runs between turns (see below).
+- **Destructive / irreversible tools** (delete a channel or message, timeout a
+  member, bulk role or nickname changes, deleting a Splitwise expense, anything
+  that removes data): Describe the action and wait for explicit user confirmation
+  before executing.
+
+**No promises of future work.** Each Discord message is handled by a single
+`claude -p` invocation that **exits when the reply is sent**. Nothing runs in the
+background, and no agent loop continues afterwards. Resumable sessions (above)
+change what you *remember* next turn — they do not give you time to work between
+turns. So the turn that emits text is still the only chance to act: never answer
+with intent ("lemme go pull that", "i'll re-render it", "gimme a sec") as a
+substitute for acting. Do the work with tools **first**, then reply describing
+what you actually did. If a task is genuinely too large for one turn, say so
+plainly and state what you'd need, rather than implying it is underway.
 
 ### Access control
 
@@ -169,6 +191,82 @@ Requires `SPLITWISE_API_KEY` in environment.
 **Workflow example:** To split $50 with "Jason":
 1. `list_friends.py` → find Jason's user ID
 2. `create_expense.py --amount 50 --description "Dinner" --split-with <jason_id>`
+
+### Resumable Claude sessions (per channel)
+
+Each Discord channel gets its own Claude Code CLI session, resumed on the next turn
+instead of re-sending the chat transcript. Without this, every message was an
+independent `claude -p --no-session-persistence` process that could not know what it
+had just done — it would say "lemme go pull that" and the process would exit, making
+the promise unkeepable. The session remembers what the model *actually did* (files
+written, URLs that worked), which a re-rendered transcript can never convey.
+
+- **Scope**: the Claude Code backend. The local Ollama backend and the PTY client
+  (which has its own single global session) keep the full-transcript behavior.
+- **Config**: `CLAUDE_RESUME_SESSIONS` (default **on**, set `0` to disable),
+  `CLAUDE_SESSION_MAX_TOKENS` (default 180000), `CLAUDE_SESSION_MAX_TURNS` (0 = off).
+- **Storage**: the `claude_sessions` table in `chat_history.db` holds only a pointer
+  (`session_id`, watermark, model, prompt/memory hashes, token count). The
+  conversation itself lives in `~/.claude/projects/<cwd-slug>/<session_id>.jsonl`,
+  which is why sessions **survive bot restarts**. Those files grow; rotated ones are
+  left behind (pruning is not automated).
+- **Delta feeding**: a resumed turn sends only messages recorded since the watermark
+  (`get_channel_messages_since`), so the bot still sees conversation it wasn't
+  mentioned in — better than the old fixed 20-message window. **Bot-authored rows are
+  excluded**: the session generated those replies itself, and `record_bot_response`
+  writes them to the DB *after* the turn, so without the filter the model would
+  re-read its own output as if a user had said it.
+- **Invalidation**: changing the system prompt (`/set_system_prompt`,
+  `/reset_system_prompt`) or the model (`/set_model`) starts a fresh session, since a
+  session bakes both in at creation. Per-user personality overrides are therefore
+  applied as a **turn-level note**, not via the system prompt — the next message in a
+  channel may come from a different user.
+- **Rotation**: past the token budget, the outgoing session writes a handoff note
+  (exact file paths, working URLs, reusable commands, open threads) that seeds its
+  replacement. Best-effort — falls back to a plain fresh session.
+- **Concurrency**: one `asyncio.Lock` per `(guild, channel)`. `--fork-session` is
+  deliberately not used — it would mint a new id and on-disk file every turn.
+- **Failure handling**: a dead session id raises `SessionResumeError` (CLI exits 1 with
+  `No conversation found with session ID: …`); the pointer is dropped and the turn
+  retries once as a fresh session. `chat_history.db` remains the source of truth.
+- **`/clear`** drops the session as well as the in-memory context.
+
+### Images (`tools/images/`)
+Claude decides **whether** an image is wanted and **how** to make it. There is no
+keyword trigger on this path. Requires the bot process to be running — the tools
+are thin HTTP clients, not standalone generators.
+
+| Tool | Description |
+|------|-------------|
+| `generate.py PROMPT [--preset P] [--width N] [--height N] [--seed N] [--steps N]` | Draw with the diffusion model (Flux2 Klein) |
+| `edit.py PROMPT --image PATH [--preset P] [...]` | Edit an existing image with the diffusion model |
+| `attach.py PATH [--caption TEXT] [--nsfw-check]` | Attach an image Claude drew itself with code |
+
+**Which one to use.** Diffusion garbles text and can't be trusted with real data,
+so anything *carrying information* should be drawn with code and registered via
+`attach.py`: charts, plots, diagrams, flowcharts, timelines, tables, scoreboards,
+anything with labels/axes/numbers. `generate.py` is for photographic/painterly
+output where realism matters and exact text doesn't.
+
+- **[image_service.py](image_service.py)** — an aiohttp service the bot hosts on
+  loopback (`IMAGE_SERVICE_HOST`/`IMAGE_SERVICE_PORT`, default `127.0.0.1:8766` —
+  note **8766**, since spookie_merged uses 8765 on the same box). It exists because
+  `FluxClient` holds Klein 9B **resident in the bot process**; a tool that imported
+  Flux directly would load a second 9B model per subprocess. The tools are
+  stdlib-only HTTP clients and must never import torch/diffusers.
+- **Auth**: a token generated at startup, written to `tools/images/.image_service`
+  with mode `0600`, removed on shutdown. Non-matching tokens get 401.
+- **Path confinement**: `--image`/`PATH` args are `realpath`'d and must live under
+  `PROJECT_DIR`, so a prompt-injected call can't pull arbitrary files off disk.
+- **Delivery**: each Claude turn gets an `IMAGE_REQUEST_ID` (uuid4) forwarded through
+  `generate_with_tools` → `_run_cli` → `_build_env` into the tool subprocess env.
+  Tools echo it back; the service buckets images under it. After the turn `bot.py`
+  calls `image_service.drain(id)` and appends `{"image": path}` dicts, which
+  `_send_response` sends as files *after* the text — so typing simulation, `---MSG---`
+  splitting, and NSFW spoilering all still apply. No path scraping from reply text.
+- **Follow-up state**: the bot injects the last generated image's path (and user
+  attachment paths) into the prompt, since the CLI runs with
+  `--allowedTools Bash,WebSearch,WebFetch` and therefore **cannot see images**.
 
 ### Web Search (`tools/web_search/`)
 Requires `TAVILY_API_KEY` in environment.
