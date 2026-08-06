@@ -286,6 +286,8 @@ class OllamaBot(discord.Client):
             "- tools/discord/get_user.py — get user/member info (add --guild-id for nickname, roles, join date)\n"
             "- tools/discord/add_role.py / remove_role.py — manage user roles\n"
             "- tools/discord/list_roles.py — list server roles\n"
+            "- tools/discord/list_emojis.py — list server custom emojis\n"
+            "- tools/discord/delete_emoji.py — delete a custom emoji (destructive)\n"
             "- tools/discord/set_nickname.py — set or clear a member's nickname\n"
             "- tools/discord/timeout_user.py — timeout a member (e.g. 10m, 1h, 7d)\n"
             "- tools/discord/react.py — add a reaction to a message\n"

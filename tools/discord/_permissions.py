@@ -54,6 +54,11 @@ PERMISSIONS = {
     "MANAGE_NICKNAMES": 1 << 27,
     "MANAGE_ROLES": 1 << 28,
     "MANAGE_WEBHOOKS": 1 << 29,
+    # Manage Expressions — the emoji/sticker/soundboard permission. Discord
+    # renamed MANAGE_EMOJIS_AND_STICKERS to MANAGE_GUILD_EXPRESSIONS without
+    # changing the bit, so the same flag covers both names (discord.py's
+    # manage_expressions / manage_emojis alias the same value).
+    "MANAGE_EXPRESSIONS": 1 << 30,
     "CREATE_PUBLIC_THREADS": 1 << 34,
     "MODERATE_MEMBERS": 1 << 40,
 }

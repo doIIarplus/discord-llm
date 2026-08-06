@@ -238,7 +238,9 @@ Enforcement is layered, and the tiers are *not* equally strong:
 
 Access control is **enforced in code**, not just by prompt. The bot injects the *triggering* Discord user's identity into every tool subprocess as the `DISCORD_REQUESTING_USER_ID` / `DISCORD_REQUESTING_GUILD_ID` env vars (for the persistent PTY session, whose env is fixed at startup, it is written to `tools/discord/.request_context` instead). Tools read this trusted identity — not the `--user-id` the model passes — so a user cannot act beyond their own permissions even if the model is convinced to try.
 
-- **Discord tools** ([tools/discord/_permissions.py](tools/discord/_permissions.py)): Every Discord tool calls `require_permission(...)`, which resolves the requesting user's Discord roles/permissions in the guild (with owner + Administrator bypass and channel-overwrite handling) and **hard-rejects** if they lack the permission the action needs. E.g. `delete_channel.py` requires Manage Channels; if the requester lacks it, the tool exits with a permission-denied error and never calls Discord. Mapping of tool → required permission lives in each tool (e.g. delete/create/rename channel → Manage Channels; timeout → Moderate Members; add/remove role → Manage Roles; delete/pin/edit message → Manage Messages; read tools → View Channel).
+- **Discord tools** ([tools/discord/_permissions.py](tools/discord/_permissions.py)): Every Discord tool calls `require_permission(...)`, which resolves the requesting user's Discord roles/permissions in the guild (with owner + Administrator bypass and channel-overwrite handling) and **hard-rejects** if they lack the permission the action needs. E.g. `delete_channel.py` requires Manage Channels; if the requester lacks it, the tool exits with a permission-denied error and never calls Discord. Mapping of tool → required permission lives in each tool (e.g. delete/create/rename channel → Manage Channels; timeout → Moderate Members; add/remove role → Manage Roles; delete/pin/edit message → Manage Messages; read tools → View Channel;
+`delete_emoji.py` → Manage Expressions, i.e. Manage Emojis and Stickers — the
+same permission bit under both of Discord's names).
 - **Splitwise tools** ([tools/splitwise/_auth.py](tools/splitwise/_auth.py)): Restricted in code to Discord user `118567805678256128` (dollarplus) via `require_owner()`. Any other requester is denied. Still decline politely in conversation, but the code is the backstop.
 - **Fail closed**: if the requesting user cannot be verified, the action is denied.
 - **Trust boundary**: this stops the normal failure mode (the model relaying a request from an unauthorized user). It is not a sandbox — a model with unrestricted Bash could bypass it. For a hard guarantee, move enforcement to a Claude Code PreToolUse hook.
@@ -360,6 +362,8 @@ Requires `DISCORD_BOT_TOKEN` in env. Webhook tools also need `DISCORD_WEBHOOK_<N
 | `add_role.py --guild-id ID --user-id ID --role-id ID` | Add a role to a user |
 | `remove_role.py --guild-id ID --user-id ID --role-id ID` | Remove a role from a user |
 | `list_roles.py --guild-id ID` | List all server roles with IDs |
+| `list_emojis.py --guild-id ID` | List server custom emojis (name, id, animated, mention form) |
+| `delete_emoji.py --guild-id ID (--emoji-id ID \| --name NAME)` | Delete one custom emoji (irreversible). `--emoji-id` accepts `<:name:id>` |
 | `set_nickname.py --guild-id ID --user-id ID --nickname TEXT [--clear]` | Set or clear a member's nickname |
 | `timeout_user.py --guild-id ID --user-id ID --duration DURATION [--remove]` | Timeout a member (e.g. 10m, 1h, 7d). Max 28d |
 | `react.py --channel-id ID --message-id ID --emoji EMOJI` | Add reaction (Unicode or custom name:id) |
