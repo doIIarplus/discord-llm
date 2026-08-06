@@ -40,7 +40,92 @@ load_dotenv()
 # Discord Configuration
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = int(os.getenv("GUILD_ID", "363154169294618625"))
-logger.info(f"Discord configuration loaded. Guild ID: {GUILD_ID}")
+
+# Guilds the bot is allowed to operate in (allowlist). Comma-separated guild IDs
+# in .env: GUILD_ALLOWLIST=111,222,333. Defaults to just GUILD_ID when unset.
+# GUILD_ID is always included (the home guild for command sync).
+# The bot ignores messages/events from — and auto-leaves — any guild not listed.
+_guild_allowlist_raw = os.getenv("GUILD_ALLOWLIST", "")
+GUILD_ALLOWLIST: set = {
+    int(x) for x in _guild_allowlist_raw.split(",") if x.strip()
+} | {GUILD_ID}
+
+# ---------------------------------------------------------------------------
+# Per-guild tool allowlist
+# ---------------------------------------------------------------------------
+# Which tools/ integrations Claude may use, per guild. Set in .env as:
+#     GUILD_TOOLS_<guild_id>=web_search,images,rag
+#     GUILD_TOOLS_<guild_id>=*            # everything
+#     GUILD_TOOLS_<guild_id>=             # explicitly nothing
+#
+# DEFAULT IS DENY-ALL: a guild with no GUILD_TOOLS_ entry gets no tools, so a
+# newly added server is safe until you opt it in deliberately.
+#
+# Enforcement is layered, and the tiers differ in strength:
+#   - empty allowlist -> the CLI runs without Bash at all (generate_with_search).
+#     A hard boundary: the model has no mechanism to run anything.
+#   - partial         -> Bash is available and each tool checks the requesting
+#     guild and hard-rejects (see tools/_guild_access.py). This stops the model
+#     from relaying an unauthorized request, but Bash is not a sandbox — a
+#     determined prompt injection could script around the tools.
+#   - "*"             -> unrestricted, as before.
+TOOL_INTEGRATIONS: set = {
+    "agent", "discord", "flux", "github", "images", "memory", "rag",
+    "resume", "scheduler", "splitwise", "web_search",
+}
+
+_GUILD_TOOLS_PREFIX = "GUILD_TOOLS_"
+
+
+def _parse_guild_tools() -> dict:
+    """Read every GUILD_TOOLS_<guild_id> env var into {guild_id: set(tools)}."""
+    out = {}
+    for key, raw in os.environ.items():
+        if not key.startswith(_GUILD_TOOLS_PREFIX):
+            continue
+        gid_raw = key[len(_GUILD_TOOLS_PREFIX):]
+        try:
+            gid = int(gid_raw)
+        except ValueError:
+            logger.warning(f"Ignoring malformed {key}: guild id is not numeric")
+            continue
+        value = (raw or "").strip()
+        if value == "*":
+            out[gid] = set(TOOL_INTEGRATIONS)
+            continue
+        names = {n.strip() for n in value.split(",") if n.strip()}
+        unknown = names - TOOL_INTEGRATIONS
+        if unknown:
+            logger.warning(
+                f"{key} lists unknown integration(s) {sorted(unknown)}; "
+                f"known: {sorted(TOOL_INTEGRATIONS)}"
+            )
+        out[gid] = names & TOOL_INTEGRATIONS
+    return out
+
+
+GUILD_TOOL_ALLOWLIST: dict = _parse_guild_tools()
+
+
+def tools_allowed_for(guild_id) -> set:
+    """Integrations allowed in this guild. Empty set = no tools (the default)."""
+    try:
+        gid = int(guild_id)
+    except (TypeError, ValueError):
+        return set()
+    return set(GUILD_TOOL_ALLOWLIST.get(gid, set()))
+
+
+logger.info(
+    f"Discord configuration loaded. Guild ID: {GUILD_ID}; "
+    f"allowlist: {sorted(GUILD_ALLOWLIST)}"
+)
+for _gid in sorted(GUILD_ALLOWLIST):
+    _t = tools_allowed_for(_gid)
+    logger.info(
+        f"  guild {_gid} tools: "
+        + ("ALL" if _t == TOOL_INTEGRATIONS else (", ".join(sorted(_t)) or "none"))
+    )
 
 # DM allowlist: only these Discord user IDs may DM the bot.
 # Messages from any other user are silently ignored.

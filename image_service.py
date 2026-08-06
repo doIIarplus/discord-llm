@@ -68,8 +68,11 @@ def _clamp_side(value, default: int) -> int:
 class ImageService:
     """Wraps an ImageGenerator behind a token-guarded loopback HTTP API."""
 
-    def __init__(self, image_gen):
+    def __init__(self, image_gen, job_manager=None):
         self.image_gen = image_gen
+        # Background coding jobs (agent_jobs.JobManager). Optional so the
+        # service still works in tests that only exercise images.
+        self.job_manager = job_manager
         self.token = secrets.token_urlsafe(32)
         self._runner: Optional[web.AppRunner] = None
         # request_id -> [{path, seed, width, height, nsfw, kind}]
@@ -85,6 +88,13 @@ class ImageService:
         app.router.add_post("/generate", self._handle_generate)
         app.router.add_post("/edit", self._handle_edit)
         app.router.add_post("/attach", self._handle_attach)
+        # Background coding jobs. Same service because a tool subprocess needs
+        # some way into the bot's event loop, and this one already exists with
+        # auth and lifecycle sorted.
+        app.router.add_post("/agent/start", self._handle_agent_start)
+        app.router.add_post("/agent/status", self._handle_agent_status)
+        app.router.add_post("/agent/cancel", self._handle_agent_cancel)
+        app.router.add_post("/agent/push", self._handle_agent_push)
         app.router.add_get("/health", self._handle_health)
 
         self._runner = web.AppRunner(app, access_log=None)
@@ -225,6 +235,89 @@ class ImageService:
             logger.warning("attach with no request_id, will not auto-attach: %s", path)
 
         return web.json_response(result)
+
+    # ---------- background coding jobs ----------
+
+    async def _agent_body(self, request: web.Request):
+        """Shared preamble: auth, JSON, and a live job manager."""
+        if not self._authorized(request):
+            return None, web.json_response({"error": "unauthorized"}, status=401)
+        if self.job_manager is None:
+            return None, web.json_response(
+                {"error": "agent jobs are not enabled on this bot"}, status=503)
+        try:
+            return (await request.json()), None
+        except Exception:
+            return None, web.json_response({"error": "invalid JSON body"}, status=400)
+
+    async def _handle_agent_start(self, request: web.Request) -> web.Response:
+        body, err = await self._agent_body(request)
+        if err:
+            return err
+        repo = (body.get("repo") or "").strip()
+        task = (body.get("task") or "").strip()
+        if not repo or not task:
+            return web.json_response(
+                {"error": "both 'repo' and 'task' are required"}, status=400)
+        guild_id, channel_id = body.get("guild_id"), body.get("channel_id")
+        if not guild_id or not channel_id:
+            return web.json_response(
+                {"error": "guild_id and channel_id are required"}, status=400)
+        try:
+            info = await self.job_manager.start(
+                guild_id, channel_id, repo, task,
+                requester_id=body.get("requester_id"))
+        except Exception as e:
+            # Worktree problems (repo not cloned, mid-rebase, job already
+            # running) are user-actionable, so pass the message through.
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response(info)
+
+    async def _handle_agent_status(self, request: web.Request) -> web.Response:
+        body, err = await self._agent_body(request)
+        if err:
+            return err
+        job_id = (body.get("job_id") or "").strip()
+        if job_id:
+            job = self.job_manager.get(job_id)
+        else:
+            job = (self.job_manager.active_for(body.get("guild_id"), body.get("channel_id"))
+                   or self.job_manager.latest_for(body.get("guild_id"), body.get("channel_id")))
+        if not job:
+            return web.json_response({"error": "no matching job"}, status=404)
+        return web.json_response(job.public())
+
+    async def _handle_agent_cancel(self, request: web.Request) -> web.Response:
+        body, err = await self._agent_body(request)
+        if err:
+            return err
+        job_id = (body.get("job_id") or "").strip()
+        if not job_id:
+            job = self.job_manager.active_for(body.get("guild_id"), body.get("channel_id"))
+            if not job:
+                return web.json_response({"error": "nothing running here"}, status=404)
+            job_id = job.id
+        try:
+            return web.json_response(await self.job_manager.cancel(job_id))
+        except KeyError as e:
+            return web.json_response({"error": str(e)}, status=404)
+
+    async def _handle_agent_push(self, request: web.Request) -> web.Response:
+        body, err = await self._agent_body(request)
+        if err:
+            return err
+        job_id = (body.get("job_id") or "").strip()
+        if not job_id:
+            job = self.job_manager.latest_for(body.get("guild_id"), body.get("channel_id"))
+            if not job:
+                return web.json_response({"error": "no job in this channel"}, status=404)
+            job_id = job.id
+        try:
+            return web.json_response(await self.job_manager.push(job_id))
+        except KeyError as e:
+            return web.json_response({"error": str(e)}, status=404)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
 
     async def _handle_generate(self, request: web.Request) -> web.Response:
         return await self._run(request, kind="generate")

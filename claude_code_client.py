@@ -5,6 +5,7 @@ This routes through your Claude Max/Pro subscription instead of API credits.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -357,7 +358,7 @@ class ClaudeCodeClient:
 
     @staticmethod
     def _build_env(model: str, requester_user_id=None, requester_guild_id=None,
-                   image_request_id=None) -> dict:
+                   image_request_id=None, requester_channel_id=None) -> dict:
         """Build environment variables for the CLI process.
 
         For Ollama models, sets ANTHROPIC_BASE_URL and auth vars.
@@ -380,10 +381,15 @@ class ClaudeCodeClient:
         # Always overwrite (don't inherit a stale value from the parent env).
         env.pop("DISCORD_REQUESTING_USER_ID", None)
         env.pop("DISCORD_REQUESTING_GUILD_ID", None)
+        env.pop("DISCORD_REQUESTING_CHANNEL_ID", None)
         if requester_user_id:
             env["DISCORD_REQUESTING_USER_ID"] = str(requester_user_id)
         if requester_guild_id:
             env["DISCORD_REQUESTING_GUILD_ID"] = str(requester_guild_id)
+        # Agent tools post progress back into the originating channel, so they
+        # need to know which one it is.
+        if requester_channel_id:
+            env["DISCORD_REQUESTING_CHANNEL_ID"] = str(requester_channel_id)
 
         # Ties images produced by tools/images/* to this turn so the bot can
         # attach them to its reply. Always overwrite to avoid a stale id
@@ -469,6 +475,7 @@ class ClaudeCodeClient:
         requester_user_id=None,
         requester_guild_id=None,
         image_request_id=None,
+        requester_channel_id=None,
         resume_session_id=None,
         persist_session: bool = False,
         meta: Optional[dict] = None,
@@ -492,11 +499,163 @@ class ClaudeCodeClient:
             prompt, model, enable_tools=True, method="generate_with_tools",
             requester_user_id=requester_user_id, requester_guild_id=requester_guild_id,
             image_request_id=image_request_id,
+            requester_channel_id=requester_channel_id,
             resume_session_id=resume_session_id,
             persist_session=persist_session,
             meta=meta,
         )
         return text, []
+
+    async def run_agent_task(
+        self,
+        prompt: str,
+        cwd: str,
+        model: str = "opus",
+        on_event=None,
+        resume_session_id=None,
+        extra_dirs=None,
+        timeout: Optional[float] = None,
+        max_turns: int = 0,
+    ) -> dict:
+        """Run a long-form coding task, streaming progress as it happens.
+
+        Unlike _run_cli (one blocking call, batched JSON), this uses
+        --output-format stream-json and reads newline-delimited events off
+        stdout as they arrive, handing each to ``on_event``. That is what lets
+        the bot render live progress into a Discord message instead of going
+        silent for ten minutes.
+
+        Differences from the chat path, all deliberate:
+          - Full tool surface including Task, so the agent can spawn subagents.
+            Claude Code already is an orchestrator; we just stop hiding it.
+          - --permission-mode acceptEdits, since nobody is at a terminal to
+            approve edits. Work is confined to a throwaway worktree.
+          - cwd is the target repo, so *its* CLAUDE.md loads and the agent picks
+            up that project's conventions rather than the bot's.
+
+        Returns a dict with session_id, result text, cost, turns, and whether it
+        completed. Raises SessionResumeError if a resumed id is dead.
+        """
+        if timeout is None:
+            timeout = CLAUDE_CODE_TIMEOUT
+        if self.is_rate_limited:
+            raise RateLimitError(
+                f"Claude Code rate limited, resets at {self.rate_limit_resets_at}",
+                resets_at=self._rate_limited_until,
+            )
+
+        model_alias = self._resolve_model(model)
+        cmd = [
+            CLAUDE_CLI,
+            "-p",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--model", model_alias,
+            "--permission-mode", "acceptEdits",
+            "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep,Task,WebSearch,WebFetch",
+        ]
+        if resume_session_id:
+            cmd.extend(["--resume", resume_session_id])
+        if max_turns:
+            cmd.extend(["--max-turns", str(max_turns)])
+        # The agent works in the repo, but bot tools live in the bot's project.
+        for d in (extra_dirs or []):
+            cmd.extend(["--add-dir", d])
+
+        env = self._build_env(model)
+        started = time.perf_counter()
+        collected = {
+            "session_id": resume_session_id, "result": None, "is_error": False,
+            "cost_usd": None, "num_turns": None, "completed": False,
+            "stderr": "", "events": 0,
+        }
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=cwd, env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        # Feed the task on stdin and close it, so the CLI stops waiting for
+        # input and starts work. (It warns and proceeds after 3s otherwise.)
+        assert proc.stdin is not None
+        proc.stdin.write(prompt.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
+        with contextlib.suppress(Exception):
+            await proc.stdin.wait_closed()
+
+        async def _pump():
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                raw = line.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    # A partial or non-JSON line must never kill the job.
+                    continue
+                collected["events"] += 1
+                etype = event.get("type")
+                if etype == "system" and event.get("subtype") == "init":
+                    collected["session_id"] = event.get("session_id") or collected["session_id"]
+                elif etype == "result":
+                    collected["result"] = event.get("result")
+                    collected["is_error"] = bool(event.get("is_error"))
+                    collected["cost_usd"] = event.get("total_cost_usd")
+                    collected["num_turns"] = event.get("num_turns")
+                    collected["session_id"] = event.get("session_id") or collected["session_id"]
+                    self._check_rate_limit(event)
+                if on_event is not None:
+                    try:
+                        res = on_event(event)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception as e:
+                        print(f"  [agent on_event handler error: {e}]")
+
+        try:
+            await asyncio.wait_for(_pump(), timeout=timeout)
+            await asyncio.wait_for(proc.wait(), timeout=30)
+            collected["completed"] = True
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            collected["result"] = collected["result"] or (
+                f"(stopped: exceeded the {timeout:.0f}s limit)")
+        except asyncio.CancelledError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            raise
+        finally:
+            if proc.stderr is not None:
+                with contextlib.suppress(Exception):
+                    err = await asyncio.wait_for(proc.stderr.read(), timeout=10)
+                    collected["stderr"] = err.decode("utf-8", errors="replace").strip()[:4000]
+
+        duration = time.perf_counter() - started
+        rc = proc.returncode
+
+        if rc not in (0, None) and resume_session_id and any(
+            m in collected["stderr"].lower() for m in _SESSION_GONE_MARKERS
+        ):
+            raise SessionResumeError(
+                f"session {resume_session_id} is no longer resumable",
+                session_id=resume_session_id)
+
+        _log_request(
+            method="run_agent_task", model=model_alias, prompt=prompt,
+            raw_json="", raw_stderr=collected["stderr"], exit_code=rc,
+            duration_ms=duration * 1000, response=collected["result"],
+            cost_usd=collected["cost_usd"],
+        )
+        collected["duration_s"] = duration
+        collected["returncode"] = rc
+        return collected
 
     async def summarize_session_for_handoff(
         self,
@@ -1057,6 +1216,7 @@ class ClaudeCodeClient:
         requester_user_id=None,
         requester_guild_id=None,
         image_request_id=None,
+        requester_channel_id=None,
         resume_session_id=None,
         persist_session: bool = False,
         meta: Optional[dict] = None,
@@ -1116,7 +1276,7 @@ class ClaudeCodeClient:
             start_time = time.perf_counter()
 
             env = self._build_env(model, requester_user_id, requester_guild_id,
-                                  image_request_id)
+                                  image_request_id, requester_channel_id)
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,

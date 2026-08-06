@@ -12,6 +12,9 @@ import random
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+import os as _ga_os, sys as _ga_sys
+_ga_sys.path.insert(0, _ga_os.path.join(_ga_os.path.dirname(_ga_os.path.abspath(__file__)), '..'))
+from _guild_access import require_integration
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -98,6 +101,9 @@ def schedule_next(cron, next_dt, delay_hours):
 
 
 def main():
+    # Per-guild tool gating (tools/_guild_access.py). The guild id comes
+    # from the trusted env var the bot injects, never from arguments.
+    require_integration('discord')
     delete_stale_tasks()
     send_message()
     cron, next_dt, delay_hours = compute_next_cron()

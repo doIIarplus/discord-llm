@@ -47,6 +47,9 @@ from _common import output, error
 from sandbox import safe_path, SandboxViolation
 import config
 from ollama_client import OllamaClient
+import os as _ga_os, sys as _ga_sys
+_ga_sys.path.insert(0, _ga_os.path.join(_ga_os.path.dirname(_ga_os.path.abspath(__file__)), '..'))
+from _guild_access import require_integration
 
 # Fixed rubric mirroring hiring-agent's evaluation categories.
 RUBRIC = [
@@ -270,6 +273,9 @@ async def _run(prompt: str) -> str:
 
 
 def main():
+    # Per-guild tool gating (tools/_guild_access.py). The guild id comes
+    # from the trusted env var the bot injects, never from arguments.
+    require_integration('resume')
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,

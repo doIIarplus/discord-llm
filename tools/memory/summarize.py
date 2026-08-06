@@ -688,11 +688,33 @@ def main():
                       help="Discord guild (server) ID to summarize")
     mode.add_argument("--dm-user-id",
                       help="Discord user ID — summarize that user's DM channel into a per-user DM profile")
+    mode.add_argument("--all-guilds", action="store_true",
+                      help="Summarize every guild present in the DB, each in isolation")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be processed without calling Claude")
     parser.add_argument("--force", action="store_true",
                         help="Skip idle-time check (still requires new messages)")
     args = parser.parse_args()
+
+    if args.all_guilds:
+        # Process each guild in isolation. A failure or empty result in one
+        # guild never affects another, and no query ever spans guilds.
+        from chat_history import get_all_guild_ids
+        guild_ids = get_all_guild_ids()
+        results = []
+        for gid in guild_ids:
+            if not args.force:
+                check = _should_run(gid)
+                if not check["should_run"]:
+                    results.append({"guild_id": gid, "status": "skipped", "reason": check["reason"]})
+                    continue
+            try:
+                asyncio.run(_run_summarization(gid, dry_run=args.dry_run))
+                results.append({"guild_id": gid, "status": "processed"})
+            except Exception as e:
+                results.append({"guild_id": gid, "status": "error", "error": str(e)})
+        output({"status": "all_guilds", "guilds_seen": len(guild_ids), "results": results})
+        return
 
     if args.dm_user_id:
         if not args.force:

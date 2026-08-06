@@ -624,6 +624,22 @@ def get_messages_since(
     return [dict(r) for r in cursor.fetchall()]
 
 
+def get_all_guild_ids(include_dms: bool = False) -> List[str]:
+    """Return every distinct real guild_id present in the messages table.
+
+    Used by the multi-server memory summarizer to process each guild
+    independently. DMs (DM_GUILD_SENTINEL) are excluded unless include_dms.
+    """
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT guild_id FROM messages ORDER BY guild_id"
+    ).fetchall()
+    guilds = [r["guild_id"] for r in rows]
+    if not include_dms:
+        guilds = [g for g in guilds if g and g != DM_GUILD_SENTINEL]
+    return guilds
+
+
 def get_latest_message_time(guild_id: str) -> Optional[str]:
     """Get the created_at timestamp of the most recent message in the guild."""
     conn = _get_conn()

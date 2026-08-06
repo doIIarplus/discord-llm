@@ -24,3 +24,10 @@ tools/discord/.request_context
 
 # Image service auth token (regenerated per bot start)
 tools/images/.image_service
+
+# Clones made by tools/github/* — working copies, not part of this repo
+github_workspace/
+
+# Agent task worktrees live inside the target repo, not here — but ignore
+# them anyway in case a repo is ever nested under this one.
+.worktrees/

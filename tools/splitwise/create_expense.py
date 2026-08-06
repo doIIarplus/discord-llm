@@ -33,6 +33,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _client import SplitwiseClient
 from _common import output, error
 from _auth import require_owner
+import os as _ga_os, sys as _ga_sys
+_ga_sys.path.insert(0, _ga_os.path.join(_ga_os.path.dirname(_ga_os.path.abspath(__file__)), '..'))
+from _guild_access import require_integration
 
 
 def _check_duplicate(client, description, amount):
@@ -135,6 +138,9 @@ def _build_custom_split(amount, payer_id, friend_ids, shares_list, group_id):
 
 
 def main():
+    # Per-guild tool gating (tools/_guild_access.py). The guild id comes
+    # from the trusted env var the bot injects, never from arguments.
+    require_integration('splitwise')
     require_owner()
     parser = argparse.ArgumentParser(
         description=__doc__,

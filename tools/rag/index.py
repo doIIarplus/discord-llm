@@ -8,9 +8,15 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from _common import output, error
+import os as _ga_os, sys as _ga_sys
+_ga_sys.path.insert(0, _ga_os.path.join(_ga_os.path.dirname(_ga_os.path.abspath(__file__)), '..'))
+from _guild_access import require_integration
 
 
 def main():
+    # Per-guild tool gating (tools/_guild_access.py). The guild id comes
+    # from the trusted env var the bot injects, never from arguments.
+    require_integration('rag')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wiki-dump", default="maplestorywikinet.xml",
                         help="Path to MediaWiki XML dump")

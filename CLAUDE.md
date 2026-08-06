@@ -163,6 +163,77 @@ substitute for acting. Do the work with tools **first**, then reply describing
 what you actually did. If a task is genuinely too large for one turn, say so
 plainly and state what you'd need, rather than implying it is underway.
 
+### GitHub (`tools/github/`) — owner only
+
+Lets the bot work on arbitrary GitHub repos: clone, edit, commit, push.
+
+| Tool | Description |
+|---|---|
+| `clone.py --repo owner/repo [--ref B] [--reset]` | Clone/refresh into `github_workspace/<owner>/<repo>`, print the path |
+| `status.py --repo-path P [--diff]` | Show changed files, diffstat, optionally the diff |
+| `commit_push.py --repo-path P -m MSG [--add ...] [--dry-run]` | Stage, commit, push to the **default branch** |
+
+Workflow: `clone.py` → edit files at the printed path with normal tools →
+`commit_push.py`. The workspace persists between turns and is gitignored.
+
+- **Owner-only, enforced in code.** `_gh.require_owner()` checks the trusted
+  `DISCORD_REQUESTING_USER_ID` against `GITHUB_OWNER_DISCORD_ID` (default
+  `118567805678256128`) and fails closed. Same pattern as
+  `tools/splitwise/_auth.py`. Also passes through the per-guild allowlist as the
+  `github` integration, which is checked first.
+- **Pushes straight to the default branch** — no PR, no review, live on push.
+  `--dry-run` shows what would be committed without doing it.
+- **Never force-pushes.** If the remote moved on, the push is rejected and the
+  commit stays local rather than clobbering other commits.
+- **Auth is the machine's SSH key**, so reachable repos = whatever that key
+  grants. No token or `gh` CLI needed (`gh` is not installed).
+- **Input hardening**: `--repo` must be a plain `owner/repo` slug (URL forms are
+  normalized); `--repo-path` must resolve inside `github_workspace/`, so these
+  tools cannot commit to *this* repo or anywhere else on disk.
+- **Known gap**: the guild that has these tools also has unrestricted Bash, so a
+  non-owner could still ask the bot to run `git push` directly. The owner check
+  stops the sanctioned path, not every path. Closing it fully needs a PreToolUse
+  hook on Bash.
+
+### Per-guild tool allowlist
+
+Which `tools/` integrations Claude may use is configured **per guild**, in `.env`:
+
+```
+GUILD_TOOLS_363154169294618625=*                    # everything
+GUILD_TOOLS_1528742025711714425=web_search,images   # only these
+GUILD_TOOLS_999999999999999999=                     # explicitly nothing
+```
+
+Valid names are the `tools/` directory names: `discord`, `flux`, `images`,
+`memory`, `rag`, `resume`, `scheduler`, `splitwise`, `web_search`. Unknown names
+are dropped with a warning; malformed `GUILD_TOOLS_<x>` keys are ignored.
+
+**The default is deny-all.** A guild with no `GUILD_TOOLS_` entry gets no tools,
+so a newly added server is safe until you opt it in. Note this cuts both ways —
+if you don't give your home guild `=*`, tools (including image generation) stop
+working there.
+
+Enforcement is layered, and the tiers are *not* equally strong:
+
+| Allowlist | Behavior | Strength |
+|---|---|---|
+| empty / unset | CLI runs with no Bash at all (`generate_with_search`) | **hard** — no execution mechanism exists |
+| partial | Bash available; each tool checks the guild and rejects | **soft** — stops the model relaying a bad request, but Bash is not a sandbox |
+| `*` | unrestricted | none |
+
+- **[tools/_guild_access.py](tools/_guild_access.py)** — `require_integration("<name>")`
+  at the top of each tool's `main()`. Reads the guild from the trusted
+  `DISCORD_REQUESTING_GUILD_ID` env var (with the same `.request_context`
+  fallback the Discord permission layer uses), never from model-supplied args.
+- **Fails closed**: no verifiable guild → denied.
+- **Scheduler exemption**: `run_due.py` sets `DISCORD_SYSTEM_CONTEXT=1`, so
+  cron-launched tasks (reminders calling `send_message.py`) are not guild-scoped
+  and keep working. `summarize.py` and `run_due.py` are ungated for the same
+  reason.
+- The system prompt states what's allowed in the current guild, so the model
+  doesn't attempt denied tools — but that is guidance, not the boundary.
+
 ### Access control
 
 Access control is **enforced in code**, not just by prompt. The bot injects the *triggering* Discord user's identity into every tool subprocess as the `DISCORD_REQUESTING_USER_ID` / `DISCORD_REQUESTING_GUILD_ID` env vars (for the persistent PTY session, whose env is fixed at startup, it is written to `tools/discord/.request_context` instead). Tools read this trusted identity — not the `--user-id` the model passes — so a user cannot act beyond their own permissions even if the model is convinced to try.

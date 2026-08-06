@@ -29,6 +29,9 @@ from config import (
     DM_GUILD_SENTINEL,
     FILE_INPUT_FOLDER,
     GUILD_ID,
+    GUILD_ALLOWLIST,
+    TOOL_INTEGRATIONS,
+    tools_allowed_for,
     IMAGE_RECOGNITION_MODEL,
     CHAT_MODEL,
     CLAUDE_RESUME_SESSIONS,
@@ -45,6 +48,7 @@ from image_generation import (
     choose_source_dimensions,
     clean_edit_instruction,
 )
+from agent_jobs import JobManager
 from image_service import ImageService
 from ollama_client import OllamaClient
 from claude_client import ClaudeClient
@@ -168,9 +172,12 @@ class OllamaBot(discord.Client):
             self.claude_code_client = ClaudeCodeClient()
             print("[bot] Using Claude Code CLI client (one-shot)")
         self.image_gen = ImageGenerator()
-        # Loopback HTTP shim over image_gen, so Claude's tools/images/* CLIs
-        # reuse the resident Flux model. Started in setup_hook.
-        self.image_service = ImageService(self.image_gen)
+        # Background coding jobs. Chat turns stay fast; real work runs detached
+        # in a git worktree and streams progress into the channel.
+        self.job_manager = JobManager(self, self.claude_code_client)
+        # Loopback HTTP shim so Claude's tools/ CLIs can reach back into the bot
+        # process — the resident Flux model, and now the job manager too.
+        self.image_service = ImageService(self.image_gen, job_manager=self.job_manager)
         self._last_search_sources: List[dict] = []
         # One lock per (guild, channel) so two messages in the same channel
         # can't resume the same Claude session concurrently. Different channels
@@ -292,6 +299,52 @@ class OllamaBot(discord.Client):
             "- tools/images/generate.py — draw an image with the diffusion model (Flux2 Klein)\n"
             "- tools/images/edit.py — edit an existing image with the diffusion model\n"
             "- tools/images/attach.py — attach an image you made yourself with code\n"
+            "- tools/github/list_repos.py — list the owner's GitHub repos (OWNER ONLY)\n"
+            "- tools/github/clone.py — get a local working copy, reusing one if it exists (OWNER ONLY)\n"
+            "- tools/github/status.py — show what changed in a checkout (OWNER ONLY)\n"
+            "- tools/github/commit_push.py — commit and push to the default branch (OWNER ONLY)\n"
+            "- tools/agent/start_task.py — hand real coding work to a background agent (OWNER ONLY)\n"
+            "- tools/agent/status.py — check on that job (OWNER ONLY)\n"
+            "- tools/agent/cancel.py — stop it (OWNER ONLY)\n"
+            "- tools/agent/push.py — publish a finished job's branch (OWNER ONLY)\n"
+            "\n"
+            "CODING WORK: there are two modes and picking right matters.\n"
+            "ANSWERING a question about code ('how does X work', 'where is Y', 'is this "
+            "a bug') — just do it yourself in this turn with Read/Grep/Bash on the repo "
+            "and reply. Do not start a job for a question.\n"
+            "DOING work — add a feature, fix a bug, refactor, write tests — call "
+            "tools/agent/start_task.py with the repo and a FULL description of the task. "
+            "The agent gets only what you write in --task, not this conversation, so "
+            "include the actual requirements and any detail the user gave. It runs in an "
+            "isolated git worktree with subagents available, and posts its own live "
+            "progress to this channel.\n"
+            "start_task returns immediately and the work is NOT done. Say what you kicked "
+            "off in one short line and stop. Do not poll status.py in a loop, do not "
+            "narrate progress yourself (the job's own message does that), and never claim "
+            "it finished.\n"
+            "When it finishes it sits on a branch awaiting a decision. Only call "
+            "tools/agent/push.py when the user explicitly says to push/ship it. If they "
+            "ask for changes instead, start a new task describing the follow-up.\n"
+            "If the repo isn't cloned locally yet, tools/github/clone.py first.\n"
+            "\n"
+            "GITHUB WORKFLOW: list_repos.py when the user is vague about which repo "
+            "('my bot repo') — match the name, don't guess a slug. Then clone.py, which "
+            "REUSES an existing local checkout instead of making a second copy. Then edit "
+            "files at the path it returns with your normal tools. Then status.py --diff to "
+            "see exactly what you changed. Then commit_push.py.\n"
+            "READ clone.py's response. If `reused: true` you are in the user's REAL working "
+            "directory — if `uncommitted_changes` is non-zero that is THEIR work in "
+            "progress, so commit only your own files via --add with explicit paths, never "
+            "a blanket commit. If `reused: false` it's a scratch clone and you can be "
+            "freer. Never --reset or --force-reset a reused checkout unless the user "
+            "explicitly said to throw that work away.\n"
+            "commit_push.py publishes DIRECTLY to the default branch — no PR, no review, "
+            "live immediately. For anything beyond a trivial edit, run status.py --diff "
+            "first and tell the user what you're about to publish. Write real commit "
+            "messages: what changed and why, not 'update files'.\n"
+            "These tools are restricted IN CODE to discord_id=118567805678256128. For "
+            "anyone else they exit with a permission error — relay that plainly and do not "
+            "work around it with raw git in Bash on someone else's behalf.\n"
             "\n"
             "IMAGES: you decide when a message wants a picture — there's no keyword trigger. "
             "You also decide HOW to make it, and the two options are good at opposite things.\n"
@@ -640,6 +693,7 @@ class OllamaBot(discord.Client):
                     prompt, model, images,
                     requester_user_id=requester_uid,
                     requester_guild_id=server,
+                    requester_channel_id=channel,
                     image_request_id=image_request_id,
                     resume_session_id=sess["resume_id"],
                     persist_session=True,
@@ -656,6 +710,7 @@ class OllamaBot(discord.Client):
                     full_prompt, model, images,
                     requester_user_id=requester_uid,
                     requester_guild_id=server,
+                    requester_channel_id=channel,
                     image_request_id=image_request_id,
                     resume_session_id=None,
                     persist_session=True,
@@ -696,10 +751,15 @@ class OllamaBot(discord.Client):
         self.command_handlers.setup_commands()
         # Load all plugins before syncing commands
         await self.plugin_manager.load_all()
-        # Sync to specific guild for instant command visibility
-        guild = discord.Object(id=GUILD_ID)
-        self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
+        # Sync to every allowlisted guild for instant command visibility.
+        for gid in GUILD_ALLOWLIST:
+            try:
+                guild = discord.Object(id=gid)
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                logger.info(f"Synced commands to guild {gid}")
+            except Exception as e:
+                logger.warning(f"Failed to sync commands to guild {gid}: {e}")
         await js_renderer.start()
         # Localhost shim so Claude-invoked tools/images/* drive the resident
         # Flux pipeline instead of loading their own copy of a 9B model.
@@ -789,11 +849,11 @@ class OllamaBot(discord.Client):
         """Called when the bot is fully connected. Send post-restart notification if pending."""
         print(f"Logged in as {self.user}")
 
-        # Guild lock audit: leave any guild the bot is in that isn't the allowed one.
+        # Guild lock audit: leave any guild the bot is in that isn't allowlisted.
         # Covers the case where the bot was added to another guild before this
         # safeguard existed, or before on_guild_join had a chance to fire.
         for g in list(self.guilds):
-            if g.id != GUILD_ID:
+            if g.id not in GUILD_ALLOWLIST:
                 logger.warning(
                     f"Found in disallowed guild {g.id} ({g.name!r}) — leaving"
                 )
@@ -887,8 +947,8 @@ class OllamaBot(discord.Client):
         """Handle message edits — update chat_history.db with the new content."""
         if after.author.bot:
             return
-        # Guild lock: only the allowed guild is honored.
-        if after.guild is not None and after.guild.id != GUILD_ID:
+        # Guild lock: only allowlisted guilds are honored.
+        if after.guild is not None and after.guild.id not in GUILD_ALLOWLIST:
             return
         # Allow edits in DMs from allowlisted users; otherwise require a guild
         if after.guild is None and after.author.id not in DM_ALLOWLIST:
@@ -898,13 +958,13 @@ class OllamaBot(discord.Client):
         await chat_history.update_message_content(after.id, after.content or "")
 
     async def on_guild_join(self, guild: discord.Guild):
-        """Auto-leave any guild that isn't the allowed one.
+        """Auto-leave any guild that isn't allowlisted.
 
         Defense in depth: if someone adds the bot to another server (e.g. via
         an OAuth invite they shouldn't have), we exit immediately without ever
         responding to anything in that guild.
         """
-        if guild.id != GUILD_ID:
+        if guild.id not in GUILD_ALLOWLIST:
             logger.warning(
                 f"Joined disallowed guild {guild.id} ({guild.name!r}) — leaving"
             )
@@ -919,9 +979,9 @@ class OllamaBot(discord.Client):
         if message.author.bot:
             return
 
-        # Guild lock: only the allowed guild is honored. DMs (no guild) skip
+        # Guild lock: only allowlisted guilds are honored. DMs (no guild) skip
         # this check — they're gated separately by DM_ALLOWLIST below.
-        if message.guild is not None and message.guild.id != GUILD_ID:
+        if message.guild is not None and message.guild.id not in GUILD_ALLOWLIST:
             return
 
         # DM handling: only allowlisted users may DM the bot.
@@ -1593,10 +1653,17 @@ class OllamaBot(discord.Client):
         # entirely in that case.
         #
         # The heuristic below remains the fallback for the local Ollama backend,
-        # which has no tool-calling path, and for rate-limited fallback.
+        # for rate-limited fallback, and for guilds with no tool access — where
+        # Claude has no image tools, so the in-process pipeline is the only way
+        # images can be produced at all. That pipeline runs inside the bot and
+        # needs no Bash, so it stays available even in locked-down guilds.
+        guild_tools = tools_allowed_for(server)
+        tools_enabled = bool(guild_tools)
+
         _routing_model = self.pick_model(server, channel)
         claude_owns_images = (
             is_claude_code_model(_routing_model)
+            and tools_enabled
             and not self.claude_code_client.is_rate_limited
         )
         if claude_owns_images:
@@ -1859,10 +1926,16 @@ class OllamaBot(discord.Client):
         # Build prompt — PTY sessions keep their own history, so only send
         # the new message + fresh context. One-shot CLI needs the full history.
         is_pty = isinstance(self.claude_code_client, ClaudeCodeClientPTY)
+        # guild_tools / tools_enabled were resolved at the top of this method,
+        # since image routing depends on them too. An empty allowlist means this
+        # guild gets no Bash at all (search-only path) — the one hard boundary
+        # here. A partial allowlist keeps Bash, with each tool enforcing the
+        # guild itself.
+
         # Resumable per-channel sessions. The full prompt is still built below:
         # it's local work (no API calls) and it's exactly what seeds a fresh
         # session. A resumed session replaces it with a delta prompt instead.
-        resume_ok = self.resume_enabled_for(using_claude_code, is_pty)
+        resume_ok = self.resume_enabled_for(using_claude_code, is_pty) and tools_enabled
 
         if is_pty and using_claude_code:
             # PTY mode: send only the latest user message with metadata
@@ -1940,6 +2013,27 @@ class OllamaBot(discord.Client):
                 prompt = f"{prompt}\n\n{memory_context}"
 
             prompt += f"\n\n[Current context: guild_id={server}, channel_id={channel}]"
+
+            # Tell the model what it may actually use here. This is guidance so
+            # it doesn't attempt denied tools and report a confusing failure —
+            # the real enforcement is in the tools (tools/_guild_access.py) and,
+            # for empty allowlists, in not passing Bash at all.
+            if not tools_enabled:
+                prompt += (
+                    "\n\n[Tool access is DISABLED in this server. You cannot run Bash "
+                    "or any tools/ CLI — including image generation. Do not claim to "
+                    "perform tool actions; just chat. Web search is available.]"
+                )
+            elif guild_tools != TOOL_INTEGRATIONS:
+                prompt += (
+                    f"\n\n[Tool access in this server is limited to: "
+                    f"{', '.join(sorted(guild_tools))}. Every other tools/ integration "
+                    "is blocked and will reject you with a permission error — do not "
+                    "attempt them, and do not try to work around the restriction (e.g. "
+                    "by scripting the same action in Bash). If a user asks for "
+                    "something only a blocked tool can do, say plainly that it isn't "
+                    "enabled in this server.]"
+                )
 
             # The Claude Code CLI has no vision input (allowedTools is
             # Bash,WebSearch,WebFetch), so attachments never reach it as images.
@@ -2021,12 +2115,20 @@ class OllamaBot(discord.Client):
                                 image_request_id=image_request_id,
                                 trigger_message_id=messages[-1].get("message_id"),
                             )
-                        else:
+                        elif tools_enabled:
                             raw_response, _ = await self.claude_code_client.generate_with_tools(
                                 prompt, model, images,
                                 requester_user_id=requester_uid,
                                 requester_guild_id=server,
+                                requester_channel_id=channel,
                                 image_request_id=image_request_id,
+                            )
+                        else:
+                            # No tools allowlisted for this guild: run without
+                            # Bash entirely. This is the hard boundary — the
+                            # model has no mechanism to execute anything.
+                            raw_response, _ = await self.claude_code_client.generate_with_search(
+                                prompt, model, images,
                             )
                     except BaseException:
                         # Don't leave orphaned images queued under this id —
@@ -2103,6 +2205,12 @@ class OllamaBot(discord.Client):
         if hasattr(self.claude_code_client, 'shutdown'):
             await self.claude_code_client.shutdown()
         await js_renderer.stop()
+        # Kill any in-flight coding jobs before the loop goes away, so their
+        # worktrees get cleaned up rather than orphaned.
+        try:
+            await self.job_manager.shutdown()
+        except Exception as e:
+            logger.warning(f"agent job shutdown failed: {e}")
         await self.image_service.stop()
         await super().close()
 
