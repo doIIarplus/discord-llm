@@ -24,12 +24,21 @@ class DiscordClient:
         if not self.token:
             error("DISCORD_BOT_TOKEN not set in environment")
 
-    def _headers(self):
-        return {
+    def _headers(self, json_body=True):
+        """Headers for a Discord API request.
+
+        Pass json_body=False for requests that send no body — Discord rejects a
+        bodyless request that still declares Content-Type: application/json on
+        some endpoints (400, code 50109 "The request body contains invalid JSON").
+        """
+        headers = {
             "Authorization": f"Bot {self.token}",
             "Content-Type": "application/json",
             "User-Agent": "DiscordBot (https://discord.com, 1.0)",
         }
+        if not json_body:
+            del headers["Content-Type"]
+        return headers
 
     def get(self, endpoint, params=None):
         """GET request to Discord API. Returns parsed JSON."""
@@ -74,8 +83,10 @@ class DiscordClient:
     def put(self, endpoint, data=None):
         """PUT to Discord API. Returns parsed JSON or None for 204."""
         url = f"{BASE_URL}{endpoint}"
-        body = json.dumps(data or {}).encode("utf-8") if data else b""
-        req = urllib.request.Request(url, headers=self._headers(), data=body, method="PUT")
+        body = json.dumps(data).encode("utf-8") if data else b""
+        req = urllib.request.Request(
+            url, headers=self._headers(json_body=bool(data)), data=body, method="PUT"
+        )
         return self._do(req, endpoint)
 
     def patch(self, endpoint, data=None):
@@ -88,7 +99,9 @@ class DiscordClient:
     def delete(self, endpoint):
         """DELETE request to Discord API."""
         url = f"{BASE_URL}{endpoint}"
-        req = urllib.request.Request(url, headers=self._headers(), method="DELETE")
+        req = urllib.request.Request(
+            url, headers=self._headers(json_body=False), method="DELETE"
+        )
         return self._do(req, endpoint)
 
     def _do(self, req, endpoint):
