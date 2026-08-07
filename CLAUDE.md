@@ -363,6 +363,7 @@ Requires `DISCORD_BOT_TOKEN` in env. Webhook tools also need `DISCORD_WEBHOOK_<N
 | `remove_role.py --guild-id ID --user-id ID --role-id ID` | Remove a role from a user |
 | `list_roles.py --guild-id ID` | List all server roles with IDs |
 | `list_emojis.py --guild-id ID` | List server custom emojis (name, id, animated, mention form) |
+| `create_emoji.py --guild-id ID --name NAME (--url URL \| --file PATH) [--roles ID ...]` | Upload a custom emoji. Requires Manage Expressions. png/jpeg/gif, ≤256KB; webp is converted to png |
 | `delete_emoji.py --guild-id ID (--emoji-id ID \| --name NAME)` | Delete one custom emoji (irreversible). `--emoji-id` accepts `<:name:id>` |
 | `set_nickname.py --guild-id ID --user-id ID --nickname TEXT [--clear]` | Set or clear a member's nickname |
 | `timeout_user.py --guild-id ID --user-id ID --duration DURATION [--remove]` | Timeout a member (e.g. 10m, 1h, 7d). Max 28d |
