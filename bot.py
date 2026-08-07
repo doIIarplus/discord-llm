@@ -287,6 +287,7 @@ class OllamaBot(discord.Client):
             "- tools/discord/add_role.py / remove_role.py — manage user roles\n"
             "- tools/discord/list_roles.py — list server roles\n"
             "- tools/discord/list_emojis.py — list server custom emojis\n"
+            "- tools/discord/emoji_stats.py — emoji usage counts (--source message|reaction|all, --unused, --backfill)\n"
             "- tools/discord/create_emoji.py — upload a custom emoji to the server\n"
             "- tools/discord/delete_emoji.py — delete a custom emoji (destructive)\n"
             "- tools/discord/set_nickname.py — set or clear a member's nickname\n"
@@ -959,6 +960,39 @@ class OllamaBot(discord.Client):
         if before.content == after.content:
             return  # Embed-only update (link preview etc.), not a real edit
         await chat_history.update_message_content(after.id, after.content or "")
+
+    async def _record_reaction_event(self, payload, delta: int):
+        """Shared body of the raw reaction add/remove handlers.
+
+        Raw events are used so reactions on messages that aren't in the cache
+        (anything older than this process) still count. Unicode emoji have no
+        id and aren't tracked — the counters are about the server's own custom
+        emoji set.
+        """
+        if payload.guild_id is None:
+            return  # DM reaction — no guild-scoped emoji set
+        if payload.guild_id not in GUILD_ALLOWLIST:
+            return
+        if payload.emoji is None or payload.emoji.id is None:
+            return  # Unicode emoji
+        try:
+            await chat_history.record_reaction(
+                str(payload.guild_id),
+                str(payload.emoji.id),
+                payload.emoji.name,
+                int(bool(payload.emoji.animated)),
+                delta=delta,
+            )
+        except Exception as e:
+            logger.error(f"Failed to record reaction {payload.emoji.id}: {e}")
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        """Count a custom-emoji reaction being added."""
+        await self._record_reaction_event(payload, delta=1)
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        """Decrement when that reaction is taken back."""
+        await self._record_reaction_event(payload, delta=-1)
 
     async def on_guild_join(self, guild: discord.Guild):
         """Auto-leave any guild that isn't allowlisted.

@@ -167,6 +167,7 @@ class TestCLI:
             "- tools/discord/add_role.py / remove_role.py — manage user roles\n"
             "- tools/discord/list_roles.py — list server roles\n"
             "- tools/discord/list_emojis.py — list server custom emojis\n"
+            "- tools/discord/emoji_stats.py — emoji usage counts (--source message|reaction|all, --unused, --backfill)\n"
             "- tools/discord/create_emoji.py — upload a custom emoji to the server\n"
             "- tools/discord/delete_emoji.py — delete a custom emoji (destructive)\n"
             "- tools/discord/set_nickname.py — set or clear a member's nickname\n"

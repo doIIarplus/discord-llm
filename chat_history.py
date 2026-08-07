@@ -8,6 +8,7 @@ import aiohttp
 import asyncio
 import base64
 import json
+import re
 import sqlite3
 import os
 from datetime import datetime, timezone
@@ -45,6 +46,9 @@ def get_user_aliases() -> dict:
         return {}
 
 DB_PATH = os.path.join(PROJECT_DIR, "chat_history.db")
+
+# Custom Discord emoji in message text: <:name:id> or <a:name:id> when animated.
+CUSTOM_EMOJI_RE = re.compile(r'<(a?):(\w+):(\d+)>')
 
 # Module-level connection (lazy-initialized, one per process)
 _conn: Optional[sqlite3.Connection] = None
@@ -160,6 +164,26 @@ def _init_schema(conn: sqlite3.Connection):
             updated_at TEXT NOT NULL,
             UNIQUE(guild_id, channel_id)
         );
+
+        -- Rolling counters for custom emoji use, so "what emoji do we actually
+        -- use?" is a table lookup instead of a full scan of messages. One row
+        -- per (guild, emoji, source); 'message' rows can be rebuilt from the
+        -- messages table by emoji_stats.py --backfill, but 'reaction' rows
+        -- cannot — Discord keeps no history we can replay, so those counts
+        -- only exist from the moment the raw reaction handlers shipped.
+        CREATE TABLE IF NOT EXISTS emoji_usage (
+            guild_id TEXT NOT NULL,
+            emoji_id TEXT NOT NULL,
+            emoji_name TEXT,
+            animated INTEGER DEFAULT 0,
+            source TEXT NOT NULL,          -- 'message' or 'reaction'
+            count INTEGER NOT NULL DEFAULT 0,
+            last_used_at TEXT,
+            PRIMARY KEY (guild_id, emoji_id, source)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_emoji_usage_guild
+            ON emoji_usage(guild_id, count DESC);
     """)
     conn.commit()
 
@@ -298,6 +322,13 @@ async def record_message(message) -> None:
         created_at=message.created_at.isoformat(),
     )
 
+    # Count custom emoji in the body (guild messages only — DMs have no
+    # guild-scoped emoji set to report on).
+    if message.guild:
+        await record_emoji_usage_from_text(
+            guild_id_str, content, used_at=message.created_at.isoformat()
+        )
+
     # Cache the channel name from Discord (DMChannel has no .name)
     channel_name = getattr(message.channel, "name", None)
     if channel_name:
@@ -327,6 +358,7 @@ async def record_bot_response(
     reply_to_message_id: Optional[int] = None,
 ) -> None:
     """Record the bot's own response to the chat history."""
+    now = datetime.now(timezone.utc).isoformat()
     await asyncio.to_thread(
         _record_message_sync,
         message_id=str(message_id),
@@ -338,8 +370,145 @@ async def record_bot_response(
         reply_to_message_id=str(reply_to_message_id) if reply_to_message_id else None,
         has_attachments=False,
         attachment_info=None,
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=now,
     )
+
+    # The bot's own emoji use counts too. guild_id is the DM sentinel for DMs,
+    # which record_emoji_usage_from_text skips.
+    if guild_id:
+        await record_emoji_usage_from_text(str(guild_id), content, used_at=now)
+
+
+# ---------------------------------------------------------------------------
+# Emoji / reaction usage counters
+# ---------------------------------------------------------------------------
+
+def _bump_emoji_sync(
+    guild_id: str,
+    emoji_id: str,
+    emoji_name: Optional[str],
+    animated: int,
+    source: str,
+    delta: int = 1,
+    used_at: Optional[str] = None,
+):
+    """Add `delta` to one emoji's counter (synchronous).
+
+    Clamped at 0 so a reaction removal for a reaction we never saw added
+    (e.g. one placed before this feature shipped) can't drive the count
+    negative. last_used_at only moves forward on increments.
+    """
+    if not guild_id or not emoji_id:
+        return
+    conn = _get_conn()
+    stamp = (used_at or datetime.now(timezone.utc).isoformat()) if delta > 0 else None
+    try:
+        conn.execute(
+            """INSERT INTO emoji_usage
+                   (guild_id, emoji_id, emoji_name, animated, source, count, last_used_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(guild_id, emoji_id, source) DO UPDATE SET
+                   count = MAX(0, emoji_usage.count + excluded.count),
+                   emoji_name = excluded.emoji_name,
+                   animated = excluded.animated,
+                   last_used_at = COALESCE(excluded.last_used_at, emoji_usage.last_used_at)""",
+            (str(guild_id), str(emoji_id), emoji_name, int(animated or 0),
+             source, int(delta), stamp),
+        )
+        # The INSERT path isn't covered by the MAX() above (there is no prior
+        # row to clamp against), so a decrement that creates a row lands at -1.
+        conn.execute(
+            """UPDATE emoji_usage SET count = 0
+               WHERE guild_id = ? AND emoji_id = ? AND source = ? AND count < 0""",
+            (str(guild_id), str(emoji_id), source),
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"[chat_history] Error bumping emoji {emoji_id} ({source}): {e}")
+
+
+def _bump_emoji_batch_sync(guild_id: str, matches: List[tuple], used_at: Optional[str]):
+    """Bump a batch of (animated_flag, name, id) regex matches as 'message' use."""
+    for animated_flag, name, emoji_id in matches:
+        _bump_emoji_sync(
+            guild_id=guild_id,
+            emoji_id=emoji_id,
+            emoji_name=name,
+            animated=1 if animated_flag == "a" else 0,
+            source="message",
+            delta=1,
+            used_at=used_at,
+        )
+
+
+async def record_emoji_usage_from_text(
+    guild_id: str,
+    content: str,
+    used_at: str = None,
+) -> None:
+    """Count every custom emoji occurrence in a message body.
+
+    Duplicates within one message each count — spamming the same emoji three
+    times in a line is three uses.
+    """
+    if not guild_id or guild_id == DM_GUILD_SENTINEL or not content:
+        return
+    matches = CUSTOM_EMOJI_RE.findall(content)
+    if not matches:
+        return
+    await asyncio.to_thread(_bump_emoji_batch_sync, str(guild_id), matches, used_at)
+
+
+async def record_reaction(
+    guild_id: str,
+    emoji_id: str,
+    emoji_name: Optional[str],
+    animated: int,
+    delta: int = 1,
+) -> None:
+    """Count a custom-emoji reaction. delta=-1 when the reaction is removed."""
+    if not guild_id or guild_id == DM_GUILD_SENTINEL or not emoji_id:
+        return
+    await asyncio.to_thread(
+        _bump_emoji_sync,
+        guild_id=str(guild_id),
+        emoji_id=str(emoji_id),
+        emoji_name=emoji_name,
+        animated=animated,
+        source="reaction",
+        delta=delta,
+    )
+
+
+def get_emoji_usage(guild_id: str, source: str = None) -> List[dict]:
+    """Emoji usage rows for a guild, most-used first.
+
+    With `source` set ('message' or 'reaction') the rows are that source only;
+    otherwise counts are summed across sources, one row per emoji.
+    """
+    conn = _get_conn()
+    if source:
+        rows = conn.execute(
+            """SELECT emoji_id, emoji_name, animated, count, last_used_at
+               FROM emoji_usage
+               WHERE guild_id = ? AND source = ?
+               ORDER BY count DESC, emoji_name ASC""",
+            (str(guild_id), source),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT emoji_id,
+                      MAX(emoji_name) AS emoji_name,
+                      MAX(animated) AS animated,
+                      SUM(count) AS count,
+                      MAX(last_used_at) AS last_used_at
+               FROM emoji_usage
+               WHERE guild_id = ?
+               GROUP BY emoji_id
+               ORDER BY count DESC, emoji_name ASC""",
+            (str(guild_id),),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def _update_message_content_sync(message_id: str, new_content: str):

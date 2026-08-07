@@ -69,6 +69,19 @@ asyncio.run(t())
 
 ### Memory System
 - **[chat_history.py](chat_history.py)** — Persistent chat history and memory. Records all Discord messages to `chat_history.db` (SQLite). Provides `get_memory_context()` which returns user profiles and recent server events for prompt injection.
+- **`emoji_usage` table** (in `chat_history.db`) — persistent counters for custom
+  emoji, keyed `(guild_id, emoji_id, source)` where source is `message` or
+  `reaction`. Message text is counted in `record_message()` and
+  `record_bot_response()` via `CUSTOM_EMOJI_RE` (duplicates within one message
+  each count); reactions are counted by `on_raw_reaction_add` /
+  `on_raw_reaction_remove` in [bot.py](bot.py), using the **raw** events so
+  reactions on uncached old messages still register. Counts are clamped at 0, so
+  a removal of a reaction we never saw added can't go negative. Unicode emoji
+  are not tracked (no id). Read it with
+  `tools/discord/emoji_stats.py`. **Message counts can be backfilled**
+  (`--backfill` rescans the `messages` table); **reaction counts only start from
+  when this shipped** — Discord exposes no reaction history to replay, so there
+  is no historical reaction data and early reaction numbers understate reality.
 - **[tools/memory/summarize.py](tools/memory/summarize.py)** — Scheduled summarizer. Reads new messages from `chat_history.db`, calls Claude (Sonnet) to analyze them, and writes user profiles and server events back to the DB. Self-gates: only runs when there are new messages AND the server has been idle for 60+ minutes.
 
 ### Supporting
@@ -365,6 +378,7 @@ Requires `DISCORD_BOT_TOKEN` in env. Webhook tools also need `DISCORD_WEBHOOK_<N
 | `list_emojis.py --guild-id ID` | List server custom emojis (name, id, animated, mention form) |
 | `create_emoji.py --guild-id ID --name NAME (--url URL \| --file PATH) [--roles ID ...]` | Upload a custom emoji. Requires Manage Expressions. png/jpeg/gif, ≤256KB; webp is converted to png |
 | `delete_emoji.py --guild-id ID (--emoji-id ID \| --name NAME)` | Delete one custom emoji (irreversible). `--emoji-id` accepts `<:name:id>` |
+| `emoji_stats.py --guild-id ID [--source message\|reaction\|all] [--unused] [--limit N] [--backfill]` | Emoji usage counts from the `emoji_usage` counter table (name, id, animated, count, last_used_at). `--unused` lists guild emojis with a zero count; `--backfill` recounts message usage from stored history (idempotent) |
 | `set_nickname.py --guild-id ID --user-id ID --nickname TEXT [--clear]` | Set or clear a member's nickname |
 | `timeout_user.py --guild-id ID --user-id ID --duration DURATION [--remove]` | Timeout a member (e.g. 10m, 1h, 7d). Max 28d |
 | `react.py --channel-id ID --message-id ID --emoji EMOJI` | Add reaction (Unicode or custom name:id) |
