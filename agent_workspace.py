@@ -1,14 +1,18 @@
-"""Isolated git worktrees for agent tasks.
+"""Sandboxed git workspace for agent tasks.
 
-Why worktrees rather than editing the checkout directly: the user's working copy
-usually has uncommitted work in it (their editor is open on it). An agent doing
-`git add -A` there would sweep that up, and two tasks at once would trample each
-other. A worktree is a real branch in a separate directory sharing the same
-object store — cheap to create, disposable, and completely inert with respect to
-the main checkout.
+Everything happens under ~/git_projects — the agent never touches the user's own
+checkouts in ~/projects. That was the earlier design and it had two problems: a
+worktree created inside a repo shows up as untracked `.worktrees/` in the user's
+`git status`, and any blanket `git add` risked sweeping up work in progress from
+their editor. A separate sandbox removes both hazards by construction.
 
-Repo resolution reuses tools/github/_gh.py (find_local_checkouts / normalize_repo)
-so "the repo the user already has" means the same thing everywhere.
+Layout:
+    ~/git_projects/<owner>/<repo>/                     working clone, kept fresh
+    ~/git_projects/.worktrees/<owner>__<repo>/<branch>/  one per task
+
+Repos are cloned on demand, so "work on X" just works without a setup step.
+Worktrees are used within the sandbox because they're cheap (shared object
+store) and let several tasks on one repo run without colliding.
 """
 
 import os
@@ -22,8 +26,11 @@ sys.path.insert(0, os.path.join(PROJECT_DIR, "tools"))
 sys.path.insert(0, os.path.join(PROJECT_DIR, "tools", "github"))
 
 BRANCH_PREFIX = os.environ.get("AGENT_BRANCH_PREFIX", "jaspt")
-WORKTREE_DIRNAME = ".worktrees"
-_GIT_TIMEOUT = 300
+# The sandbox. Deliberately outside the bot's project and outside ~/projects.
+WORKSPACE_ROOT = os.path.realpath(
+    os.environ.get("AGENT_WORKSPACE", os.path.expanduser("~/git_projects")))
+WORKTREE_ROOT = os.path.join(WORKSPACE_ROOT, ".worktrees")
+_GIT_TIMEOUT = 600
 
 
 class WorkspaceError(RuntimeError):
@@ -50,17 +57,44 @@ def slugify(text: str, max_len: int = 40) -> str:
     return text or "task"
 
 
-def resolve_repo(repo: str):
-    """Canonical slug + the local checkout to base a worktree on."""
-    from _gh import find_local_checkouts, normalize_repo_value
+def sandbox_path(slug: str) -> str:
+    """Where a repo lives in the sandbox, confined to WORKSPACE_ROOT."""
+    path = os.path.realpath(os.path.join(WORKSPACE_ROOT, *slug.split("/")))
+    if not path.startswith(WORKSPACE_ROOT + os.sep):
+        raise WorkspaceError(f"refusing to operate outside the sandbox: {path}")
+    return path
 
-    slug = normalize_repo_value(repo)
-    checkouts = find_local_checkouts(slug)
-    if not checkouts:
+
+def resolve_repo(repo: str, clone_if_missing: bool = True):
+    """Canonical slug + its sandbox clone, cloning on demand.
+
+    Never returns a path in ~/projects — the agent works only in the sandbox, so
+    the user's own checkouts and any work in progress there stay untouched.
+    """
+    from _gh import normalize_repo_value
+
+    try:
+        slug = normalize_repo_value(repo)
+    except ValueError as e:
+        raise WorkspaceError(str(e))
+
+    path = sandbox_path(slug)
+    if os.path.isdir(os.path.join(path, ".git")):
+        # Keep it current, but never destroy anything: fetch only.
+        _git(["fetch", "origin", "--prune"], cwd=path, check=False)
+        return slug, path
+
+    if not clone_if_missing:
+        raise WorkspaceError(f"{slug} is not cloned in the sandbox yet")
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        _git(["clone", f"git@github.com:{slug}.git", path])
+    except WorkspaceError as e:
         raise WorkspaceError(
-            f"no local checkout of {slug} found. Clone it first with "
-            "tools/github/clone.py, then start the task.")
-    return slug, checkouts[0]
+            f"could not clone {slug} into the sandbox — check the repo exists "
+            f"and the machine's SSH key can read it. ({e})")
+    return slug, path
 
 
 def default_branch(checkout: str) -> str:
@@ -89,7 +123,8 @@ def create(repo: str, task: str, job_id: str) -> dict:
     _git(["fetch", "origin", "--prune"], cwd=checkout, check=False)
 
     branch = f"{BRANCH_PREFIX}/{slugify(task)}-{job_id[:6]}"
-    path = os.path.join(checkout, WORKTREE_DIRNAME, branch.replace("/", "_"))
+    path = os.path.join(WORKTREE_ROOT, slug.replace("/", "__"),
+                        branch.replace("/", "_"))
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     # Base off origin/<default> when we have it, so the agent starts from the
@@ -142,10 +177,40 @@ def remove(checkout: str, worktree: str, branch: str, keep_branch: bool) -> None
         _git(["branch", "-D", branch], cwd=checkout, check=False)
 
 
-def push_branch(worktree: str, branch: str) -> str:
-    """Publish a task branch. Never force-pushes."""
-    _git(["push", "-u", "origin", f"{branch}:{branch}"], cwd=worktree)
-    return branch
+class PushDenied(WorkspaceError):
+    """Push rejected because the key can't write to that repo (needs a fork)."""
+
+
+_DENIED_MARKERS = ("permission denied", "403", "access rights",
+                   "repository not found", "denied to")
+
+
+def push_branch(worktree: str, branch: str) -> dict:
+    """Publish a task branch. Never force-pushes.
+
+    Distinguishes "you can't write here" from other failures, because the first
+    is a fork situation the user can act on and the second is a real error.
+    """
+    p = _git(["push", "-u", "origin", f"{branch}:{branch}"],
+             cwd=worktree, check=False)
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "").strip()
+        low = err.lower()
+        if any(m in low for m in _DENIED_MARKERS):
+            raise PushDenied(
+                "no write access to this repo, so the branch stays local. "
+                "The work is committed and safe — to publish it you'd need a "
+                "fork (set GITHUB_TOKEN to enable that) or push access.")
+        raise WorkspaceError(f"push failed: {err[:400]}")
+    sha = _git(["rev-parse", "HEAD"], cwd=worktree).stdout.strip()
+    return {"branch": branch, "sha": sha, "short_sha": sha[:8]}
+
+
+def delete_branch(checkout: str, branch: str, remote: bool = True) -> None:
+    """Remove a task branch locally and (optionally) on the remote."""
+    if remote:
+        _git(["push", "origin", "--delete", branch], cwd=checkout, check=False)
+    _git(["branch", "-D", branch], cwd=checkout, check=False)
 
 
 def prune_stale(checkout: str) -> None:

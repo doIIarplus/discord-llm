@@ -34,14 +34,15 @@ from _guild_access import require_integration  # noqa: E402
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORKSPACE = os.path.join(PROJECT_DIR, "github_workspace")
 
-# Where to look for checkouts that already exist, so we reuse them instead of
-# cloning a second copy of a repo the user already has locally. Colon-separated
-# override via GITHUB_LOCAL_ROOTS. These roots also define what counts as a
-# legal --repo-path: anything outside them is refused.
+# The sandbox the bot works in. Deliberately NOT ~/projects: the user's own
+# checkouts have work in progress in them, and an agent doing `git add -A` there
+# would sweep it up. Everything the bot clones or edits lives here instead.
+# These roots also define what counts as a legal --repo-path.
+AGENT_WORKSPACE = os.path.realpath(
+    os.environ.get("AGENT_WORKSPACE", os.path.expanduser("~/git_projects")))
 LOCAL_ROOTS = [
     os.path.realpath(p) for p in (
-        os.environ.get("GITHUB_LOCAL_ROOTS")
-        or f"{os.path.expanduser('~/projects')}:{WORKSPACE}"
+        os.environ.get("GITHUB_LOCAL_ROOTS") or f"{AGENT_WORKSPACE}:{WORKSPACE}"
     ).split(":") if p.strip()
 ]
 # How deep under each root to look for a .git directory.
@@ -176,6 +177,19 @@ def resolve_repo_path(raw: str) -> str:
     if not raw:
         error("--repo-path is required")
     path = os.path.realpath(raw)
+
+    # The bot's own source is reachable now that LOCAL_ROOTS includes ~/projects,
+    # but committing/pushing the code you are currently running from a chat
+    # message is its own kind of footgun — and there is already a dedicated
+    # self-modification flow (with a confirm-and-restart step) for that. Worktrees
+    # *under* it are fine: those are isolated copies.
+    if path == os.path.realpath(PROJECT_DIR):
+        error(
+            "refusing to operate on the bot's own project directory. Editing the "
+            "running bot's source goes through the self-modification flow, not "
+            "these tools. To work on this repo as a normal project, start an "
+            "agent task — it runs in an isolated worktree.")
+
     if not _under_a_root(path):
         error(
             f"refusing to operate on {raw!r}: GitHub tools only touch git "

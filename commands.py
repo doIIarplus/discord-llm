@@ -445,6 +445,95 @@ class CommandHandlers:
             logger.info(f"Get model command called by {interaction.user.name}#{interaction.user.discriminator}")
             await interaction.response.send_message(f"Current model: **{self.bot.active_model}**")
 
+        @self.bot.tree.command(name="emoji_stats", description="Custom emoji usage counts for this server")
+        @app_commands.describe(
+            source="message text, reactions, or both (default both)",
+            unused="only show emojis with zero uses",
+            limit="how many to show (default 25)",
+        )
+        @app_commands.choices(source=[
+            app_commands.Choice(name="all", value="all"),
+            app_commands.Choice(name="message", value="message"),
+            app_commands.Choice(name="reaction", value="reaction"),
+        ])
+        async def emoji_stats(interaction: discord.Interaction, source: str = "all", unused: bool = False, limit: int = 25):
+            """Emoji usage counts from the emoji_usage table (mirrors tools/discord/emoji_stats.py)."""
+            logger.info(
+                f"Emoji stats command called by {interaction.user.name} "
+                f"(source={source}, unused={unused}, limit={limit})"
+            )
+            await interaction.response.defer()
+
+            guild = interaction.guild
+            if guild is None:
+                await interaction.followup.send("server only — run this in a server channel.")
+                return
+
+            limit = max(1, min(100, limit))
+
+            try:
+                rows = await asyncio.to_thread(
+                    chat_history.get_emoji_usage,
+                    str(guild.id),
+                    None if source == "all" else source,
+                )
+
+                def mention(name, emoji_id, animated):
+                    return f"<{'a' if animated else ''}:{name}:{emoji_id}>"
+
+                if unused:
+                    counted = {r["emoji_id"] for r in rows if (r["count"] or 0) > 0}
+                    entries = sorted(
+                        (e for e in guild.emojis if str(e.id) not in counted),
+                        key=lambda e: (e.name or "").lower(),
+                    )
+                    header = (
+                        f"**Unused emojis** ({source}): {len(entries)} of "
+                        f"{len(guild.emojis)} server emojis have no recorded uses"
+                    )
+                    lines = [
+                        f"{mention(e.name, e.id, e.animated)} {e.name} — 0"
+                        for e in entries
+                    ]
+                else:
+                    total_uses = sum((r["count"] or 0) for r in rows)
+                    header = (
+                        f"**Emoji usage** ({source}): {len(rows)} emojis, "
+                        f"{total_uses} total uses"
+                    )
+                    lines = [
+                        f"{mention(r['emoji_name'], r['emoji_id'], bool(r['animated']))} "
+                        f"{r['emoji_name']} — {r['count'] or 0}"
+                        for r in rows
+                    ]
+
+                total_lines = len(lines)
+                if not lines:
+                    await interaction.followup.send(f"{header}\n(nothing to show)")
+                    return
+
+                shown = lines[:limit]
+                hidden = total_lines - len(shown)
+
+                # Trim from the end until the whole message fits Discord's 2000-char cap,
+                # keeping the "…and N more" footer accurate as lines are dropped.
+                def render(body_lines, more):
+                    parts = [header] + body_lines
+                    if more > 0:
+                        parts.append(f"…and {more} more")
+                    return "\n".join(parts)
+
+                message = render(shown, hidden)
+                while len(message) > 2000 and shown:
+                    shown.pop()
+                    hidden = total_lines - len(shown)
+                    message = render(shown, hidden)
+
+                await interaction.followup.send(message[:2000])
+            except Exception as e:
+                logger.error(f"Emoji stats failed: {e}", exc_info=True)
+                await interaction.followup.send(f"emoji_stats failed: {e}")
+
         @self.bot.tree.command(name="purge", description="Delete all messages in this channel")
         @app_commands.default_permissions(manage_messages=True)
         async def purge(interaction: discord.Interaction):

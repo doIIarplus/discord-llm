@@ -121,6 +121,7 @@ for the local Ollama backend and rate-limited fallback.
 | `/search_wiki` | Search indexed wiki content |
 | `/rag_stats` | Show RAG database stats |
 | `/search <query>` | Search the web via Tavily, summarize with LLM |
+| `/emoji_stats [source] [unused] [limit]` | Custom emoji usage counts for the server (source: all/message/reaction; `unused` lists zero-count emojis; limit 1–100, default 25) |
 | `/sync_commands` | Manually sync slash commands to Discord |
 
 ## Configuration (`.env`)
@@ -175,6 +176,48 @@ with intent ("lemme go pull that", "i'll re-render it", "gimme a sec") as a
 substitute for acting. Do the work with tools **first**, then reply describing
 what you actually did. If a task is genuinely too large for one turn, say so
 plainly and state what you'd need, rather than implying it is underway.
+
+### Agentic coding (`tools/agent/`) — owner only
+
+Conversational code work: "add logging to X", "fix the bug in Y". A chat turn
+starts a **background job**; a full Claude Code agent (with subagents via `Task`)
+does the work in an isolated worktree and streams progress into a Discord message
+that edits itself.
+
+| Tool | Description |
+|---|---|
+| `start_task.py --repo owner/repo --task "..."` | Kick off a job; returns a job_id immediately |
+| `status.py [--job-id ID]` | Check the channel's current/latest job |
+| `cancel.py [--job-id ID]` | Kill the agent and remove its worktree |
+| `push.py [--job-id ID]` | Retry a push that failed (jobs push themselves) |
+
+**Sandbox.** Everything happens under `~/git_projects` (`AGENT_WORKSPACE`), never
+in `~/projects`. Repos are cloned on demand into
+`~/git_projects/<owner>/<repo>`; each task gets a worktree under
+`~/git_projects/.worktrees/<owner>__<repo>/<branch>`. This is deliberate — an
+earlier design put worktrees inside the user's own checkout, which showed up as
+an untracked `.worktrees/` in their `git status` and risked a blanket `git add`
+sweeping up their work in progress.
+
+**Flow.** Agent works → harness commits to `jaspt/<slug>-<jobid>` → **pushes the
+branch automatically** → posts buttons. Auto-push is safe because it's always a
+task branch, never the default branch. If the key lacks write access the push is
+skipped (`PushDenied`), the work stays committed locally, and the message says so.
+
+**Buttons** ([agent_views.py](agent_views.py)): *Open PR* (a link to GitHub's
+prefilled compare page — no token needed; becomes a real API-backed button when
+`GITHUB_TOKEN` is set), *View diff*, *Delete branch*. Action buttons are
+restricted to whoever started the job, matching `RestartConfirmView` in
+commands.py.
+
+**Streaming** ([agent_events.py](agent_events.py)): `--output-format stream-json`
+is parsed into a `ProgressState` and rendered into one message, edited at most
+every 5s (`EDIT_INTERVAL`) so Discord's ratelimits aren't hit. The agent runs with
+`--allowedTools Bash,Read,Write,Edit,Glob,Grep,Task,WebSearch,WebFetch` and
+`--permission-mode acceptEdits`, with `cwd` set to the worktree so the *target
+repo's* CLAUDE.md loads rather than this one.
+
+One job per channel. `cancel` kills the subprocess and cleans up.
 
 ### GitHub (`tools/github/`) — owner only
 

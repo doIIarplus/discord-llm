@@ -16,6 +16,7 @@ Design notes:
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ logger = logging.getLogger("agent_jobs")
 EDIT_INTERVAL = 5.0          # seconds between Discord message edits
 MAX_JOB_TURNS = 0            # 0 = no cap; CLAUDE_CODE_TIMEOUT still applies
 
-_TERMINAL = {"done", "failed", "cancelled", "awaiting_push"}
+_TERMINAL = {"done", "failed", "cancelled", "awaiting_push", "pushed"}
 
 
 @dataclass
@@ -46,6 +47,7 @@ class AgentJob:
     branch: str = ""
     base_ref: str = ""
     session_id: Optional[str] = None
+    pushed: bool = False
     started_at: float = field(default_factory=time.time)
     ended_at: Optional[float] = None
     error: Optional[str] = None
@@ -211,7 +213,24 @@ class JobManager:
                 # Ran fine but changed nothing — a question, or a no-op.
                 job.status = "done"
             else:
-                job.status = "awaiting_push"
+                # Publish the branch automatically. This is safe: it's a task
+                # branch, never the default branch, so nothing the user depends
+                # on moves. It also means the result is a real GitHub link
+                # instead of something stuck on this machine.
+                try:
+                    pushed = await asyncio.to_thread(
+                        agent_workspace.push_branch, job.worktree, job.branch)
+                    job.summary["head_sha"] = pushed["sha"]
+                    job.pushed = True
+                    job.status = "pushed"
+                except agent_workspace.PushDenied as e:
+                    # No write access — the work is committed locally and safe.
+                    job.status = "awaiting_push"
+                    job.error = str(e)
+                except Exception as e:
+                    job.status = "awaiting_push"
+                    job.error = f"push failed: {e}"
+                    logger.warning("[agent] job %s push failed: %s", job.id, e)
 
         except asyncio.CancelledError:
             job.status = "cancelled"
@@ -222,26 +241,26 @@ class JobManager:
             logger.exception("[agent] job %s failed", job.id)
         finally:
             job.ended_at = time.time()
-            keep = False
-            try:
-                keep = bool(job.summary.get("commits"))
-            except Exception:
-                pass
-            # Keep the worktree only while it's awaiting a push decision.
+            keep_branch = bool((job.summary or {}).get("commits"))
+            # Once the branch is pushed the worktree has served its purpose;
+            # keep it only when the work is still local-only and might need a
+            # retry of the push.
             if job.status != "awaiting_push":
                 try:
                     await asyncio.to_thread(
                         agent_workspace.remove, job.checkout, job.worktree,
-                        job.branch, keep)
+                        job.branch, keep_branch)
                 except Exception as e:
                     logger.warning("[agent] worktree cleanup failed: %s", e)
+
             final_text = self._final_text(job)
+            view = self._result_view(job)
             try:
                 if message is not None:
-                    await message.edit(content=final_text)
+                    await message.edit(content=final_text, view=view)
                 elif channel is not None:
                     # Failed before the progress message existed — still report.
-                    await channel.send(final_text)
+                    await channel.send(final_text, view=view)
             except Exception as e:
                 logger.debug("[agent] final report failed: %s", e)
             logger.info("[agent] job %s -> %s in %.0fs", job.id, job.status, job.elapsed)
@@ -262,15 +281,39 @@ class JobManager:
             "why, plus anything you could not do."
         )
 
+    def _result_view(self, job: AgentJob):
+        """Buttons for a job that actually produced a pushed branch."""
+        if job.status != "pushed":
+            return None
+        try:
+            from agent_views import JobResultView
+            token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+            return JobResultView(job, requester_id=job.requester_id,
+                                 github_token=token)
+        except Exception as e:
+            logger.warning("[agent] could not build result view: %s", e)
+            return None
+
     def _final_text(self, job: AgentJob) -> str:
         body = job._progress.render(job.elapsed, job.status) if job._progress else ""
+        s = job.summary or {}
         extra = []
-        if job.status == "awaiting_push":
-            s = job.summary or {}
+
+        if job.status == "pushed":
             if s.get("diffstat"):
                 extra.append(f"```\n{s['diffstat'][:600]}\n```")
-            extra.append(f"on branch `{job.branch}` — say **push it** to publish, "
-                         f"or ignore it and the branch just sits there.")
+            sha = s.get("head_sha", "")
+            if sha:
+                extra.append(
+                    f"pushed to `{job.branch}` · "
+                    f"<https://github.com/{job.repo}/commit/{sha}>")
+            else:
+                extra.append(f"pushed to `{job.branch}`")
+        elif job.status == "awaiting_push":
+            if s.get("diffstat"):
+                extra.append(f"```\n{s['diffstat'][:600]}\n```")
+            extra.append(f"committed to `{job.branch}` but NOT pushed — "
+                         f"{job.error or 'push failed'}")
         elif job.status == "failed" and job.error:
             extra.append(f"error: {job.error[:300]}")
         elif job.status == "done":
@@ -280,16 +323,26 @@ class JobManager:
     # ---------- push gate ----------
 
     async def push(self, job_id: str) -> dict:
-        """Publish a finished job's branch, then clean up its worktree."""
+        """Retry publishing a branch whose automatic push didn't land.
+
+        Jobs push themselves now, so this is the recovery path — e.g. the first
+        attempt failed on a transient network error. A job that's already
+        `pushed` has nothing to do.
+        """
         job = self.jobs.get(job_id)
         if not job:
             raise KeyError(f"no such job: {job_id}")
+        if job.status == "pushed":
+            return {**job.public(), "pushed_branch": job.branch,
+                    "note": "already pushed"}
         if job.status != "awaiting_push":
             raise RuntimeError(f"job {job_id} is {job.status}, nothing to push")
 
-        await asyncio.to_thread(
+        pushed = await asyncio.to_thread(
             agent_workspace.push_branch, job.worktree, job.branch)
-        job.status = "done"
+        job.summary["head_sha"] = pushed["sha"]
+        job.pushed = True
+        job.status = "pushed"
         try:
             await asyncio.to_thread(
                 agent_workspace.remove, job.checkout, job.worktree, job.branch, True)
