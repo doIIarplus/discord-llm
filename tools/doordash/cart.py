@@ -12,6 +12,34 @@ Subcommands (mapping to dd-cli):
 `add` without --cart-uuid APPENDS to an existing open cart at that store if one
 exists, so run `cart.py list` first if a surprise cart would matter.
 
+--items-json schema (dd-cli `cart add-items`)
+---------------------------------------------
+
+  [
+    {
+      "item_id": "i_21941681157",
+      "item_name": "Avocado & Quinoa Superfood Ensalada",
+      "quantity": 1,
+      "nested_options": [
+        {"id": "o_40817472508", "name": "Chipotle Vinaigrette (On the Side)", "quantity": 1,
+         "options": [ {"id": "o_...", "name": "...", "quantity": 1} ]}
+      ]
+    }
+  ]
+
+  * The key inside a nested_options entry is `id`, NOT `option_id`. Using
+    `option_id` makes DoorDash reject the request with an "option is nested at
+    the wrong level" error.
+  * A top-level "options" key on the ITEM is ignored — modifiers must go under
+    `nested_options`.
+  * Deeper combo/nested choices recurse via an "options": [...] array INSIDE an
+    option entry, using the same {"id", "name", "quantity"} shape.
+  * Prefixed ids are correct (`i_` for items, `o_` for options). Pass them
+    verbatim as returned by menu.py / item_details.py — do not strip prefixes.
+  * Items with required modifiers (size, dressing, etc.) fail to add unless the
+    required option ids are supplied. Get them from
+    `item_details.py --kind restaurant --store-id ID --menu-id ID --item-id ID`.
+
 Examples:
 
   cart.py add --store-id 928163 --menu-id 1657275 \\
@@ -43,7 +71,39 @@ def main():
     )
     sub = parser.add_subparsers(dest="action", required=True)
 
-    p_add = sub.add_parser("add", help="Add items to a cart (dd-cli cart add-items)")
+    p_add = sub.add_parser(
+        "add",
+        help="Add items to a cart (dd-cli cart add-items)",
+        description=(
+            "Add items to a cart, creating one if needed. Without --cart-uuid this "
+            "APPENDS to an existing open cart at that store.\n\n"
+            "--items-json shape:\n"
+            "  [\n"
+            "    {\n"
+            '      "item_id": "i_21941681157",\n'
+            '      "item_name": "Avocado & Quinoa Superfood Ensalada",\n'
+            '      "quantity": 1,\n'
+            '      "nested_options": [\n'
+            '        {"id": "o_40817472508", "name": "Chipotle Vinaigrette (On the Side)", '
+            '"quantity": 1,\n'
+            '         "options": [ {"id": "o_...", "name": "...", "quantity": 1} ]}\n'
+            "      ]\n"
+            "    }\n"
+            "  ]\n\n"
+            "  - Inside nested_options the key is `id`, NOT `option_id`. `option_id` is\n"
+            "    rejected by DoorDash with 'option is nested at the wrong level'.\n"
+            "  - A top-level \"options\" key on the item is IGNORED; modifiers belong\n"
+            "    under nested_options.\n"
+            "  - Deeper combo choices recurse via \"options\": [...] inside an option\n"
+            "    entry, same {\"id\", \"name\", \"quantity\"} shape.\n"
+            "  - Prefixed ids (i_ items, o_ options) are correct; pass verbatim from\n"
+            "    menu.py / item_details.py.\n"
+            "  - Items with required modifiers (size, dressing) fail to add unless the\n"
+            "    required option ids are supplied; get them from\n"
+            "    item_details.py --kind restaurant --store-id ID --menu-id ID --item-id ID."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_add.add_argument("--store-id", required=True, help="Store ID (numeric)")
     p_add.add_argument(
         "--menu-id",
@@ -54,9 +114,15 @@ def main():
     p_add.add_argument(
         "--items-json",
         required=True,
-        help='JSON array of items, e.g. \'[{"item_id":"abc","item_name":"X",'
-             '"quantity":2}]\'. Each entry needs item_id + item_name + quantity; '
-             "may include nested_options[] for customizations.",
+        help='JSON array of items, e.g. \'[{"item_id":"i_abc","item_name":"X",'
+             '"quantity":2}]\'. Each entry needs item_id + item_name + quantity. '
+             'Customizations go in nested_options[], whose entries use the key '
+             '"id" (NOT "option_id" — that gets rejected as "option is nested at '
+             'the wrong level") plus "name"/"quantity", and recurse via an inner '
+             '"options":[...] array of the same shape. A top-level "options" key '
+             'on the item is ignored. Pass i_/o_ prefixed ids verbatim from '
+             "menu.py / item_details.py; required modifiers must be included or "
+             "the add fails. See `cart.py add --help` for the full schema.",
     )
     p_add.add_argument("--cart-uuid", help="Add to this existing cart instead of resolving one")
     p_add.add_argument(

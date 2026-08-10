@@ -343,6 +343,37 @@ missing the tools exit 1 with `{"error": "dd-cli not installed"}`.
 | `address.py --intent TEXT [--set ADDRESS_ID]` | List saved addresses, or set the default (`address list` / `address set`) |
 | `payment_methods.py --intent TEXT` | List saved cards (`payment-method list`) |
 
+#### Cart item JSON schema (`--items-json`)
+
+```json
+[
+  {
+    "item_id": "i_21941681157",
+    "item_name": "Avocado & Quinoa Superfood Ensalada",
+    "quantity": 1,
+    "nested_options": [
+      {"id": "o_40817472508", "name": "Chipotle Vinaigrette (On the Side)", "quantity": 1,
+       "options": [ {"id": "o_...", "name": "...", "quantity": 1} ]}
+    ]
+  }
+]
+```
+
+- The key inside a `nested_options` entry is **`id`**, NOT `option_id`. Using
+  `option_id` makes DoorDash reject the request with an *"option is nested at the
+  wrong level"* error.
+- A top-level `"options"` key on the item is **ignored** — modifiers must go
+  under `nested_options`.
+- Deeper combo/nested choices recurse via an `"options": [...]` array *inside* an
+  option entry, using the same `{"id", "name", "quantity"}` shape.
+- Prefixed ids (`i_` for items, `o_` for options) are correct — pass them
+  verbatim as returned by `menu.py` / `item_details.py`, don't strip the prefix.
+- Items with required modifiers (size, dressing, …) will **fail to add** unless
+  the required option ids are supplied. Get them from
+  `item_details.py --kind restaurant --store-id ID --menu-id ID --item-id ID`.
+- `cart.py add` appends to an existing open cart at that store unless
+  `--cart-uuid` is given.
+
 - **Owner-only, enforced in code.** `_dd.require_owner()` checks the trusted
   `DISCORD_REQUESTING_USER_ID` against `118567805678256128` and fails closed —
   same pattern as `tools/splitwise/_auth.py`. Also gated by the per-guild
