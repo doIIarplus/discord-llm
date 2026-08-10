@@ -70,8 +70,8 @@ GUILD_ALLOWLIST: set = {
 #     determined prompt injection could script around the tools.
 #   - "*"             -> unrestricted, as before.
 TOOL_INTEGRATIONS: set = {
-    "agent", "discord", "flux", "github", "images", "memory", "rag",
-    "resume", "scheduler", "splitwise", "web_search",
+    "agent", "discord", "doordash", "flux", "github", "images", "memory",
+    "rag", "resume", "scheduler", "splitwise", "web_search",
 }
 
 _GUILD_TOOLS_PREFIX = "GUILD_TOOLS_"

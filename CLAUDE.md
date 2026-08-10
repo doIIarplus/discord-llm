@@ -136,6 +136,7 @@ NSFW_CLASSIFICATION_MODEL=qwen3-vl:32b
 FLUX_MODEL_ID=black-forest-labs/FLUX.2-klein-9B      # optional, default shown
 FILE_INPUT_FOLDER=/home/dollarplus/projects/discord_llm_bot/multimodal_input/
 TAVILY_API_KEY=tvly-...                                # required for /search command
+DD_CLI_ACCESS_TOKEN=                                   # required for tools/doordash (no keychain in WSL)
 ```
 
 The active chat model (`CHAT_MODEL`) is hardcoded in [config.py](config.py) as `Txt2TxtModel.GEMMA3_27B_ABLITERATED`.
@@ -163,9 +164,9 @@ Standalone Python scripts in `tools/` that Claude can call via Bash. Each tool u
   Do not describe what you are about to do and stop — that reads as a broken
   promise, because nothing runs between turns (see below).
 - **Destructive / irreversible tools** (delete a channel or message, timeout a
-  member, bulk role or nickname changes, deleting a Splitwise expense, anything
-  that removes data): Describe the action and wait for explicit user confirmation
-  before executing.
+  member, bulk role or nickname changes, deleting a Splitwise expense, **placing
+  a DoorDash order**, anything that removes data or spends money): Describe the
+  action and wait for explicit user confirmation before executing.
 
 **No promises of future work.** Each Discord message is handled by a single
 `claude -p` invocation that **exits when the reply is sent**. Nothing runs in the
@@ -261,9 +262,9 @@ GUILD_TOOLS_1528742025711714425=web_search,images   # only these
 GUILD_TOOLS_999999999999999999=                     # explicitly nothing
 ```
 
-Valid names are the `tools/` directory names: `discord`, `flux`, `images`,
-`memory`, `rag`, `resume`, `scheduler`, `splitwise`, `web_search`. Unknown names
-are dropped with a warning; malformed `GUILD_TOOLS_<x>` keys are ignored.
+Valid names are the `tools/` directory names: `discord`, `doordash`, `flux`,
+`images`, `memory`, `rag`, `resume`, `scheduler`, `splitwise`, `web_search`.
+Unknown names are dropped with a warning; malformed `GUILD_TOOLS_<x>` keys are ignored.
 
 **The default is deny-all.** A guild with no `GUILD_TOOLS_` entry gets no tools,
 so a newly added server is safe until you opt it in. Note this cuts both ways —
@@ -320,6 +321,61 @@ Requires `SPLITWISE_API_KEY` in environment.
 **Workflow example:** To split $50 with "Jason":
 1. `list_friends.py` → find Jason's user ID
 2. `create_expense.py --amount 50 --description "Dinner" --split-with <jason_id>`
+
+### DoorDash (`tools/doordash/`)
+Thin subprocess wrappers around the installed `dd-cli` binary (v0.2.2,
+`~/.local/bin/dd-cli`). No DoorDash API is reimplemented here — if the binary is
+missing the tools exit 1 with `{"error": "dd-cli not installed"}`.
+
+| Tool | Description |
+|------|-------------|
+| `search.py QUERY --intent TEXT [--limit N] [--lat F] [--lng F]` | Find nearby restaurants. Entry point; returns `stores[].store_id` |
+| `menu.py --store-id ID --intent TEXT` | Show a restaurant's menu (`menu_id` + `items[].item_id`) |
+| `find_items.py --store-id ID QUERY [QUERY ...] --intent TEXT` | Search items in a **retail/grocery** store (empty for restaurants). Repeatable query |
+| `item_details.py --kind restaurant\|retail --store-id ID --item-id ID [--menu-id ID] --intent TEXT` | Item pricing/description/customizations. `--kind restaurant` also needs `--menu-id` |
+| `cart.py add --store-id ID --menu-id ID --items-json JSON [--cart-uuid U] [--fulfillment delivery\|pickup] --intent TEXT` | Add items (`dd-cli cart add-items`). Appends to an existing open cart at that store unless `--cart-uuid` is given |
+| `cart.py show \| clear --cart-uuid U --intent TEXT` | Show contents (no pricing) / empty and abandon (`cart show` / `cart delete`) |
+| `cart.py list [--store-id ID] --intent TEXT` | List open carts |
+| `order.py preview --cart-uuid U --intent TEXT` | **Price the cart — no charge.** The only source of the real total (fees, tax, delivery) |
+| `order.py place --cart-uuid U --confirm [--tip-cents N] --intent TEXT` | **Submits the order. Spends real money, irreversible** (`dd-cli order submit`) |
+| `order.py history [--max N] [--days N] --intent TEXT` | Recent order history |
+| `order.py status --order-uuid U --intent TEXT` | Whether a submitted order went through |
+| `address.py --intent TEXT [--set ADDRESS_ID]` | List saved addresses, or set the default (`address list` / `address set`) |
+| `payment_methods.py --intent TEXT` | List saved cards (`payment-method list`) |
+
+- **Owner-only, enforced in code.** `_dd.require_owner()` checks the trusted
+  `DISCORD_REQUESTING_USER_ID` against `118567805678256128` and fails closed —
+  same pattern as `tools/splitwise/_auth.py`. Also gated by the per-guild
+  allowlist as the `doordash` integration, which is checked first.
+- **`--intent` is mandatory on every tool.** dd-cli v0.2.2 requires it on every
+  tool-backed command, so `run_dd` always appends it. It is a plain-language
+  line about *who this is for and the goal* ("Summary: Help the user order
+  lunch"), not a restatement of the command. DoorDash reviews this data.
+- **`DD_CLI_ACCESS_TOKEN` is required.** dd-cli normally stores credentials in
+  the OS keychain, which does not exist under WSL. Get a token by running
+  `dd-cli export-token` on a desktop machine and set it in `.env`. Without it
+  every command fails; `_dd.py` translates that into
+  `{"error": "not_authenticated"}`, and a waitlisted account into
+  `{"error": "no_access"}`. Relay either plainly and do not retry.
+- **`order.py place` is the one money-spending tool.** It refuses to run without
+  `--confirm`, which asserts the user was shown the actual items and the actual
+  `order.py preview` total and said yes to *that*. "Order me a salad" authorizes
+  building and quoting a cart, not buying it. Everything else in this
+  integration is read-only or reversible — run those immediately.
+- `place` and `address --set` pass dd-cli's `-y` internally: these run as
+  captured subprocesses with no tty, so dd-cli's own interactive prompt would
+  hang until the 120s timeout. The `--confirm` gate is the real check.
+- **Location**: dd-cli falls back to `DD_LAT`/`DD_LNG` and finally a Cupertino
+  default. Prefer resolving coordinates first — `address.py` lists saved
+  addresses; the `is_default` entry's lat/lng is "near me".
+
+**Workflow example:** "order me a salad"
+1. `address.py --intent "..."` → default address lat/lng
+2. `search.py salad --lat ... --lng ... --intent "..."` → pick a store_id
+3. `menu.py --store-id <id> --intent "..."` → menu_id + item_id
+4. `cart.py add --store-id <id> --menu-id <mid> --items-json '[...]' --intent "..."` → cart_uuid
+5. `order.py preview --cart-uuid <uuid> --intent "..."` → **show the user the items and total**
+6. only after they say yes: `order.py place --cart-uuid <uuid> --confirm --intent "..."`
 
 ### Resumable Claude sessions (per channel)
 
