@@ -339,6 +339,7 @@ missing the tools exit 1 with `{"error": "dd-cli not installed"}`.
 | `order.py preview --cart-uuid U --intent TEXT` | **Price the cart — no charge.** The only source of the real total (fees, tax, delivery) |
 | `order.py place --cart-uuid U --confirm [--tip-cents N] --intent TEXT` | **Submits the order. Spends real money, irreversible** (`dd-cli order submit`) |
 | `order.py history [--max N] [--days N] --intent TEXT` | Recent order history |
+| `order.py receipt --order-uuid U --intent TEXT` | Full itemized receipt for a past order, **including modifiers/options** (read-only) |
 | `order.py status --order-uuid U --intent TEXT` | Whether a submitted order went through |
 | `address.py --intent TEXT [--set ADDRESS_ID]` | List saved addresses, or set the default (`address list` / `address set`) |
 | `payment_methods.py --intent TEXT` | List saved cards (`payment-method list`) |
@@ -388,6 +389,13 @@ missing the tools exit 1 with `{"error": "dd-cli not installed"}`.
   every command fails; `_dd.py` translates that into
   `{"error": "not_authenticated"}`, and a waitlisted account into
   `{"error": "no_access"}`. Relay either plainly and do not retry.
+- **`order.py history` omits modifiers.** It returns only top-level items and
+  does **NOT** include modifiers/customizations. To see what options were on a
+  past order (e.g. whether chicken was added to a salad), use `order.py
+  receipt`. Modifier data lives at
+  `structuredContent.orders[].order_items[].options[].item_extra_option.{name, price_monetary_fields.display_string}`,
+  with the base item at `order_items[].item.name`. One order per call — there is
+  no batch mode.
 - **`order.py place` is the one money-spending tool.** It refuses to run without
   `--confirm`, which asserts the user was shown the actual items and the actual
   `order.py preview` total and said yes to *that*. "Order me a salad" authorizes

@@ -7,7 +7,10 @@ Subcommands (mapping to dd-cli):
                               the real total (fees, tax, delivery) comes from —
                               cart.py show does NOT include pricing.
   place    -> order submit    SUBMIT THE ORDER. Spends real money, irreversible.
-  history  -> order history   Recent past orders.
+  history  -> order history   Recent past orders. Top-level items only — this
+                              does NOT include modifiers/customizations.
+  receipt  -> order receipt   Full itemized receipt for one past order,
+                              including the options/modifiers history omits.
   status   -> order status    Whether a submitted order actually went through.
 
 `place` refuses to run without --confirm. Only pass --confirm after showing the
@@ -80,6 +83,18 @@ def main():
     p_hist.add_argument("--days", type=int, help="Window in days, 0-365 (default 90)")
     add_intent_arg(p_hist)
 
+    p_rcpt = sub.add_parser(
+        "receipt",
+        help="Full itemized receipt for a past order, including modifiers "
+             "(dd-cli order receipt)",
+    )
+    p_rcpt.add_argument(
+        "--order-uuid",
+        required=True,
+        help="Order UUID as returned by `order.py history` or `order.py place`",
+    )
+    add_intent_arg(p_rcpt)
+
     p_stat = sub.add_parser("status", help="Check a submitted order went through")
     p_stat.add_argument("--order-uuid", required=True, help="Order UUID from `place`")
     add_intent_arg(p_stat)
@@ -120,6 +135,9 @@ def main():
             dd_args += ["--max", args.max]
         if args.days is not None:
             dd_args += ["--days", args.days]
+
+    elif args.action == "receipt":
+        dd_args = ["order", "receipt", "--order-uuid", args.order_uuid]
 
     else:
         dd_args = ["order", "status", "--order-uuid", args.order_uuid]
