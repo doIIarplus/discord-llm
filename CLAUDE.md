@@ -139,7 +139,7 @@ TAVILY_API_KEY=tvly-...                                # required for /search co
 DD_CLI_ACCESS_TOKEN=                                   # required for tools/doordash (no keychain in WSL)
 ```
 
-The active chat model (`CHAT_MODEL`) is hardcoded in [config.py](config.py) as `Txt2TxtModel.GEMMA3_27B_ABLITERATED`.
+The active chat model (`CHAT_MODEL`) is hardcoded in [config.py](config.py) as `Txt2TxtModel.CLAUDE_CODE` (the Claude Code CLI backend). To switch back to a local Ollama model, use `/set_model` at runtime or edit `CHAT_MODEL` in [config.py](config.py). The utility models (`SEARCH_UTILITY_MODEL`, `SEARCH_SUMMARIZATION_MODEL`, `NSFW_CLASSIFICATION_MODEL`, `IMAGE_RECOGNITION_MODEL`, `IMAGE_EDIT_DESCRIPTION_MODEL`) remain on Ollama.
 
 ## Dependencies
 

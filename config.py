@@ -154,7 +154,10 @@ NSFW_CLASSIFICATION_MODEL = os.getenv("NSFW_CLASSIFICATION_MODEL", "gemma3:27b")
 # we give it a generous num_predict budget (1500) to cover hidden
 # chain-of-thought tokens plus the actual output.
 IMAGE_EDIT_DESCRIPTION_MODEL = os.getenv("IMAGE_EDIT_DESCRIPTION_MODEL", "qwen3-vl:32b")
-CHAT_MODEL = Txt2TxtModel.GEMMA3_27B.value
+# Main chat model: the Claude Code CLI backend. Switch back to a local Ollama
+# model at runtime with /set_model, or by editing this line. The utility models
+# below stay on Ollama.
+CHAT_MODEL = Txt2TxtModel.CLAUDE_CODE.value
 SEARCH_UTILITY_MODEL = Txt2TxtModel.GEMMA3_27B.value
 SEARCH_SUMMARIZATION_MODEL = Txt2TxtModel.QWEN3_VL.value
 TEXT_TO_IMAGE_MODEL = "..."
