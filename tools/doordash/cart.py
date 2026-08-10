@@ -6,6 +6,7 @@ Subcommands (mapping to dd-cli):
   add    -> cart add-items    Add items to a cart, creating one if needed.
   show   -> cart show         Show a cart's contents (no pricing — use
                               order.py preview for the total).
+  remove -> cart remove-item  Drop one line from a cart, keeping the cart.
   clear  -> cart delete       Empty a cart and abandon it.
   list   -> cart list         List the consumer's open carts.
 
@@ -129,11 +130,50 @@ def main():
         "--fulfillment", choices=["delivery", "pickup"],
         help="Fulfillment mode at cart creation (default delivery)",
     )
+    p_add.add_argument(
+        "--group-cart",
+        action="store_true",
+        help="Create a shareable GROUP cart instead of a personal one. The "
+             "response's cart.group_cart_url is the link to share (null for "
+             "personal carts). With --cart-uuid pointing at someone else's "
+             "group cart it joins that cart as a participant instead.",
+    )
+    p_add.add_argument(
+        "--spend-limit-cents",
+        type=int,
+        help="Per-participant spending limit in CENTS for a new host-pays-all "
+             "group cart (2500 = $25.00). Omit for unlimited. Requires "
+             "--group-cart and cannot be used with --cart-uuid.",
+    )
     add_intent_arg(p_add)
 
     p_show = sub.add_parser("show", help="Show cart contents (dd-cli cart show)")
     p_show.add_argument("--cart-uuid", required=True, help="Cart UUID from `cart.py add`")
     add_intent_arg(p_show)
+
+    p_remove = sub.add_parser(
+        "remove",
+        help="Remove one line item from a cart (dd-cli cart remove-item)",
+        description=(
+            "Remove a single line from a cart, keeping the cart itself usable "
+            "(cart_uuid stays valid). Use this to fix a wrong cart instead of "
+            "clearing it and rebuilding from scratch.\n\n"
+            "--cart-item-id is the cart LINE id — `cart.py show` items[].id — "
+            "NOT the menu item_id used by --items-json. They are different ids, "
+            "so `cart.py show` has to be called first to get it.\n\n"
+            "To change a quantity rather than drop the item, `cart.py add` is "
+            "cleaner: adds are additive, so add (target - current)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_remove.add_argument("--cart-uuid", required=True, help="Cart UUID from `cart.py add`")
+    p_remove.add_argument(
+        "--cart-item-id",
+        required=True,
+        help="Cart-LINE id from `cart.py show` items[].id — NOT the menu "
+             "item_id. Run `cart.py show` first to get it.",
+    )
+    add_intent_arg(p_remove)
 
     p_clear = sub.add_parser("clear", help="Empty and abandon a cart (dd-cli cart delete)")
     p_clear.add_argument("--cart-uuid", required=True, help="Cart UUID from `cart.py add`")
@@ -155,6 +195,20 @@ def main():
         if not isinstance(parsed, list) or not parsed:
             error("--items-json must be a non-empty JSON array of item objects")
 
+        # dd-cli rejects these combinations, but its error is opaque — catch
+        # them here so the model gets something it can act on.
+        if args.spend_limit_cents is not None:
+            if not args.group_cart:
+                error("--spend-limit-cents requires --group-cart: a spend limit "
+                      "only exists on a host-pays-all group cart")
+            if args.spend_limit_cents < 1:
+                error("--spend-limit-cents must be a positive number of CENTS "
+                      "(2500 = $25.00); omit it entirely for unlimited spending")
+        if args.cart_uuid and args.spend_limit_cents is not None:
+            error("--spend-limit-cents cannot be combined with --cart-uuid: the "
+                  "limit is set when a new group cart is created, not on an "
+                  "existing one")
+
         dd_args = [
             "cart", "add-items",
             "--store-id", args.store_id,
@@ -165,8 +219,18 @@ def main():
             dd_args += ["--cart-uuid", args.cart_uuid]
         if args.fulfillment:
             dd_args += ["--fulfillment", args.fulfillment]
+        if args.group_cart:
+            dd_args.append("--group-cart")
+        if args.spend_limit_cents is not None:
+            dd_args += ["--spend-limit-cents", args.spend_limit_cents]
     elif args.action == "show":
         dd_args = ["cart", "show", "--cart-uuid", args.cart_uuid]
+    elif args.action == "remove":
+        dd_args = [
+            "cart", "remove-item",
+            "--cart-uuid", args.cart_uuid,
+            "--cart-item-id", args.cart_item_id,
+        ]
     elif args.action == "clear":
         dd_args = ["cart", "delete", "--cart-uuid", args.cart_uuid]
     else:

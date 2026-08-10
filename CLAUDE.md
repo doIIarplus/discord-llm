@@ -159,14 +159,18 @@ Standalone Python scripts in `tools/` that Claude can call via Bash. Each tool u
 ### Confirmation policy
 - **Read-only tools** (list, get, search, stats): Execute immediately, report results.
 - **Producing / additive tools** (generate or edit an image, render a chart, send a
-  message, create a thread, schedule a task): **Execute immediately.** These are
-  cheap and reversible, and the user asking for the thing *is* the confirmation.
-  Do not describe what you are about to do and stop — that reads as a broken
-  promise, because nothing runs between turns (see below).
+  message, create a thread, schedule a task, **rebuilding a DoorDash cart with
+  `order.py reorder`, applying or removing a promo with `promo.py apply/remove`,
+  or dropping a wrong line with `cart.py remove`**): **Execute immediately.**
+  These are cheap and reversible, and the user asking for the thing *is* the
+  confirmation. Do not describe what you are about to do and stop — that reads as
+  a broken promise, because nothing runs between turns (see below).
 - **Destructive / irreversible tools** (delete a channel or message, timeout a
   member, bulk role or nickname changes, deleting a Splitwise expense, **placing
   a DoorDash order**, anything that removes data or spends money): Describe the
-  action and wait for explicit user confirmation before executing.
+  action and wait for explicit user confirmation before executing. In the
+  DoorDash integration `order.py place` is the *only* tool in this tier —
+  everything else there is read-only or reversible.
 
 **No promises of future work.** Each Discord message is handled by a single
 `claude -p` invocation that **exits when the reply is sent**. Nothing runs in the
@@ -329,18 +333,26 @@ missing the tools exit 1 with `{"error": "dd-cli not installed"}`.
 
 | Tool | Description |
 |------|-------------|
-| `search.py QUERY --intent TEXT [--limit N] [--lat F] [--lng F]` | Find nearby restaurants. Entry point; returns `stores[].store_id` |
+| `search.py QUERY --intent TEXT [--limit N] [--lat F] [--lng F]` | Find nearby **restaurants**. Entry point; returns `stores[].store_id` |
+| `find_nearby_stores.py [--vertical grocery\|alcohol\|convenience\|pets\|retail\|nv] [--max N] [--lat F] [--lng F] --intent TEXT` | **Non-restaurant** discovery entry point (default vertical `grocery`, default max 10). Fixed 16-mile radius; falls back to the default saved address when lat/lng are omitted. `stores[].store_id` feeds `find_items.py` |
+| `store_details.py --store-id ID --intent TEXT` | Store name, image, business metadata — and the **only** source of `printable_address` (read-only) |
 | `menu.py --store-id ID --intent TEXT` | Show a restaurant's menu (`menu_id` + `items[].item_id`) |
 | `find_items.py --store-id ID QUERY [QUERY ...] --intent TEXT` | Search items in a **retail/grocery** store (empty for restaurants). Repeatable query |
 | `item_details.py --kind restaurant\|retail --store-id ID --item-id ID [--menu-id ID] --intent TEXT` | Item pricing/description/customizations. `--kind restaurant` also needs `--menu-id` |
-| `cart.py add --store-id ID --menu-id ID --items-json JSON [--cart-uuid U] [--fulfillment delivery\|pickup] --intent TEXT` | Add items (`dd-cli cart add-items`). Appends to an existing open cart at that store unless `--cart-uuid` is given |
+| `cart.py add --store-id ID --menu-id ID --items-json JSON [--cart-uuid U] [--fulfillment delivery\|pickup] [--group-cart] [--spend-limit-cents N] --intent TEXT` | Add items (`dd-cli cart add-items`). Appends to an existing open cart at that store unless `--cart-uuid` is given. `--spend-limit-cents` is the per-participant limit on a new host-pays-all group cart: it requires `--group-cart` and is rejected with `--cart-uuid` (validated in the wrapper) |
+| `cart.py remove --cart-uuid U --cart-item-id ID --intent TEXT` | Drop one line from a cart, keeping the cart (`dd-cli cart remove-item`). `--cart-item-id` is the cart **LINE** id from `cart.py show` `items[].id`, **not** the menu `item_id` — call `cart.py show` first |
 | `cart.py show \| clear --cart-uuid U --intent TEXT` | Show contents (no pricing) / empty and abandon (`cart show` / `cart delete`) |
 | `cart.py list [--store-id ID] --intent TEXT` | List open carts |
-| `order.py preview --cart-uuid U --intent TEXT` | **Price the cart — no charge.** The only source of the real total (fees, tax, delivery) |
-| `order.py place --cart-uuid U --confirm [--tip-cents N] --intent TEXT` | **Submits the order. Spends real money, irreversible** (`dd-cli order submit`) |
+| `order.py preview --cart-uuid U [--scheduled-time ISO8601] [--fulfillment delivery\|pickup] [--priority] [--no-apply-credits] --intent TEXT` | **Price the cart — no charge.** The only source of the real total (fees, tax, delivery) |
+| `order.py place --cart-uuid U --confirm [--tip-cents N] [--scheduled-time ISO8601] [--fulfillment delivery\|pickup] [--priority] [--no-apply-credits] --intent TEXT` | **Submits the order. Spends real money, irreversible** (`dd-cli order submit`) |
+| `order.py reorder --order-uuid U --intent TEXT` | Build a **new cart** from a past order, modifiers included. No charge; returns a `cart_uuid` for `preview` |
+| `order.py checkout-url --cart-uuid U --intent TEXT` | Browser checkout link (read-only). Fallback for edits the CLI can't express: payment method, delivery address, in-browser tip |
 | `order.py history [--max N] [--days N] --intent TEXT` | Recent order history |
 | `order.py receipt --order-uuid U --intent TEXT` | Full itemized receipt for a past order, **including modifiers/options** (read-only) |
 | `order.py status --order-uuid U --intent TEXT` | Whether a submitted order went through |
+| `promo.py list --store-id ID --intent TEXT` | Campaign promos eligible at a store (read-only). Consumer- **and** store-scoped; an empty list is a normal answer, and it says nothing about which promos are on a given cart |
+| `promo.py apply --cart-uuid U --promo-code CODE [--campaign-id ID] [--ad-group-id ID] [--ad-id ID] --intent TEXT` | Put a promo on a cart. Campaign promos need all four values from one `promo.py list` row; user-typed/referral codes need only `--promo-code` |
+| `promo.py remove --cart-uuid U --promo-code CODE [--campaign-id ID] [--ad-group-id ID] [--ad-id ID] --intent TEXT` | Take a promo back off a cart. Pass the same flags `apply` was given |
 | `address.py --intent TEXT [--set ADDRESS_ID]` | List saved addresses, or set the default (`address list` / `address set`) |
 | `payment_methods.py --intent TEXT` | List saved cards (`payment-method list`) |
 
@@ -369,6 +381,10 @@ missing the tools exit 1 with `{"error": "dd-cli not installed"}`.
   option entry, using the same `{"id", "name", "quantity"}` shape.
 - Prefixed ids (`i_` for items, `o_` for options) are correct — pass them
   verbatim as returned by `menu.py` / `item_details.py`, don't strip the prefix.
+  **The prefix rule is asymmetric**: `cart.py add --items-json` wants the ids
+  verbatim *with* their `i_`/`o_` prefixes, but `item_details.py --kind
+  restaurant --item-id` wants the `i_` prefix **stripped** (`i_232…` → `232…`),
+  because dd-cli's `restaurant-item-details` requires the bare numeric id.
 - Items with required modifiers (size, dressing, …) will **fail to add** unless
   the required option ids are supplied. Get them from
   `item_details.py --kind restaurant --store-id ID --menu-id ID --item-id ID`.
@@ -396,6 +412,19 @@ missing the tools exit 1 with `{"error": "dd-cli not installed"}`.
   `structuredContent.orders[].order_items[].options[].item_extra_option.{name, price_monetary_fields.display_string}`,
   with the base item at `order_items[].item.name`. One order per call — there is
   no batch mode.
+- **`order.py reorder` is the fastest correct way to repeat a past order**,
+  including all its modifiers — prefer it over rebuilding a cart by hand from
+  `order.py history`, which omits modifiers entirely. It charges nothing, so run
+  it immediately; feed the returned `cart_uuid` into `order.py preview`. Not
+  every order is reorderable (check `success: false` + `fail_reason`), and the
+  new cart **inherits the original order's fulfillment mode** — reordering a past
+  pickup order silently produces a pickup cart, so confirm with `preview`.
+- **Quote-affecting flags must be repeated on `place`.** Anything passed to
+  `order.py preview` — `--scheduled-time`, `--fulfillment`, `--priority`,
+  `--no-apply-credits` — has to be passed identically to `order.py place`, or the
+  amount charged won't match the total the user approved. `--priority` is
+  delivery-only and can't combine with `pickup` or `--scheduled-time` (the
+  wrapper rejects both combinations).
 - **`order.py place` is the one money-spending tool.** It refuses to run without
   `--confirm`, which asserts the user was shown the actual items and the actual
   `order.py preview` total and said yes to *that*. "Order me a salad" authorizes
