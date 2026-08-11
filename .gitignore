@@ -4,7 +4,10 @@ latex_images/
 multimodal_input/
 venv/
 output.txt
-.env
+# Match .env AND every variant. A bare `.env` does NOT match `.env.bak`, and
+# copies of it (.env.bak, .env.bak.<timestamp>) were committed once as a
+# result — they held every credential the bot has.
+.env*
 chroma_db/
 
 # State / runtime data
