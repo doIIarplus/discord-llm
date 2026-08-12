@@ -34,6 +34,7 @@ from config import (
     tools_allowed_for,
     IMAGE_RECOGNITION_MODEL,
     CHAT_MODEL,
+    OLLAMA_UTILITY_MODEL,
     CLAUDE_RESUME_SESSIONS,
     CLAUDE_SESSION_MAX_TOKENS,
     CLAUDE_SESSION_MAX_TURNS,
@@ -846,7 +847,7 @@ class OllamaBot(discord.Client):
             logger.info("[preload] flux warm in %.1fs", time.perf_counter() - t_flux)
 
             # Classifier / rewriter text model
-            logger.info("[preload] warming %s classifier...", CHAT_MODEL)
+            logger.info("[preload] warming %s classifier...", OLLAMA_UTILITY_MODEL)
             t_cls = time.perf_counter()
             await self.image_gen.is_image_generation_task("generate a cat")
             logger.info("[preload] gemma warm in %.1fs", time.perf_counter() - t_cls)

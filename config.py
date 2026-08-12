@@ -158,6 +158,16 @@ IMAGE_EDIT_DESCRIPTION_MODEL = os.getenv("IMAGE_EDIT_DESCRIPTION_MODEL", "qwen3-
 # model at runtime with /set_model, or by editing this line. The utility models
 # below stay on Ollama.
 CHAT_MODEL = Txt2TxtModel.CLAUDE_CODE.value
+# Default model for Ollama-only utility calls (image-task classification, edit
+# instruction normalization, and OllamaClient.generate's default).
+#
+# These MUST NOT use CHAT_MODEL. CHAT_MODEL is the *conversation* backend and is
+# currently a Claude Code alias ("claude-code"), which Ollama has never heard of
+# — pointing utility calls at it makes every one of them 404 with
+# "model 'claude-code' not found". That is exactly what happened when CHAT_MODEL
+# was switched to Claude Code: the image classifier and the preload warmup both
+# started failing. Keep this pinned to a real local model.
+OLLAMA_UTILITY_MODEL = os.getenv("OLLAMA_UTILITY_MODEL", Txt2TxtModel.GEMMA3_27B.value)
 SEARCH_UTILITY_MODEL = Txt2TxtModel.GEMMA3_27B.value
 SEARCH_SUMMARIZATION_MODEL = Txt2TxtModel.QWEN3_VL.value
 TEXT_TO_IMAGE_MODEL = "..."

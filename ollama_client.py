@@ -12,7 +12,7 @@ _OLLAMA_TIMEOUT = ClientTimeout(total=1200, sock_read=1200, sock_connect=30)
 
 from config import (
     OLLAMA_API_URL,
-    CHAT_MODEL,
+    OLLAMA_UTILITY_MODEL,
     SEARCH_UTILITY_MODEL,
     SEARCH_SUMMARIZATION_MODEL,
     NSFW_CLASSIFICATION_MODEL,
@@ -104,7 +104,7 @@ class OllamaClient:
     async def generate(
         self,
         prompt: str,
-        model: str = CHAT_MODEL,
+        model: str = OLLAMA_UTILITY_MODEL,
         images: Optional[List[str]] = None,
         keep_alive: Optional[int] = None,
         num_ctx: Optional[int] = None,
@@ -252,7 +252,7 @@ class OllamaClient:
 
         full_prompt = f"System: {system_prompt}\nUser: {prompt}\nAssistant: "
         response = await self.generate(
-            full_prompt, model=CHAT_MODEL, keep_alive=300, num_ctx=4096, think=False,
+            full_prompt, model=OLLAMA_UTILITY_MODEL, keep_alive=300, num_ctx=4096, think=False,
         )
 
         return "yes" in response.lower()
@@ -411,7 +411,7 @@ class OllamaClient:
         )
         raw = await self.generate(
             full_prompt,
-            model=CHAT_MODEL,
+            model=OLLAMA_UTILITY_MODEL,
             keep_alive=300,
             num_ctx=4096,
             num_predict=80,
